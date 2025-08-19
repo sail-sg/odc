@@ -1,0 +1,4 @@
+datasets
+wandb
+transformers
+flash_attn
