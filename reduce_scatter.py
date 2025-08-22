@@ -120,8 +120,9 @@ class ReductionWatcher:
             if not self.running:
                 break
 
-            for idx, flag in enumerate(self.cpu_lock_buffers):
-                if flag == 2:
+            nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False)[0].tolist()
+            for idx in nonzeros:
+                if self.cpu_lock_buffers[idx] == 2:
                     self.accumulations[idx].add_(self.buffers[idx])
                     self.task_count += 1
                     # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
@@ -134,6 +135,7 @@ def tensor_from_handle(handle, size, dtype):
 def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue):
     torch.cuda.set_device(device_id)
     import sys
+    # torch.cuda.cudart().cudaProfilerStart()
     
     buffers = [tensor_from_handle(*buffer) for buffer in buffers]
     accumulations = [tensor_from_handle(*acc) for acc in accumulations]
@@ -163,7 +165,7 @@ def start_reduction_watcher(accumulations, buffers, lock_buffers):
     ctx = torch.multiprocessing.get_context("spawn")
     cmd_queue = ctx.Queue()
     response_queue = ctx.Queue()
-    device_id = torch.cuda.current_device()
+    device_id = torch.distributed.get_rank() % 8
     process = ctx.Process(target=reduction_watcher_function,
                        args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
     process.start()
@@ -266,8 +268,10 @@ class ReductionService:
         return acc
     
     def sync(self, pg: dist.ProcessGroup):
-        group_size = dist.get_world_size(pg)
-        call_watcher(self.reduction_watcher, 'wait_and_reset_task_count', self.dispatched_tasks * group_size)
+        dispatched_tasks = torch.tensor(self.dispatched_tasks, device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(dispatched_tasks, op=torch.distributed.ReduceOp.SUM, group=pg)
+        torch.cuda.synchronize()
+        call_watcher(self.reduction_watcher, 'wait_and_reset_task_count', dispatched_tasks.item())
         self.dispatched_tasks = 0
 
     def stop(self):

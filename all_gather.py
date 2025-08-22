@@ -27,6 +27,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
     assert len(input_tensor.shape) == 1
 
     registry = SymmBufferRegistry.get_instance()
+    # print(f"Rank {torch.distributed.get_rank()} input_tensor: dtype {input_tensor.dtype}, device {input_tensor.device} shape {input_tensor.shape} ptr {input_tensor.data_ptr()}")
     peer_tensors = registry.get_peer_tensors(input_tensor)
 
     # All ranks are global ranks for usage in nvshmem
