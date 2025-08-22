@@ -112,14 +112,19 @@ class ReductionWatcher:
     def run(self):
         while self.running:
             block_size = triton.next_power_of_2(self.num_locks)
+
             self.cpu_lock_buffers.fill_(0)
-            reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
+            time.sleep(1/10000)
+            # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
 
             self.cpu_lock_buffers.copy_(self.lock_buffers, non_blocking=True)
             torch.cuda.current_stream().synchronize()
             if not self.running:
                 break
-
+            
+            if self.cpu_lock_buffers.max() < 2:
+                continue
+            
             nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False)[0].tolist()
             for idx in nonzeros:
                 if self.cpu_lock_buffers[idx] == 2:
@@ -286,6 +291,7 @@ class ReductionService:
 
 if __name__ == "__main__":
     import os
+    torch.cuda.cudart().cudaProfilerStart()
     try:
       torch.cuda.set_device(f"cuda:{os.environ['RANK']}")
       torch.distributed.init_process_group("nccl")
@@ -308,7 +314,7 @@ if __name__ == "__main__":
       
       
 
-      group_count = 2
+      group_count = 1
       
       for i in range(group_count):
         group_ranks_ = range(i, world_size, group_count)
@@ -397,3 +403,4 @@ if __name__ == "__main__":
       traceback.print_exc()
     finally:
       SymmBufferRegistry.get_instance().finalize()
+    torch.cuda.cudart().cudaProfilerStop()
