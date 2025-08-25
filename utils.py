@@ -26,7 +26,7 @@ def nvshmem_create_tensor(shape, dtype) -> torch.Tensor:
     return tensor
 
 
-def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Tensor]:
+def nvshmem_create_tensors(shape, dtype, rank, local_world_size, local_buffer=None) -> List[torch.Tensor]:
 
     def get_peer_tensor(t, peer) -> torch.Tensor:
         # avoid create tensor on the same buf again. nvshmem4py can't handle multiple reference with grace. so we handle it here.
@@ -39,7 +39,10 @@ def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.T
     rank_on_same_node_start = rank - local_rank
     rank_on_same_node_end = rank_on_same_node_start + local_world_size
     torch.cuda.synchronize()
-    tensor = nvshmem_create_tensor(shape, dtype=dtype)
+    if local_buffer is None:
+        tensor = nvshmem_create_tensor(shape, dtype=dtype)
+    else:
+        tensor = local_buffer
     torch.cuda.synchronize()
     return [get_peer_tensor(tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
 
@@ -65,6 +68,7 @@ class SymmBufferRegistry:
         self.local_tensor_to_keys = {}
         self.updated = set()
         self.peer_tensors = {}
+        self.cached_local_buffer = {}
 
     @classmethod
     def get_instance(cls):
@@ -89,12 +93,22 @@ class SymmBufferRegistry:
             torch.distributed.barrier()
         return self.local_tensor[buffer_key]
   
-    def allocate_symm_buffer(self, key, shape, dtype):
+    def get_cached_local_buffer(self, shape, dtype):
+        key = (tuple(shape), dtype)
+        if key not in self.cached_local_buffer:
+            self.cached_local_buffer[key] = nvshmem_create_tensor(shape, dtype=dtype)
+        return self.cached_local_buffer[key]
+
+    def allocate_symm_buffer(self, key, shape, dtype, local_single_buffer=False):
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        self.peer_tensors[key] = nvshmem_create_tensors(shape, dtype, rank, world_size)
+        local_buffer = None
+        if local_single_buffer:
+            local_buffer = self.get_cached_local_buffer(shape, dtype)
+        self.peer_tensors[key] = nvshmem_create_tensors(shape, dtype, rank, world_size, local_buffer)
         self.local_tensor[key] = self.peer_tensors[key][rank]
+        assert self.local_tensor[key].data_ptr() == local_buffer.data_ptr() if local_buffer is not None else True
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
         print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")
         return self.local_tensor[key]
@@ -107,8 +121,13 @@ class SymmBufferRegistry:
         return self.peer_tensors[buffer_key]
     
     def finalize(self):
+        cached_local_buffer = set(self.cached_local_buffer.values())
         for buffer_key in self.local_tensor:
-            nvshmem_free_tensor_sync(self.local_tensor[buffer_key])
+            if self.local_tensor[buffer_key] not in cached_local_buffer:
+                nvshmem_free_tensor_sync(self.local_tensor[buffer_key])
+        for buffer in cached_local_buffer:
+            nvshmem_free_tensor_sync(buffer)
+        self.cached_local_buffer.clear()
         self.local_tensor.clear()
         self.local_tensor_to_keys.clear()
         self.updated.clear()

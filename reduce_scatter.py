@@ -10,66 +10,111 @@ from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, n
                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
 from typing import List
 import time
-from odc.utils import SymmBufferRegistry, init_nvshmem
+from utils import SymmBufferRegistry, init_nvshmem
 import torch.distributed as dist
 
 ### NVSHMEM kernels are used by clients to communicate with reduction servers
+# @triton.jit(do_not_specialize=["target_rank", "lock_id"])
+# def nvshmem_poll_lock_kernel(
+#     lock_buffer_ptr,
+#     target_rank,
+#     lock_id,
+# ):
+#     pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+#     tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+#     if pid == 0 and tidx == 0:
+#         r = 1
+#         while r != 0:
+#             r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, 1, target_rank)
+#     __syncthreads()
+
+
 @triton.jit(do_not_specialize=["target_rank", "lock_id"])
-def nvshmem_poll_lock_kernel(
+def nvshmem_poll_lock_with_idx_kernel(
     lock_buffer_ptr,
     target_rank,
     lock_id,
 ):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
+    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
     if pid == 0 and tidx == 0:
         r = 1
         while r != 0:
-            r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, 1, target_rank)
+            idx = lock_id
+            r = libshmem_device.atomic_compare_swap(lock_buffer_ptr, 0, -(idx + 1), target_rank)
+            # r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, 1, target_rank)
     __syncthreads()
 
 
+# @triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
+# def nvshmem_set_kernel(
+#     lock_buffer_ptr,
+#     target_rank,
+#     lock_id,
+#     value,
+# ):
+#     pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+#     tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+#     if pid == 0 and tidx == 0:
+#         libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
+#     __syncthreads()
+    
 @triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
-def nvshmem_set_kernel(
+def nvshmem_notify_data_kernel(
     lock_buffer_ptr,
     target_rank,
     lock_id,
-    value,
 ):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
+    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
     if pid == 0 and tidx == 0:
-        libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
+        idx = lock_id
+        prev = libshmem_device.atomic_swap(lock_buffer_ptr, idx + 1, target_rank)
+        assert -prev == idx + 1
     __syncthreads()
 
 
 ### Plain triton kernels are used within reduction servers themselves, locally.
 
-@triton.jit(do_not_specialize=["num_locks"])
-def reduction_watcher_kernel(
-    lock_buffer_ptr,
-    num_locks,
-    BLOCK_SIZE: tl.constexpr,
-):
-   pid = tl.program_id(axis=0)
-   tidx = tid(axis=0)
-   if pid == 0:
-      r = 0
-      offsets = tl.arange(0, BLOCK_SIZE)
-      mask = offsets < num_locks
-      while r < 2:
-          data = tl.load(lock_buffer_ptr + offsets, mask=mask, volatile=True)
-          r = tl.max(data)
-          __syncthreads()
+# @triton.jit(do_not_specialize=["num_locks"])
+# def reduction_watcher_kernel(
+#     lock_buffer_ptr,
+#     num_locks,
+#     BLOCK_SIZE: tl.constexpr,
+# ):
+#     pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+#     tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+#     if pid == 0:
+#       r = 0
+#       offsets = tl.arange(0, BLOCK_SIZE)
+#       mask = offsets < num_locks
+#       while r < 2:
+#           data = tl.load(lock_buffer_ptr + offsets, mask=mask, volatile=True)
+#           r = tl.max(data)
+#           __syncthreads()
+
+# @triton.jit(do_not_specialize=["lock_id"])
+# def reset_lock_kernel(
+#     lock_buffer_ptr,
+#     lock_id):
+#     pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+#     tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+#     if pid == 0 and tidx == 0:
+#         tl.atomic_xchg(lock_buffer_ptr + lock_id, 0)
+#     __syncthreads()
 
 @triton.jit(do_not_specialize=["lock_id"])
 def reset_lock_kernel(
     lock_buffer_ptr,
     lock_id):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
+    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
     if pid == 0 and tidx == 0:
-        tl.atomic_xchg(lock_buffer_ptr + lock_id, 0)
+        tl.atomic_xchg(lock_buffer_ptr, 0)
+        # prev = libshmem_device.atomic_swap(lock_buffer_ptr, 0, my_rank)
+        # if prev != lock_id + 1:
+        #     print("Rank reset_lock_kernel:", prev, lock_id + 1)
+        #     assert prev == lock_id + 1
     __syncthreads()
 
 class DistLock:
@@ -81,10 +126,12 @@ class DistLock:
         
 
     def lock(self, target_rank, lock_id):
-        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, lock_id)
+        # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, lock_id)
+        nvshmem_poll_lock_with_idx_kernel[(1, )](self.lock_buffers, target_rank, lock_id)
     
     def notify_data(self, target_rank, lock_id):
-        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, lock_id, 2)
+        # nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, lock_id, 2)
+        nvshmem_notify_data_kernel[(1, )](self.lock_buffers, target_rank, lock_id)
 
 class ReductionWatcher:
     def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor):
@@ -122,16 +169,26 @@ class ReductionWatcher:
             if not self.running:
                 break
             
-            if self.cpu_lock_buffers.max() < 2:
+            idx = self.cpu_lock_buffers[0].item()
+            # print(f"cpu_lock_buffers idx: {repr(idx)}")
+            if idx <= 0:
                 continue
+            idx = idx - 1
+            self.accumulations[idx].add_(self.buffers[0])
+            self.task_count += 1
+            # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
+            assert self.lock_buffers.device.type == "cuda", self.lock_buffers.device
+            reset_lock_kernel[(1, )](self.lock_buffers, idx)
+            # if self.cpu_lock_buffers.max() < 2:
+            #     continue
             
-            nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False)[0].tolist()
-            for idx in nonzeros:
-                if self.cpu_lock_buffers[idx] == 2:
-                    self.accumulations[idx].add_(self.buffers[idx])
-                    self.task_count += 1
-                    # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
-                    reset_lock_kernel[(1, )](self.lock_buffers, idx)
+            # nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False)[0].tolist()
+            # for idx in nonzeros:
+            #     if self.cpu_lock_buffers[idx] == 2:
+            #         self.accumulations[idx].add_(self.buffers[idx])
+            #         self.task_count += 1
+            #         # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
+            #         reset_lock_kernel[(1, )](self.lock_buffers, idx)
 
 def tensor_from_handle(handle, size, dtype):
     from tensor_ipc import reconstruct_tensor
@@ -198,7 +255,7 @@ class ReductionService:
     
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
-            self.lock = DistLock(1024)
+            self.lock = DistLock(1)
             lock_buffers_handle = get_nvshmem_handle(self.lock.lock_buffers)
 
             # Make sure changes are visible to all reduction watchers
@@ -216,7 +273,7 @@ class ReductionService:
         
         acc = registry.allocate_symm_buffer(accumulation_key, output_tensor_shape, grad_dtype)
         acc.fill_(0)
-        buffer = registry.allocate_symm_buffer(buffer_key, output_tensor_shape, reduction_dtype)
+        buffer = registry.allocate_symm_buffer(buffer_key, output_tensor_shape, reduction_dtype, local_single_buffer=True)
             
         
         current_size = len(self.buffers)
