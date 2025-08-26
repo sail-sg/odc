@@ -1,3 +1,6 @@
+from threading import Thread
+from queue import Queue
+
 import nvshmem.core
 import torch
 from cuda import cuda
@@ -10,7 +13,10 @@ from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, n
                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
 from typing import List
 import time
-from odc.utils import SymmBufferRegistry, init_nvshmem
+try:
+    from odc.utils import SymmBufferRegistry, init_nvshmem
+except:
+    from utils import SymmBufferRegistry, init_nvshmem
 import torch.distributed as dist
 
 ### NVSHMEM kernels are used by clients to communicate with reduction servers
@@ -20,8 +26,8 @@ def nvshmem_poll_lock_kernel(
     target_rank,
     lock_id,
 ):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
+    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
     if pid == 0 and tidx == 0:
         r = 1
         while r != 0:
@@ -36,8 +42,8 @@ def nvshmem_set_kernel(
     lock_id,
     value,
 ):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
+    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
     if pid == 0 and tidx == 0:
         libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
     __syncthreads()
@@ -65,9 +71,12 @@ def reduction_watcher_kernel(
 @triton.jit(do_not_specialize=["lock_id"])
 def reset_lock_kernel(
     lock_buffer_ptr,
-    lock_id):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
+    lock_id,
+    preload_kernel=False):
+    if preload_kernel:
+        return
+    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
+    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
     if pid == 0 and tidx == 0:
         tl.atomic_xchg(lock_buffer_ptr + lock_id, 0)
     __syncthreads()
@@ -106,8 +115,10 @@ class ReductionWatcher:
 
     def add_buffer(self, accumulation, buffer):
         # print(f"Rank {dist.get_rank()} adding buffer {accumulation} {buffer}")
-        self.accumulations.append(tensor_from_handle(*accumulation))
-        self.buffers.append(tensor_from_handle(*buffer))
+        # self.accumulations.append(tensor_from_handle(*accumulation))
+        # self.buffers.append(tensor_from_handle(*buffer))
+        self.accumulations.append(accumulation)
+        self.buffers.append(buffer)
 
     def run(self):
         while self.running:
@@ -133,18 +144,22 @@ class ReductionWatcher:
                     # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
                     reset_lock_kernel[(1, )](self.lock_buffers, idx)
 
-def tensor_from_handle(handle, size, dtype):
-    from tensor_ipc import reconstruct_tensor
-    return reconstruct_tensor(handle, (size,), dtype)
+# def tensor_from_handle(handle, size, dtype):
+#     from tensor_ipc import reconstruct_tensor
+#     return reconstruct_tensor(handle, (size,), dtype)
 
 def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue):
     torch.cuda.set_device(device_id)
-    import sys
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    for t in accumulations + buffers + [lock_buffers]:
+        t.record_stream(stream)
+    # stream.wait_stream(torch.cuda.default_stream())
     # torch.cuda.cudart().cudaProfilerStart()
-    
-    buffers = [tensor_from_handle(*buffer) for buffer in buffers]
-    accumulations = [tensor_from_handle(*acc) for acc in accumulations]
-    lock_buffers = tensor_from_handle(*lock_buffers)
+
+    # buffers = [tensor_from_handle(*buffer) for buffer in buffers]
+    # accumulations = [tensor_from_handle(*acc) for acc in accumulations]
+    # lock_buffers = tensor_from_handle(*lock_buffers)
 
     watcher = ReductionWatcher(accumulations, buffers, lock_buffers)
 
@@ -165,15 +180,18 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
     cmd_thread.join()
 
 def start_reduction_watcher(accumulations, buffers, lock_buffers):
-    from torch.multiprocessing import Process
+    # from torch.multiprocessing import Process
     
-    ctx = torch.multiprocessing.get_context("spawn")
-    cmd_queue = ctx.Queue()
-    response_queue = ctx.Queue()
+    # ctx = torch.multiprocessing.get_context("spawn")
+    cmd_queue = Queue()
+    response_queue = Queue()
     device_id = torch.distributed.get_rank() % 8
-    process = ctx.Process(target=reduction_watcher_function,
-                       args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
-    process.start()
+    # process = ctx.Process(target=reduction_watcher_function,
+    #                    args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
+    # process.start()
+    thread = Thread(target=reduction_watcher_function,
+                   args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
+    thread.start()
     return cmd_queue, response_queue
 
 def call_watcher(watcher_handle, cmd, *args):
@@ -181,10 +199,10 @@ def call_watcher(watcher_handle, cmd, *args):
     cmd_queue.put((cmd, *args))
     return response_queue.get()
 
-def get_nvshmem_handle(tensor):
-    from tensor_ipc import get_ipc_handle
-    handle = get_ipc_handle(tensor)
-    return handle, tensor.numel(), tensor.dtype
+# def get_nvshmem_handle(tensor):
+#     from tensor_ipc import get_ipc_handle
+#     handle = get_ipc_handle(tensor)
+#     return handle, tensor.numel(), tensor.dtype
 
 class ReductionService:
     def __init__(self, accumulation_dtype=None):
@@ -199,7 +217,8 @@ class ReductionService:
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
             self.lock = DistLock(1024)
-            lock_buffers_handle = get_nvshmem_handle(self.lock.lock_buffers)
+            # lock_buffers_handle = get_nvshmem_handle(self.lock.lock_buffers)
+            lock_buffers_handle = self.lock.lock_buffers
 
             # Make sure changes are visible to all reduction watchers
             torch.distributed.barrier()
@@ -223,8 +242,10 @@ class ReductionService:
         self.buffers.append((acc, buffer))
         self.indices[key] = current_size
 
-        acc_handle = get_nvshmem_handle(acc)
-        buffer_handle = get_nvshmem_handle(buffer)
+        # acc_handle = get_nvshmem_handle(acc)
+        # buffer_handle = get_nvshmem_handle(buffer)
+        acc_handle = acc
+        buffer_handle = buffer
         call_watcher(self.reduction_watcher, 'add_buffer', acc_handle, buffer_handle)
 
         # Make sure changes are visible to all reduction watchers
@@ -288,9 +309,20 @@ class ReductionService:
             nvshmem_free_tensor_sync(self.lock.lock_buffers)
 
 
+def preload_watcher_kernels(accumulation_dtype):
+    lock_id = 0
+    device = torch.cuda.current_device()
+    lock_buffers = nvshmem_create_tensor(1, torch.int32)
+    reset_lock_kernel[(1, )](lock_buffers, lock_id, preload_kernel=True)
+    accumulation = torch.empty(1, dtype=accumulation_dtype, device=device)
+    accumulation.add_(1)
+    torch.cuda.synchronize()
+    nvshmem_free_tensor_sync(lock_buffers)
+
 
 if __name__ == "__main__":
     import os
+    assert int(os.environ['CUDA_DEVICE_MAX_CONNECTIONS']) >= 8, "CUDA_DEVICE_MAX_CONNECTIONS must be >= 8"
     torch.cuda.cudart().cudaProfilerStart()
     try:
       torch.cuda.set_device(f"cuda:{os.environ['RANK']}")
@@ -301,6 +333,8 @@ if __name__ == "__main__":
 
       accum_dtype = torch.bfloat16
       grad_dtype = torch.bfloat16
+
+      preload_watcher_kernels(accum_dtype)
 
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
       cnt = 20
