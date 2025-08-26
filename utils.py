@@ -1,5 +1,6 @@
 import torch
 import nvshmem
+import os
 from typing import List
 
 
@@ -65,6 +66,7 @@ class SymmBufferRegistry:
         self.local_tensor_to_keys = {}
         self.updated = set()
         self.peer_tensors = {}
+        self.allocations = []
 
     @classmethod
     def get_instance(cls):
@@ -93,7 +95,15 @@ class SymmBufferRegistry:
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        self.peer_tensors[key] = nvshmem_create_tensors(shape, dtype, rank, world_size)
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_rank = rank % local_world_size
+        peer_tensors = []
+        for node_rank in range(world_size // local_world_size):
+            tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
+            self.allocations.append(tensors[local_rank])
+            peer_tensors.extend(tensors)
+        assert len(peer_tensors) == world_size
+        self.peer_tensors[key] = peer_tensors
         self.local_tensor[key] = self.peer_tensors[key][rank]
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
         print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")
@@ -107,8 +117,8 @@ class SymmBufferRegistry:
         return self.peer_tensors[buffer_key]
     
     def finalize(self):
-        for buffer_key in self.local_tensor:
-            nvshmem_free_tensor_sync(self.local_tensor[buffer_key])
+        for t in self.allocations:
+            nvshmem_free_tensor_sync(t)
         self.local_tensor.clear()
         self.local_tensor_to_keys.clear()
         self.updated.clear()

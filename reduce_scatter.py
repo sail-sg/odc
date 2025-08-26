@@ -122,14 +122,15 @@ class ReductionWatcher:
             if not self.running:
                 break
             
-            if self.cpu_lock_buffers.max() < 2:
-                continue
+            nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False).tolist()
+            if len(nonzeros) > 0:
+              nonzeros = nonzeros[0]
             
-            nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False)[0].tolist()
             for idx in nonzeros:
                 if self.cpu_lock_buffers[idx] == 2:
                     self.accumulations[idx].add_(self.buffers[idx])
                     self.task_count += 1
+                    # print(f"Rank {torch.cuda.current_device()} adding buffer {idx}")
                     # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
                     reset_lock_kernel[(1, )](self.lock_buffers, idx)
 
@@ -349,7 +350,8 @@ if __name__ == "__main__":
       def reduce_scatter_accumulation(src_tensor, dest_idx, pg: dist.ProcessGroup):
         reduction_service.reduce_scatter_accumulation(dest_idx, src_tensor, pg)
 
-
+      dist.barrier()
+      torch.cuda.synchronize()
       for reduce_scatter_func in [reduce_scatter_accumulation, reduce_scatter_accumulation_nccl]:
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
@@ -383,15 +385,15 @@ if __name__ == "__main__":
             # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[0]}")
             
             for i in range(cnt):
-              print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.buffers[i][0]}")
+              # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.buffers[i][0]}")
               torch.testing.assert_close(nccl_accumulations[i], reduction_service.buffers[i][0], rtol=5e-2, atol=5e-2)
           end = torch.cuda.Event(enable_timing=True)
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
-          print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
+          # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
           reduce_scatter_payload = size // group_size* (group_size - 1)* data.dtype.itemsize
-          print(f"Rank {rank} reduce_scatter bw: {[reduce_scatter_payload / 1024 ** 2 / start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}")
+          # print(f"Rank {rank} reduce_scatter bw: {[reduce_scatter_payload / 1024 ** 2 / start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}")
           print(f"Rank {rank} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 

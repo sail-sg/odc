@@ -47,14 +47,41 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
         output_tensor_views[src_group_rank].copy_(peer_tensors[src_rank])
     return output_tensor
 
+same_local_rank_pg = None
+def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
+    assert dist.get_world_size() == dist.get_world_size(group=pg), "Cached AG only supports pure data parallelism"
+
+    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    if local_world_size == dist.get_world_size():
+       return
+    local_rank = dist.get_rank() % local_world_size
+    global same_local_rank_pg
+    if same_local_rank_pg is None:
+      for i in range(local_world_size):
+         ranks = [i + j * local_world_size for j in range(dist.get_world_size() // local_world_size)]
+         new_gp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+         if i == local_rank:
+            same_local_rank_pg = new_gp
+    assert same_local_rank_pg is not None
+    
+    same_local_rank_pg_ranks = dist.get_process_group_ranks(group=same_local_rank_pg)
+
+    registry = SymmBufferRegistry.get_instance()
+    # print(registry.get_peer_tensors(input_tensor))
+    tensors = [registry.get_peer_tensors(input_tensor)[r] for r in same_local_rank_pg_ranks]
+    torch.distributed.all_gather(tensors, input_tensor, group=same_local_rank_pg)
+    return tensors
+    
+
 
 def all_gather_into_tensor_nccl(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
     return dist.all_gather_into_tensor(output_tensor, input_tensor, group=pg)
 
 
 if __name__ == "__main__":
+    torch.cuda.cudart().cudaProfilerStart()
     try:
-      torch.cuda.set_device(f"cuda:{os.environ['RANK']}")
+      torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % 8}")
       torch.distributed.init_process_group("nccl")
       init_nvshmem()
       world_size = torch.distributed.get_world_size()
@@ -64,7 +91,7 @@ if __name__ == "__main__":
       size = 16 * (1000 ** 2)
       comp_sizes = torch.rand(cnt).tolist()
 
-      group_count = 2
+      group_count = 1
       
       for i in range(group_count):
         group_ranks_ = range(i, world_size, group_count)
@@ -90,6 +117,7 @@ if __name__ == "__main__":
       for i in range(cnt):
         src_tensors[i].fill_(i + rank*100)
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
+        all_gather_sync_cache(src_tensors[i], group)
 
       for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
