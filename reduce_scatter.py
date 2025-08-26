@@ -20,8 +20,8 @@ def nvshmem_poll_lock_with_idx_kernel(
     target_rank,
     lock_id,
 ):
-    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
-    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+    pid = tl.program_id(axis=0)
+    tidx = tid(axis=0)
     if pid == 0 and tidx == 0:
         r = 1
         while r != 0:
@@ -37,8 +37,8 @@ def nvshmem_notify_data_kernel(
     target_rank,
     lock_id,
 ):
-    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
-    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+    pid = tl.program_id(axis=0)
+    tidx = tid(axis=0)
     if pid == 0 and tidx == 0:
         idx = lock_id
         prev = libshmem_device.atomic_swap(lock_buffer_ptr, idx + 1, target_rank)
@@ -51,8 +51,8 @@ def nvshmem_notify_data_kernel(
 def reset_lock_kernel(
     lock_buffer_ptr,
     lock_id):
-    pid = tl.program_id(axis=0) + tl.program_id(axis=1) + tl.program_id(axis=2)
-    tidx = tid(axis=0) + tid(axis=1) + tid(axis=2)
+    pid = tl.program_id(axis=0)
+    tidx = tid(axis=0)
     if pid == 0 and tidx == 0:
         tl.atomic_xchg(lock_buffer_ptr, 0)
     __syncthreads()
@@ -107,7 +107,7 @@ class ReductionWatcher:
             if idx <= 0:
                 continue
             idx = idx - 1
-            self.accumulations[idx].add_(self.buffers[0])
+            self.accumulations[idx].add_(self.buffers[idx])
             self.task_count += 1
             # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
             assert self.lock_buffers.device.type == "cuda", self.lock_buffers.device
