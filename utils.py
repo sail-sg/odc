@@ -59,12 +59,30 @@ def init_nvshmem():
     init_nvshmem_by_torch_process_group(torch.distributed.group.WORLD)
 
 
+class BufferLock:
+    def __init__(self):
+        self.locked = False
+    
+    def unlock(self):
+        self.locked = False
+    
+    def is_locked(self):
+        return self.locked
+    
+    def spin_lock(self):
+        while self.is_locked():
+            import time
+            time.sleep(0.01)
+        self.locked = True
+
+
 class SymmBufferRegistry:
     def __init__(self):
         self.local_tensor = {}
         self.local_tensor_to_keys = {}
         self.updated = set()
         self.peer_tensors = {}
+        self.lock = BufferLock()
 
     @classmethod
     def get_instance(cls):
@@ -93,7 +111,9 @@ class SymmBufferRegistry:
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
+        self.lock.spin_lock()
         self.peer_tensors[key] = nvshmem_create_tensors(shape, dtype, rank, world_size)
+        self.lock.unlock()
         self.local_tensor[key] = self.peer_tensors[key][rank]
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
         print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")

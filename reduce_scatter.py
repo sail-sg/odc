@@ -1,5 +1,6 @@
 from threading import Thread
 from queue import Queue
+import ctypes
 
 import nvshmem.core
 import torch
@@ -130,11 +131,20 @@ class ReductionWatcher:
         rank = dist.get_rank()
         device = torch.cuda.current_device()
         dummy = torch.empty(1, dtype=torch.bfloat16, device=device)
+        start_time = time.time()
         while self.running:
-            # for idx in range(self.num_locks):
-            #     reset_lock_kernel[(1, )](self.lock_buffers, idx)
-            # time.sleep(1/1000)
-            # continue
+            registry = SymmBufferRegistry.get_instance()
+            for idx in range(self.num_locks):
+                registry.lock.spin_lock()
+                # reset_lock_kernel[(1, )](self.lock_buffers, idx)
+                dummy.add_(1)
+                torch.cuda.current_stream().synchronize()
+                registry.lock.unlock()
+            time.sleep(1/1000)
+            if (time.time() - start_time) > 30:
+                print(f"Rank {rank} timeout")
+                break
+            continue
             block_size = triton.next_power_of_2(self.num_locks)
 
             self.cpu_lock_buffers.fill_(0)
@@ -182,6 +192,8 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
     torch.cuda.set_device(device_id)
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
+    bg_stream_ptr = ctypes.c_void_p(stream.cuda_stream)
+    print(f"Rank {dist.get_rank()} bg_stream_ptr: {bg_stream_ptr}")
     # for t in accumulations + buffers + [lock_buffers]:
     #     t.record_stream(stream)
     # stream.wait_stream(torch.cuda.default_stream())
@@ -425,6 +437,8 @@ if __name__ == "__main__":
       stream = torch.cuda.Stream()
       torch.cuda.set_stream(stream)
       stream.wait_stream(torch.cuda.default_stream())
+      main_stream_ptr = ctypes.c_void_p(stream.cuda_stream)
+      print(f"Rank {rank} main_stream_ptr: {main_stream_ptr}")
         
       torch.cuda.synchronize()
       mem_allocated = torch.cuda.memory_allocated() / (1024 ** 2)
@@ -442,10 +456,10 @@ if __name__ == "__main__":
       def reduce_scatter_accumulation(src_tensor, dest_idx, pg: dist.ProcessGroup):
         reduction_service.reduce_scatter_accumulation(dest_idx, src_tensor, pg)
 
-      for dst_idx in range(cnt):
-          reduction_service.pre_register(dst_idx, data[dst_idx], group)
-      torch.cuda.synchronize()
-      print(f"Rank {rank} pre_register done")
+    #   for dst_idx in range(cnt):
+    #       reduction_service.pre_register(dst_idx, data[dst_idx], group)
+    #   torch.cuda.synchronize()
+    #   print(f"Rank {rank} pre_register done")
 
       for reduce_scatter_func in [reduce_scatter_accumulation, reduce_scatter_accumulation_nccl]:
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
