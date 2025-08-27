@@ -168,6 +168,7 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
     return padded_unsharded_flat_param
 
+
 from torch.distributed.fsdp._flat_param import FlatParamHandle
 old_get_shard = FlatParamHandle._get_shard
 def custom_get_shard(tensor, rank, world_size):
@@ -201,7 +202,7 @@ def inter_group_reduction(fsdp_module):
     reduction_service.sync(fsdp_module.process_group)
     import time
     # time.sleep(1)
-    for acc, _ in reduction_service.buffers:
+    for acc in reduction_service.accumulations:
         if hasattr(fsdp_module, "_inter_node_pg"):
             dist.all_reduce(acc, group=fsdp_module._inter_node_pg)
         _div_if_needed(acc, fsdp_module._gradient_postdivide_factor)
