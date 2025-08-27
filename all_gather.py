@@ -15,7 +15,7 @@ import nvshmem.core
 import os
 from typing import List
 from torch import Tensor
-from odc.utils import SymmBufferRegistry, init_nvshmem
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
 #  Used to extract PyTorch Stream into a cuda.core.Stream for NVSHMEM APIs
@@ -47,23 +47,12 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
         output_tensor_views[src_group_rank].copy_(peer_tensors[src_rank])
     return output_tensor
 
-same_local_rank_pg = None
 def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
-    assert dist.get_world_size() == dist.get_world_size(group=pg), "Cached AG only supports pure data parallelism"
-
     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    if local_world_size == dist.get_world_size():
+    if local_world_size == torch.distributed.get_world_size():
        return
-    local_rank = dist.get_rank() % local_world_size
-    global same_local_rank_pg
-    if same_local_rank_pg is None:
-      for i in range(local_world_size):
-         ranks = [i + j * local_world_size for j in range(dist.get_world_size() // local_world_size)]
-         new_gp = torch.distributed.new_group(ranks=ranks, backend="nccl")
-         if i == local_rank:
-            same_local_rank_pg = new_gp
-    assert same_local_rank_pg is not None
     
+    same_local_rank_pg = get_same_local_rank_pg(pg)
     same_local_rank_pg_ranks = dist.get_process_group_ranks(group=same_local_rank_pg)
 
     registry = SymmBufferRegistry.get_instance()

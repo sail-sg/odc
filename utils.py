@@ -109,6 +109,13 @@ class SymmBufferRegistry:
         print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")
         return self.local_tensor[key]
     
+    def get_local_peer_tensors(self, local_tensor):
+        peer_tensors = self.get_peer_tensors(local_tensor)
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_rank = torch.distributed.get_rank() % local_world_size
+        num_nodes = torch.distributed.get_world_size() // local_world_size
+        return [peer_tensors[local_rank + i * local_world_size] for i in range(num_nodes)]
+    
     def has_key(self, key):
         return key in self.local_tensor
     
@@ -123,3 +130,20 @@ class SymmBufferRegistry:
         self.local_tensor_to_keys.clear()
         self.updated.clear()
         self.peer_tensors.clear()
+
+same_local_rank_pg = None
+# TODO: support hybrid mode, where pg is only a subset of the world
+def get_same_local_rank_pg(pg: torch.distributed.ProcessGroup):
+    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    assert torch.distributed.get_world_size() == torch.distributed.get_world_size(group=pg), "Cached AG only supports pure data parallelism"
+    assert local_world_size != torch.distributed.get_world_size(), "No need to call this for single node"
+    local_rank = torch.distributed.get_rank() % local_world_size
+    global same_local_rank_pg
+    if same_local_rank_pg is None:
+      for i in range(local_world_size):
+         ranks = [i + j * local_world_size for j in range(torch.distributed.get_world_size() // local_world_size)]
+         new_gp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+         if i == local_rank:
+            same_local_rank_pg = new_gp
+    assert same_local_rank_pg is not None
+    return same_local_rank_pg
