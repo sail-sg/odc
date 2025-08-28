@@ -5,18 +5,38 @@ from typing import List
 
 
 # From triton_dist.utils
-def init_nvshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
+def init_nvshmem():
+    assert torch.distributed.is_initialized()
     # Extract rank, nranks from process group
-    num_ranks = pg.size()
-    rank_id = pg.rank()
+    num_ranks = torch.distributed.get_world_size()
+    rank_id = torch.distributed.get_rank()
+    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    local_rank = rank_id % int(os.environ["LOCAL_WORLD_SIZE"])
 
     # Create an empty uniqueid for all ranks
-    broadcast_objects = [nvshmem.core.get_unique_id(empty=rank_id != 0)]
-    torch.distributed.broadcast_object_list(broadcast_objects, src=0, group=pg)
-    torch.distributed.barrier(group=pg)
+
     from cuda.core.experimental import Device
-    nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=broadcast_objects[0], rank=rank_id,
-                      nranks=num_ranks, initializer_method="uid")
+
+    # broadcast_objects = [nvshmem.core.get_unique_id(empty=rank_id != 0)]
+    # torch.distributed.broadcast_object_list(uid, src=0, group=pg)
+    # torch.distributed.barrier(group=pg)
+    # nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=uid[0], rank=rank_id,
+    #                   nranks=num_ranks, initializer_method="uid")
+    
+    
+    # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
+    all_gather_objects = [nvshmem.core.get_unique_id(empty=local_rank != 0)]
+    res = [None for _ in range(num_ranks)]
+    torch.distributed.all_gather_object(res, all_gather_objects, group=torch.distributed.group.WORLD)
+    torch.distributed.barrier(group=torch.distributed.group.WORLD)
+    uid = res[rank_id // local_world_size * local_world_size]
+    nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=uid[0], rank=local_rank,
+                      nranks=local_world_size, initializer_method="uid")
+    
+
+    
+    
+    
     # nvshmem.core.utils._configure_logging("DEBUG")
 
 
@@ -34,7 +54,9 @@ def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.T
         # https://forums.developer.nvidia.com/t/nvshmem4py-nvshmem-core-finalize-does-not-handle-everything/337979
         if peer == rank:
             return t
-        return nvshmem.core.get_peer_tensor(t, peer)
+        # return nvshmem.core.get_peer_tensor(t, peer)
+        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
+        return nvshmem.core.get_peer_tensor(t, peer % local_world_size)
 
     local_rank = rank % local_world_size
     rank_on_same_node_start = rank - local_rank
@@ -53,11 +75,6 @@ def nvshmem_free_tensor_sync(tensor):
 
 def finalize_distributed():
     nvshmem.core.finalize()
-
-
-def init_nvshmem():
-    assert torch.distributed.is_initialized()
-    init_nvshmem_by_torch_process_group(torch.distributed.group.WORLD)
 
 
 class SymmBufferRegistry:

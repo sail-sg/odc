@@ -83,12 +83,16 @@ class DistLock:
 
     def lock(self, target_rank, buffer_id):
         assert buffer_id < self.num_locks
-        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
+        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
+        # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
+        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % int(os.environ["LOCAL_WORLD_SIZE"]), buffer_id)
     
     def notify_data(self, target_rank, buffer_id, accumulation_id):
         assert buffer_id < self.num_locks
         assert accumulation_id > 0
-        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
+        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
+        # nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
+        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % int(os.environ["LOCAL_WORLD_SIZE"]), buffer_id, accumulation_id)
 
 class ReductionWatcher:
     def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor):
@@ -121,7 +125,7 @@ class ReductionWatcher:
             block_size = triton.next_power_of_2(self.num_locks)
 
             self.cpu_lock_buffers.fill_(0)
-            time.sleep(1/10000)
+            # time.sleep(1/10000)
             # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
 
             self.cpu_lock_buffers.copy_(self.lock_buffers, non_blocking=True)
@@ -387,7 +391,7 @@ if __name__ == "__main__":
     import os
     torch.cuda.cudart().cudaProfilerStart()
     try:
-      torch.cuda.set_device(f"cuda:{os.environ['RANK']}")
+      torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
       torch.distributed.init_process_group("nccl")
       init_nvshmem()
       world_size = torch.distributed.get_world_size()
@@ -422,7 +426,7 @@ if __name__ == "__main__":
       group_size = len(group_ranks)
       print(f"Rank {rank} group: {group_ranks}")
 
-      data = torch.rand(cnt * times, size, dtype=grad_dtype, device="cuda") / group_size / times
+      data = torch.rand(cnt * times, size, dtype=grad_dtype, device="cuda")
       # data = torch.arange(cnt * times * size, dtype=grad_dtype, device="cuda").reshape(cnt * times, size) / group_size / times
       # print(f"Rank {rank} data: {data}")
       # data = torch.ones(cnt * times, size, dtype=grad_dtype, device="cuda") * rank
@@ -490,7 +494,7 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
           reduce_scatter_payload = size // group_size* (group_size - 1)* data.dtype.itemsize
-          # print(f"Rank {rank} reduce_scatter bw: {[reduce_scatter_payload / 1024 ** 2 / start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}")
+          print(f"Rank {rank} reduce_scatter bw: {[reduce_scatter_payload / 1024 ** 2 / start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}")
           print(f"Rank {rank} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 

@@ -70,7 +70,7 @@ def all_gather_into_tensor_nccl(output_tensor: Tensor, input_tensor: Tensor, pg:
 if __name__ == "__main__":
     torch.cuda.cudart().cudaProfilerStart()
     try:
-      torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % 8}")
+      torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
       torch.distributed.init_process_group("nccl")
       init_nvshmem()
       world_size = torch.distributed.get_world_size()
