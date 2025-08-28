@@ -60,6 +60,53 @@ def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
     tensors = [registry.get_peer_tensors(input_tensor)[r] for r in same_local_rank_pg_ranks]
     torch.distributed.all_gather(tensors, input_tensor, group=same_local_rank_pg)
     return tensors
+
+dst_buffer_map = {}
+def all_gather_into_tensor_onstream(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
+    assert len(output_tensor.shape) == 1
+    assert len(input_tensor.shape) == 1
+
+    registry = SymmBufferRegistry.get_instance()
+    # print(f"Rank {torch.distributed.get_rank()} input_tensor: dtype {input_tensor.dtype}, device {input_tensor.device} shape {input_tensor.shape} ptr {input_tensor.data_ptr()}")
+    peer_tensors = registry.get_peer_tensors(input_tensor)
+
+    # All ranks are global ranks for usage in nvshmem
+    ranks = dist.get_process_group_ranks(group=pg)
+    # print(f"Ranks: {ranks} on {dist.get_rank()}")
+    group_idx = torch.distributed.get_rank(group=pg)
+
+    size = input_tensor.numel()
+
+    if (input_tensor.dtype, input_tensor.shape) not in dst_buffer_map:
+      dst_buffer_map[(input_tensor.dtype, input_tensor.shape)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(f"ag_dst_buffer_{input_tensor.dtype}_{input_tensor.shape}", input_tensor.shape, dtype=input_tensor.dtype)
+    dst_buffer = dst_buffer_map[(input_tensor.dtype, input_tensor.shape)]
+
+    output_tensor_views = [
+        output_tensor[r * size:(r + 1) * size] for r in range(len(ranks))
+    ]
+
+
+    class PyTorchStreamWrapper:
+        def __init__(self, pt_stream):
+            self.pt_stream = pt_stream
+            self.handle = pt_stream.cuda_stream
+
+        def __cuda_stream__(self):
+            stream_id = self.pt_stream.cuda_stream
+            return (0, stream_id)  # Return format required by CUDA Python
+    stream = PyTorchStreamWrapper(torch.cuda.current_stream())
+    # print(f"Rank {torch.distributed.get_rank()} stream: {stream}")
+
+
+    for r_offset in range(len(ranks)):
+        src_group_rank = (group_idx + r_offset) % len(ranks)
+        src_rank = ranks[src_group_rank]
+        src_array = input_tensor
+        size = input_tensor.numel()
+        target_pe = src_rank
+        nvshmem.core.get(dst_buffer, src_array, target_pe, stream=stream)  
+        output_tensor_views[src_group_rank].copy_(dst_buffer)
+    return output_tensor
     
 
 
@@ -108,7 +155,7 @@ if __name__ == "__main__":
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
         all_gather_sync_cache(src_tensors[i], group)
 
-      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
+      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_onstream, all_gather_into_tensor_nccl]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
