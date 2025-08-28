@@ -397,7 +397,7 @@ if __name__ == "__main__":
       grad_dtype = torch.float32
 
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
-      cnt = 20
+      cnt = 10
       times = 10
       size = 16 * (1000 ** 2)
       # cnt = 1

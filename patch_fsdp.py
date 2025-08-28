@@ -179,7 +179,6 @@ def custom_get_shard(tensor, rank, world_size):
         id(tensor), sharded)
     return sharded_in_nvshmem, padded
 
-
 def patch_fsdp(reduce_dtype=None):
     global reduction_service
     reduction_service = odc.ReductionService(accumulation_dtype=reduce_dtype)
@@ -193,7 +192,7 @@ def patch_fsdp(reduce_dtype=None):
 
 
 
-def inter_group_reduction(fsdp_module):
+def pre_optimizer_step(fsdp_module):
     from torch.distributed.fsdp._runtime_utils import _FSDPState, _div_if_needed
     import torch.distributed as dist
     global reduction_service
@@ -211,10 +210,17 @@ def inter_group_reduction(fsdp_module):
         # print(f"Rank {dist.get_rank()}: cast_grad_to_param_dtype_if_needed shape: {handle.flat_param.shape}")
         handle.flat_param.grad = reduction_service.get_accumulation(id(handle.flat_param)).to(handle.flat_param.dtype)
 
-def clear_accumulations():
+def pre_minibatch_start(fsdp_module):
     global reduction_service
     import torch.distributed as dist
     reduction_service.clear_accumulations()
+    # for handle in fsdp_module._all_handles:
+    #     odc.all_gather_sync_cache(handle.flat_param, fsdp_module.process_group)
+    
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    for fsdp_module in FSDP.fsdp_modules(fsdp_module):
+        odc.all_gather_sync_cache(fsdp_module._flat_param, fsdp_module.process_group)
+    
     # Make sure optimizer updates are visible to all ranks
     dist.barrier()
 
