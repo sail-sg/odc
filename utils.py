@@ -6,12 +6,13 @@ from typing import List
 
 # From triton_dist.utils
 def init_nvshmem():
+    print(f"init_nvshmem: {os.environ}")
     assert torch.distributed.is_initialized()
     # Extract rank, nranks from process group
     num_ranks = torch.distributed.get_world_size()
     rank_id = torch.distributed.get_rank()
-    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    local_rank = rank_id % int(os.environ["LOCAL_WORLD_SIZE"])
+    local_world_size = get_local_world_size()
+    local_rank = rank_id % get_local_world_size()
 
     # Create an empty uniqueid for all ranks
 
@@ -112,7 +113,7 @@ class SymmBufferRegistry:
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_world_size = get_local_world_size()
         local_rank = rank % local_world_size
         peer_tensors = []
         for node_rank in range(world_size // local_world_size):
@@ -128,7 +129,7 @@ class SymmBufferRegistry:
     
     def get_local_peer_tensors(self, local_tensor):
         peer_tensors = self.get_peer_tensors(local_tensor)
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_world_size = get_local_world_size()
         local_rank = torch.distributed.get_rank() % local_world_size
         num_nodes = torch.distributed.get_world_size() // local_world_size
         return [peer_tensors[local_rank + i * local_world_size] for i in range(num_nodes)]
@@ -151,7 +152,7 @@ class SymmBufferRegistry:
 same_local_rank_pg = None
 # TODO: support hybrid mode, where pg is only a subset of the world
 def get_same_local_rank_pg(pg: torch.distributed.ProcessGroup):
-    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    local_world_size = get_local_world_size()
     assert torch.distributed.get_world_size() == torch.distributed.get_world_size(group=pg), "Cached AG only supports pure data parallelism"
     assert local_world_size != torch.distributed.get_world_size(), "No need to call this for single node"
     local_rank = torch.distributed.get_rank() % local_world_size
@@ -164,3 +165,12 @@ def get_same_local_rank_pg(pg: torch.distributed.ProcessGroup):
             same_local_rank_pg = new_gp
     assert same_local_rank_pg is not None
     return same_local_rank_pg
+
+def get_local_world_size():
+    if "RAY_LOCAL_WORLD_SIZE" in os.environ:
+        return int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+    else:
+        return int(os.environ["LOCAL_WORLD_SIZE"])
+    
+    
+    

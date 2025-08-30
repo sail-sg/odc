@@ -11,7 +11,7 @@ from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, n
                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
 from typing import List
 import time
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size
 import torch.distributed as dist
 
 ### NVSHMEM kernels are used by clients to communicate with reduction servers
@@ -85,14 +85,14 @@ class DistLock:
         assert buffer_id < self.num_locks
         # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
         # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
-        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % int(os.environ["LOCAL_WORLD_SIZE"]), buffer_id)
+        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id)
     
     def notify_data(self, target_rank, buffer_id, accumulation_id):
         assert buffer_id < self.num_locks
         assert accumulation_id > 0
         # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
         # nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
-        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % int(os.environ["LOCAL_WORLD_SIZE"]), buffer_id, accumulation_id)
+        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id, accumulation_id)
 
 class ReductionWatcher:
     def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor):
@@ -125,7 +125,7 @@ class ReductionWatcher:
             block_size = triton.next_power_of_2(self.num_locks)
 
             self.cpu_lock_buffers.fill_(0)
-            # time.sleep(1/10000)
+            time.sleep(1/10000)
             # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
 
             self.cpu_lock_buffers.copy_(self.lock_buffers, non_blocking=True)
@@ -156,7 +156,8 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
     torch.cuda.set_device(device_id)
     import sys
     # torch.cuda.cudart().cudaProfilerStart()
-    
+    import os
+    print('reduction_watcher_function: ', os.environ)
     buffers = [tensor_from_handle(*buffer) for buffer in buffers]
     accumulations = [tensor_from_handle(*acc) for acc in accumulations]
     lock_buffers = tensor_from_handle(*lock_buffers)
@@ -185,7 +186,7 @@ def start_reduction_watcher(accumulations, buffers, lock_buffers):
     ctx = torch.multiprocessing.get_context("spawn")
     cmd_queue = ctx.Queue()
     response_queue = ctx.Queue()
-    device_id = torch.distributed.get_rank() % 8
+    device_id = torch.distributed.get_rank() % get_local_world_size()
     process = ctx.Process(target=reduction_watcher_function,
                        args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
     process.start()
@@ -302,7 +303,7 @@ class ReductionService:
         size = buffer.numel()
         assert input_tensor.numel() == size * group_size
         
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_world_size = get_local_world_size()
 
         rank_info = [(r, group_ranks[r], group_ranks[r] % local_world_size) for r in range(group_size)]
         for local_r_offset in range(0, local_world_size):
@@ -345,7 +346,7 @@ class ReductionService:
         torch.distributed.all_gather_object(dispatched_task_list, self.dispatched_tasks, group=pg)
         torch.cuda.synchronize()
 
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_world_size = get_local_world_size()
         if local_world_size == torch.distributed.get_world_size():
            target = sum(dispatched_task_list)
         else:
@@ -361,7 +362,7 @@ class ReductionService:
           self.reduce_scatter_sync_cache(acc, pg)
 
     def reduce_scatter_sync_cache(self, accumulation, pg: dist.ProcessGroup):
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_world_size = get_local_world_size()
         if local_world_size == torch.distributed.get_world_size():
           return
         

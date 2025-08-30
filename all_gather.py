@@ -15,7 +15,7 @@ import nvshmem.core
 import os
 from typing import List
 from torch import Tensor
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
 #  Used to extract PyTorch Stream into a cuda.core.Stream for NVSHMEM APIs
@@ -48,7 +48,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
     return output_tensor
 
 def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
-    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    local_world_size = get_local_world_size()
     if local_world_size == torch.distributed.get_world_size():
        return
     
