@@ -377,6 +377,18 @@ if __name__ == "__main__":
 
       dist.barrier()
       torch.cuda.synchronize()
+      with torch.cuda.nvtx.range("warmup"):
+        for reduce_scatter_func in [reduce_scatter_accumulation, reduce_scatter_accumulation_nccl]:
+          with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
+            for i in range(cnt):
+              dst_idx = i
+              reduce_scatter_func(data[i], dst_idx, group)
+              compute_buffer[dst_idx] @ compute_param
+            if reduce_scatter_func == reduce_scatter_accumulation:
+              reduction_service.sync(group)
+      dist.barrier()
+      torch.cuda.synchronize()
+
       for reduce_scatter_func in [reduce_scatter_accumulation, reduce_scatter_accumulation_nccl]:
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
@@ -384,10 +396,9 @@ if __name__ == "__main__":
           compute_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
           start = torch.cuda.Event(enable_timing=True)
           
+          start.record()
           for i in range(cnt * times):
             dst_idx = i % cnt
-            if i == 1:
-              start.record()
             
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
