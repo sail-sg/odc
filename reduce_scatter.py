@@ -129,8 +129,7 @@ class ReductionWatcher:
                 break
             
             nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False).tolist()
-            if len(nonzeros) > 0:
-              nonzeros = nonzeros[0]
+            nonzeros = sum(nonzeros, [])
             
             for buf_id in nonzeros:
                 acc_id = self.cpu_lock_buffers[buf_id]
