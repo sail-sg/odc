@@ -182,6 +182,10 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
 
 def start_reduction_watcher(accumulations, buffers, lock_buffers):
     from torch.multiprocessing import Process
+
+    original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if original_visible_devices is not None:
+        del os.environ['CUDA_VISIBLE_DEVICES']
     
     ctx = torch.multiprocessing.get_context("spawn")
     cmd_queue = ctx.Queue()
@@ -190,6 +194,10 @@ def start_reduction_watcher(accumulations, buffers, lock_buffers):
     process = ctx.Process(target=reduction_watcher_function,
                        args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
     process.start()
+    if original_visible_devices is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
+    elif 'CUDA_VISIBLE_DEVICES' in os.environ:
+        del os.environ['CUDA_VISIBLE_DEVICES']
     return cmd_queue, response_queue
 
 def call_watcher(watcher_handle, cmd, *args):
