@@ -1,3 +1,4 @@
+from collections import defaultdict
 import nvshmem.core
 import torch
 import os
@@ -11,7 +12,7 @@ from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, n
                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
 from typing import List
 import time
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size
+from utils import SymmBufferRegistry, init_nvshmem, get_local_world_size
 import torch.distributed as dist
 
 ### NVSHMEM kernels are used by clients to communicate with reduction servers
@@ -221,7 +222,7 @@ class ReductionService:
         self.shared_buffer = {}
         self.dispatched_tasks = 0
         self.accumulation_dtype = accumulation_dtype
-        pass
+        self.rank_streams = defaultdict(lambda: torch.cuda.Stream())
     
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
@@ -313,22 +314,30 @@ class ReductionService:
         
         local_world_size = get_local_world_size()
 
+        events = []
         rank_info = [(r, group_ranks[r], group_ranks[r] % local_world_size) for r in range(group_size)]
         for local_r_offset in range(0, local_world_size):
             dst_local_rank = (torch.distributed.get_rank() + local_r_offset) % local_world_size
             dst_rank_infos = [r for r in rank_info if r[2] == dst_local_rank]
             matching_rank_in_local_world = torch.distributed.get_rank() // local_world_size * local_world_size + dst_local_rank
-            
-            
 
             if len(dst_rank_infos) == 0:
                 continue
-            self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            
+            stream = self.rank_streams[dst_local_rank]
+            event = torch.cuda.Event()
+            events.append(event)
+            with torch.cuda.stream(stream):
+                self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
 
-            for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-                dst_buffer = peer_buffers[dst_group_idx]
-                dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+                for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
+                    dst_buffer = peer_buffers[dst_group_idx]
+                    dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
+                self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+                event.record()
+
+        for event in events:
+            torch.cuda.current_stream().wait_event(event)
            
         # for r_offset in range(0, group_size):
         #     dst_group_idx = (group_idx + r_offset) % group_size
@@ -462,6 +471,17 @@ if __name__ == "__main__":
 
       dist.barrier()
       torch.cuda.synchronize()
+      with torch.cuda.nvtx.range("warmup"):
+        for reduce_scatter_func in [reduce_scatter_accumulation, reduce_scatter_accumulation_nccl]:
+          with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
+            for i in range(cnt):
+              dst_idx = i
+              reduce_scatter_func(data[i], dst_idx, group)
+              compute_buffer[dst_idx] @ compute_param
+            if reduce_scatter_func == reduce_scatter_accumulation:
+              reduction_service.sync(group)
+      dist.barrier()
+      torch.cuda.synchronize()
       for reduce_scatter_func in [reduce_scatter_accumulation, reduce_scatter_accumulation_nccl]:
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
@@ -515,4 +535,5 @@ if __name__ == "__main__":
       traceback.print_exc()
     finally:
       SymmBufferRegistry.get_instance().finalize()
+      torch.distributed.destroy_process_group()
     torch.cuda.cudart().cudaProfilerStop()
