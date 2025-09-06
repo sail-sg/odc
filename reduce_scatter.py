@@ -14,34 +14,68 @@ import time
 from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
 import torch.distributed as dist
 
-### NVSHMEM kernels are used by clients to communicate with reduction servers
-@triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
-def nvshmem_poll_lock_kernel(
-    lock_buffer_ptr,
-    target_rank,
-    lock_id,
-):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
-    if pid == 0 and tidx == 0:
-        r = 1
-        while r != 0:
-            r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, -1, target_rank)
-    __syncthreads()
+# ### NVSHMEM kernels are used by clients to communicate with reduction servers
+# @triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
+# def nvshmem_poll_lock_kernel(
+#     lock_buffer_ptr,
+#     target_rank,
+#     lock_id,
+# ):
+#     pid = tl.program_id(axis=0)
+#     tidx = tid(axis=0)
+#     if pid == 0 and tidx == 0:
+#         r = 1
+#         while r != 0:
+#             r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, -1, target_rank)
+#     __syncthreads()
 
 
-@triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
-def nvshmem_set_kernel(
-    lock_buffer_ptr,
-    target_rank,
-    lock_id,
-    value,
-):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
-    if pid == 0 and tidx == 0:
-        libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
-    __syncthreads()
+# @triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
+# def nvshmem_set_kernel(
+#     lock_buffer_ptr,
+#     target_rank,
+#     lock_id,
+#     value,
+# ):
+#     pid = tl.program_id(axis=0)
+#     tidx = tid(axis=0)
+#     if pid == 0 and tidx == 0:
+#         libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
+#     __syncthreads()
+
+@triton.jit(do_not_specialize=["server_rank", "command", "request_id"])
+def nvshmem_request_wait_kernel(
+  request_buffer_ptr,
+  response_buffer_ptr,
+  client_rank,
+  server_rank,
+  command,
+  request_id):
+  pid = tl.program_id(axis=0)
+  tidx = tid(axis=0)
+  if pid == 0 and tidx == 0:
+    libshmem_device.int_p(request_buffer_ptr + client_rank, command + 1, server_rank)
+    # libshmem_device.quiet()
+    # r = 0
+    # while r < 1:
+    #   r
+    while r != request_id:
+      r = libshmem_device.int_g(response_buffer_ptr + client_rank, server_rank)
+  __syncthreads()
+
+@triton.jit(do_not_specialize=["client_rank", "request_id"])
+def nvshmem_response_kernel(
+  request_buffer_ptr,
+  response_buffer_ptr,
+  client_rank,
+  server_rank,
+  request_id):
+  pid = tl.program_id(axis=0)
+  tidx = tid(axis=0)
+  if pid == 0 and tidx == 0:
+    tl.store(request_buffer_ptr + client_rank, 0)
+    tl.store(response_buffer_ptr + client_rank, request_id)
+  __syncthreads()
 
 
 ### Plain triton kernels are used within reduction servers themselves, locally.
@@ -63,6 +97,32 @@ def reduction_watcher_kernel(
           r = tl.max(data)
           __syncthreads()
 
+def test_request_response():
+    request_buffer = nvshmem_create_tensor(1024, torch.int32)
+    response_buffer = nvshmem_create_tensor(1024, torch.int32)
+    request_buffer_cpu = torch.empty_like(request_buffer, device="cpu").pin_memory()
+    if torch.distributed.get_rank() != 0:
+      for i in range(64):
+        nvshmem_request_wait_kernel[(1, )](request_buffer, response_buffer, 
+        client_rank=torch.distributed.get_rank(), server_rank=0, command=(i % 2 + 1), request_id=i + 1)
+        torch.cuda.synchronize()
+        print(f"Rank {torch.distributed.get_rank()} command {i % 2 + 1} request_id {i + 1} done")
+    else:
+      done_counts = torch.zeros_like(request_buffer, device="cuda")
+      while True:
+        request_buffer_cpu.copy_(request_buffer)
+        nonzeros = torch.nonzero(request_buffer_cpu, as_tuple=False).squeeze(1).tolist()
+        for client_rank in nonzeros:
+          command = request_buffer_cpu[client_rank]
+          print(f"Rank {torch.distributed.get_rank()} received command {command} from client {client_rank}")
+          done_counts[client_rank] += 1
+          nvshmem_response_kernel[(1, )](request_buffer, response_buffer, client_rank = client_rank, server_rank=0, request_id=done_counts[client_rank])
+    torch.cuda.synchronize()
+
+        
+        
+    
+
 @triton.jit(do_not_specialize=["lock_id"])
 def reset_lock_kernel(
     lock_buffer_ptr,
@@ -83,16 +143,13 @@ class DistLock:
 
     def lock(self, target_rank, buffer_id):
         assert buffer_id < self.num_locks
-        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
-        # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
-        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id)
+        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
+        # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id)
     
     def notify_data(self, target_rank, buffer_id, accumulation_id):
         assert buffer_id < self.num_locks
         assert accumulation_id > 0
-        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
-        # nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
-        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id, accumulation_id)
+        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
 
 class ReductionWatcher:
     def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor):
@@ -406,6 +463,8 @@ if __name__ == "__main__":
       torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
       torch.distributed.init_process_group("nccl")
       init_nvshmem()
+      test_request_response()
+      raise Exception("Stop here")
       world_size = torch.distributed.get_world_size()
       rank = torch.distributed.get_rank()
 

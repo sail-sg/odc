@@ -18,22 +18,11 @@ def init_nvshmem():
 
     from cuda.core.experimental import Device
 
-    # broadcast_objects = [nvshmem.core.get_unique_id(empty=rank_id != 0)]
-    # torch.distributed.broadcast_object_list(uid, src=0, group=pg)
-    # torch.distributed.barrier(group=pg)
-    # nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=uid[0], rank=rank_id,
-    #                   nranks=num_ranks, initializer_method="uid")
-    
-    
-    # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
-    all_gather_objects = [nvshmem.core.get_unique_id(empty=local_rank != 0)]
-    res = [None for _ in range(num_ranks)]
-    torch.distributed.all_gather_object(res, all_gather_objects, group=torch.distributed.group.WORLD)
+    broadcast_objects = [nvshmem.core.get_unique_id(empty=rank_id != 0)]
+    torch.distributed.broadcast_object_list(broadcast_objects, src=0, group=torch.distributed.group.WORLD)
     torch.distributed.barrier(group=torch.distributed.group.WORLD)
-    uid = res[rank_id // local_world_size * local_world_size]
-    nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=uid[0], rank=local_rank,
-                      nranks=local_world_size, initializer_method="uid")
-    
+    nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=broadcast_objects[0], rank=rank_id,
+                      nranks=num_ranks, initializer_method="uid")    
 
     
     
@@ -55,9 +44,7 @@ def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.T
         # https://forums.developer.nvidia.com/t/nvshmem4py-nvshmem-core-finalize-does-not-handle-everything/337979
         if peer == rank:
             return t
-        # return nvshmem.core.get_peer_tensor(t, peer)
-        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
-        return nvshmem.core.get_peer_tensor(t, peer % local_world_size)
+        return nvshmem.core.get_peer_tensor(t, peer)
 
     local_rank = rank % local_world_size
     rank_on_same_node_start = rank - local_rank
