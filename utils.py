@@ -166,6 +166,21 @@ def get_same_local_rank_pg(pg: torch.distributed.ProcessGroup):
     assert same_local_rank_pg is not None
     return same_local_rank_pg
 
+local_world_pg = None
+def get_local_world_pg(pg: torch.distributed.ProcessGroup):
+    local_world_size = get_local_world_size()
+    assert torch.distributed.get_world_size() == torch.distributed.get_world_size(group=pg), "Cached AG only supports pure data parallelism"
+    rank = torch.distributed.get_rank()
+    global local_world_pg
+    if local_world_pg is None:
+      for i in range(0, torch.distributed.get_world_size(), local_world_size):
+         ranks = list(range(i, i + local_world_size))
+         new_gp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+         if rank in ranks:
+            local_world_pg = new_gp
+    assert local_world_pg is not None
+    return local_world_pg
+
 def get_local_world_size():
     if "RAY_LOCAL_WORLD_SIZE" in os.environ:
         return int(os.environ["RAY_LOCAL_WORLD_SIZE"])

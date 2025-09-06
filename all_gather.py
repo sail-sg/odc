@@ -15,7 +15,7 @@ import nvshmem.core
 import os
 from typing import List
 from torch import Tensor
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
 #  Used to extract PyTorch Stream into a cuda.core.Stream for NVSHMEM APIs
@@ -46,6 +46,28 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
         src_rank = ranks[src_group_rank]
         output_tensor_views[src_group_rank].copy_(peer_tensors[src_rank])
     return output_tensor
+
+def all_gather_into_tensor_nccl_comm(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
+    assert len(output_tensor.shape) == 1
+    assert len(input_tensor.shape) == 1
+
+    registry = SymmBufferRegistry.get_instance()
+    # print(f"Rank {torch.distributed.get_rank()} input_tensor: dtype {input_tensor.dtype}, device {input_tensor.device} shape {input_tensor.shape} ptr {input_tensor.data_ptr()}")
+    local_peer_tensors = registry.get_local_peer_tensors(input_tensor)
+
+    size = input_tensor.numel()
+
+    output_tensor_views = [
+        output_tensor[r * size:(r + 1) * size] for r in range(torch.distributed.get_world_size(group=pg))
+    ]
+
+    local_world_pg = get_local_world_pg(pg)
+    local_world_size = torch.distributed.get_world_size(group=local_world_pg)
+    assert len(local_peer_tensors) * local_world_size == torch.distributed.get_world_size(group=pg)
+    for i in range(0, len(output_tensor_views), local_world_size):
+      dst_tensors = output_tensor_views[i:i+local_world_size]
+      src_tensor = local_peer_tensors[i // local_world_size]
+      torch.distributed.all_gather(dst_tensors, src_tensor, group=local_world_pg)
 
 def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
     local_world_size = get_local_world_size()
@@ -108,7 +130,7 @@ if __name__ == "__main__":
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
         all_gather_sync_cache(src_tensors[i], group)
 
-      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
+      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
