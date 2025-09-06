@@ -299,16 +299,12 @@ class ReductionService:
 
         size = self.infer_output_shape(input_tensor, pg)[0]
 
-        input_tensor_views = [
-            input_tensor[r * size:(r + 1) * size] for r in range(torch.distributed.get_world_size(group=pg))
-        ]
-
         local_world_pg = get_local_world_pg(pg)
         local_world_size = torch.distributed.get_world_size(group=local_world_pg)
         assert len(local_peer_accs) * local_world_size == torch.distributed.get_world_size(group=pg)
-        for i in range(0, len(input_tensor_views), local_world_size):
-          src_tensors = input_tensor_views[i:i+local_world_size]
-          torch.distributed.reduce_scatter(buffer, src_tensors, group=local_world_pg)
+        for i in range(0, torch.distributed.get_world_size(group=pg), local_world_size):
+          src_tensor = input_tensor[i * size:(i + local_world_size) * size]
+          torch.distributed.reduce_scatter_tensor(buffer, src_tensor, group=local_world_pg)
           local_peer_accs[i // local_world_size].add_(buffer)
 
     def reduce_scatter_accumulation(self, key, input_tensor, pg: dist.ProcessGroup):
@@ -419,7 +415,7 @@ if __name__ == "__main__":
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
       cnt = 10
       times = 10
-      size = 16 * (1000 ** 2)
+      size = 64 * (1000 ** 2)
       # cnt = 1
       # times = 2
       # size = 16 * (1000 ** 0)
@@ -442,7 +438,10 @@ if __name__ == "__main__":
       group_size = len(group_ranks)
       print(f"Rank {rank} group: {group_ranks}")
 
-      data = torch.rand(cnt * times, size, dtype=grad_dtype, device="cuda")
+      data = [
+        torch.rand(size, dtype=grad_dtype, device="cuda")
+        for _ in range(cnt * times)
+      ]
       # data = torch.arange(cnt * times * size, dtype=grad_dtype, device="cuda").reshape(cnt * times, size) / group_size / times
       # print(f"Rank {rank} data: {data}")
       # data = torch.ones(cnt * times, size, dtype=grad_dtype, device="cuda") * rank
@@ -482,7 +481,7 @@ if __name__ == "__main__":
           
           for i in range(cnt * times):
             dst_idx = i % cnt
-            if i == 1:
+            if i == cnt:
               start.record()
             
             # dst_arr = [
@@ -492,10 +491,12 @@ if __name__ == "__main__":
             start_events[i].record()
             reduce_scatter_func(data[i], dst_idx, group)
             comm_events[i].record()
-            compute_buffer[dst_idx] @ compute_param
+            # compute_buffer[dst_idx] @ compute_param
             compute_events[i].record()
             
             # print(dst)
+          end = torch.cuda.Event(enable_timing=True)
+          end.record()
           
           
           
@@ -508,13 +509,11 @@ if __name__ == "__main__":
           else:
             pass
             # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[0]}")
-          end = torch.cuda.Event(enable_timing=True)
-          end.record()
           dist.barrier()
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
-          reduce_scatter_payload = size // group_size* (group_size - 1)* data.dtype.itemsize
-          print(f"Rank {rank} reduce_scatter bw: {[reduce_scatter_payload / 1024 ** 2 / start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}")
+          reduce_scatter_payload = size // group_size* (group_size - 1)* data[0].dtype.itemsize
+          print(f"Rank {rank} reduce_scatter bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 1)) / start.elapsed_time(end)}")
           print(f"Rank {rank} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 

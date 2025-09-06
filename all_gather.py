@@ -57,17 +57,17 @@ def all_gather_into_tensor_nccl_comm(output_tensor: Tensor, input_tensor: Tensor
 
     size = input_tensor.numel()
 
-    output_tensor_views = [
-        output_tensor[r * size:(r + 1) * size] for r in range(torch.distributed.get_world_size(group=pg))
-    ]
+    # output_tensor_views = [
+    #     output_tensor[r * size:(r + 1) * size] for r in range(torch.distributed.get_world_size(group=pg))
+    # ]
 
     local_world_pg = get_local_world_pg(pg)
     local_world_size = torch.distributed.get_world_size(group=local_world_pg)
     assert len(local_peer_tensors) * local_world_size == torch.distributed.get_world_size(group=pg)
-    for i in range(0, len(output_tensor_views), local_world_size):
-      dst_tensors = output_tensor_views[i:i+local_world_size]
+    for i in range(0, torch.distributed.get_world_size(group=pg), local_world_size):
+      dst_tensor = output_tensor[i * size:(i + local_world_size) * size]
       src_tensor = local_peer_tensors[i // local_world_size]
-      torch.distributed.all_gather(dst_tensors, src_tensor, group=local_world_pg)
+      torch.distributed.all_gather_into_tensor(dst_tensor, src_tensor, group=local_world_pg)
 
 def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
     local_world_size = get_local_world_size()
@@ -148,7 +148,7 @@ if __name__ == "__main__":
             start_events[i].record()
             all_gather_func(dst, src_tensors[i], group)
             comm_events[i].record()
-            compute_buffer[i] @ compute_param
+            # compute_buffer[i] @ compute_param
             compute_events[i].record()
             
             # print(dst)
@@ -159,9 +159,9 @@ if __name__ == "__main__":
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
-          print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
+          # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* torch.long.itemsize
-          print(f"Rank {rank} all_gather bw: {[all_gather_payload / 1024 ** 2 / start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}")
+          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 
