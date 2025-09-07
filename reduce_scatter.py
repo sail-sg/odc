@@ -11,37 +11,9 @@ from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, n
                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
 from typing import List
 import time
+from dataclasses import dataclass
 from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
 import torch.distributed as dist
-
-# ### NVSHMEM kernels are used by clients to communicate with reduction servers
-# @triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
-# def nvshmem_poll_lock_kernel(
-#     lock_buffer_ptr,
-#     target_rank,
-#     lock_id,
-# ):
-#     pid = tl.program_id(axis=0)
-#     tidx = tid(axis=0)
-#     if pid == 0 and tidx == 0:
-#         r = 1
-#         while r != 0:
-#             r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, -1, target_rank)
-#     __syncthreads()
-
-
-# @triton.jit(do_not_specialize=["target_rank", "lock_id", "value"])
-# def nvshmem_set_kernel(
-#     lock_buffer_ptr,
-#     target_rank,
-#     lock_id,
-#     value,
-# ):
-#     pid = tl.program_id(axis=0)
-#     tidx = tid(axis=0)
-#     if pid == 0 and tidx == 0:
-#         libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
-#     __syncthreads()
 
 @triton.jit(do_not_specialize=["server_rank", "command", "request_id"])
 def nvshmem_request_wait_kernel(
@@ -54,110 +26,113 @@ def nvshmem_request_wait_kernel(
   pid = tl.program_id(axis=0)
   tidx = tid(axis=0)
   if pid == 0 and tidx == 0:
-    libshmem_device.int_p(request_buffer_ptr + client_rank, command + 1, server_rank)
-    # libshmem_device.quiet()
-    # r = 0
-    # while r < 1:
-    #   r
+    libshmem_device.int_p(request_buffer_ptr + client_rank, command, server_rank)
+    r=request_id-1
     while r != request_id:
-      r = libshmem_device.int_g(response_buffer_ptr + client_rank, server_rank)
+      libshmem_device.quiet()
+      r=libshmem_device.int_g(response_buffer_ptr + client_rank, server_rank)
   __syncthreads()
 
-@triton.jit(do_not_specialize=["client_rank", "request_id"])
-def nvshmem_response_kernel(
-  request_buffer_ptr,
-  response_buffer_ptr,
-  client_rank,
-  server_rank,
-  request_id):
-  pid = tl.program_id(axis=0)
-  tidx = tid(axis=0)
-  if pid == 0 and tidx == 0:
-    tl.store(request_buffer_ptr + client_rank, 0)
-    tl.store(response_buffer_ptr + client_rank, request_id)
-  __syncthreads()
+@dataclass
+class ClientContext:
+    request_buffer: torch.Tensor
+    response_buffer: torch.Tensor
+    next_request_id: list[int]
 
+client_context = None
+def remote_request(client_context, server_rank, command):
+    nvshmem_request_wait_kernel[(1, )](
+        client_context.request_buffer,
+        client_context.response_buffer,
+        client_rank=torch.distributed.get_rank(),
+        server_rank=server_rank,
+        command=command,
+        request_id=client_context.next_request_id[server_rank])
+    client_context.next_request_id[server_rank] += 1
 
-### Plain triton kernels are used within reduction servers themselves, locally.
+@dataclass
+class ServerContext:
+    request_buffer: torch.Tensor
+    response_buffer: torch.Tensor
+    next_request_id: list[int]
 
-@triton.jit(do_not_specialize=["num_locks"])
-def reduction_watcher_kernel(
-    lock_buffer_ptr,
-    num_locks,
-    BLOCK_SIZE: tl.constexpr,
-):
-   pid = tl.program_id(axis=0)
-   tidx = tid(axis=0)
-   if pid == 0:
-      r = 0
-      offsets = tl.arange(0, BLOCK_SIZE)
-      mask = offsets < num_locks
-      while r < 1:
-          data = tl.load(lock_buffer_ptr + offsets, mask=mask, volatile=True)
-          r = tl.max(data)
-          __syncthreads()
+def ack(server_context, client_rank):
+    server_context.request_buffer[client_rank] = 0
+    server_context.response_buffer[client_rank] = server_context.next_request_id[client_rank]
+    server_context.next_request_id[client_rank] += 1
+
+def server_loop(server_context, dispatch_func, exit_predicate, client_mask=set()):
+    request_buffer_cpu = torch.empty_like(server_context.request_buffer, device="cpu").pin_memory()
+    while True:
+        request_buffer_cpu.copy_(server_context.request_buffer)
+        nonzeros = torch.nonzero(request_buffer_cpu, as_tuple=False).squeeze(1).tolist()
+        for client_rank in nonzeros:
+            if len(client_mask) > 0 and client_rank not in client_mask:
+                continue
+            command = request_buffer_cpu[client_rank]
+            # print(f"Rank {torch.distributed.get_rank()} received command {command} from client {client_rank}")
+            acked = dispatch_func(client_rank, command)
+            if not acked:
+                ack(server_context, client_rank)
+        if exit_predicate():
+            break
 
 def test_request_response():
     request_buffer = nvshmem_create_tensor(1024, torch.int32)
     response_buffer = nvshmem_create_tensor(1024, torch.int32)
     request_buffer_cpu = torch.empty_like(request_buffer, device="cpu").pin_memory()
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+    num_requests = 10000
     if torch.distributed.get_rank() != 0:
-      for i in range(64):
-        nvshmem_request_wait_kernel[(1, )](request_buffer, response_buffer, 
-        client_rank=torch.distributed.get_rank(), server_rank=0, command=(i % 2 + 1), request_id=i + 1)
-        torch.cuda.synchronize()
-        print(f"Rank {torch.distributed.get_rank()} command {i % 2 + 1} request_id {i + 1} done")
+      client_context = ClientContext(request_buffer, response_buffer, [1] * 1024)
+      for i in range(num_requests):
+        remote_request(client_context, 0, i % 2 + 1)
     else:
-      done_counts = torch.zeros_like(request_buffer, device="cuda")
-      while True:
-        request_buffer_cpu.copy_(request_buffer)
-        nonzeros = torch.nonzero(request_buffer_cpu, as_tuple=False).squeeze(1).tolist()
-        for client_rank in nonzeros:
-          command = request_buffer_cpu[client_rank]
-          print(f"Rank {torch.distributed.get_rank()} received command {command} from client {client_rank}")
-          done_counts[client_rank] += 1
-          nvshmem_response_kernel[(1, )](request_buffer, response_buffer, client_rank = client_rank, server_rank=0, request_id=done_counts[client_rank])
+      server_context = ServerContext(request_buffer, response_buffer, [1] * 1024)
+      server_loop(server_context, lambda client_rank, command: False, lambda: min(server_context.next_request_id[1:torch.distributed.get_world_size()]) == num_requests + 1)
+      # done_counts = torch.zeros_like(request_buffer, device="cpu")
+      # while True:
+      #   request_buffer_cpu.copy_(request_buffer)
+      #   nonzeros = torch.nonzero(request_buffer_cpu, as_tuple=False).squeeze(1).tolist()
+      #   for client_rank in nonzeros:
+      #     command = request_buffer_cpu[client_rank]
+      #     print(f"Rank {torch.distributed.get_rank()} received command {command} from client {client_rank}")
+      #     done_counts[client_rank] += 1
+      #     request_buffer[client_rank] = 0
+      #     response_buffer[client_rank] = done_counts[client_rank]
+      #   if done_counts[1:8].min() == 10000:
+      #       break
+    torch.distributed.barrier()
     torch.cuda.synchronize()
 
-        
-        
-    
-
-@triton.jit(do_not_specialize=["lock_id"])
-def reset_lock_kernel(
-    lock_buffer_ptr,
-    lock_id):
-    pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
-    if pid == 0 and tidx == 0:
-        tl.atomic_xchg(lock_buffer_ptr + lock_id, 0)
-    __syncthreads()
-
 class DistLock:
-    def __init__(self, num_locks):
-        self.num_locks = num_locks
-        self.lock_buffers = nvshmem_create_tensor(self.num_locks, torch.int32)
-        self.lock_buffers.fill_(0)
-        self.cpu_lock_buffers = torch.empty_like(self.lock_buffers, device="cpu").pin_memory()
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.request_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer('request_buffer', (self.world_size,), torch.int32)
+        self.response_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer('response_buffer', (self.world_size,), torch.int32)
+        self.client_context = ClientContext(self.request_buffer, self.response_buffer, [1] * self.world_size)
+        self.server_context = ServerContext(self.request_buffer, self.response_buffer, [1] * self.world_size)
         
 
-    def lock(self, target_rank, buffer_id):
-        assert buffer_id < self.num_locks
-        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
-        # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id)
+    def lock(self, target_rank):
+        assert target_rank < self.world_size
+        remote_request(self.client_context, target_rank, -1)
     
     def notify_data(self, target_rank, buffer_id, accumulation_id):
-        assert buffer_id < self.num_locks
         assert accumulation_id > 0
-        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
+        assert buffer_id < 2** 10
+        assert accumulation_id < 2** 10
+        command = (buffer_id << 16) | accumulation_id
+        remote_request(self.client_context, target_rank, command)
 
 class ReductionWatcher:
-    def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor):
+    def __init__(self, world_size, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], request_buffer: torch.Tensor, response_buffer: torch.Tensor):
         self.accumulations = accumulations
         self.buffers = buffers
-        self.lock_buffers = lock_buffers
-        self.cpu_lock_buffers = torch.empty_like(self.lock_buffers, device="cpu").pin_memory()
-        self.num_locks = len(lock_buffers)
+        self.request_buffer = request_buffer
+        self.response_buffer = response_buffer
+        self.world_size = world_size
         self.running = True
         self.task_count = 0
 
@@ -178,44 +153,63 @@ class ReductionWatcher:
         self.accumulations.append([tensor_from_handle(*acc) for acc in accumulations])
 
     def run(self):
-        while self.running:
-            block_size = triton.next_power_of_2(self.num_locks)
+        def dispatch_func(client_rank, command):
+            if command == -1:
+                client_mask.add(client_rank)
+                return False
+            else:
+                ack(self.server_context, client_rank)
+                buffer_id = command >> 16
+                accumulation_id = command & 0xFFFF
+                for acc, buf in zip(self.accumulations[accumulation_id - 1], self.buffers[buffer_id]):
+                    acc.add_(buf)
+                self.task_count += 1
+                client_mask.remove(client_rank)
+                return True
+        def exit_predicate():
+            return not self.running
+        self.server_context = ServerContext(self.request_buffer, self.response_buffer, [1] * self.world_size)
+        client_mask = set()
+        server_loop(self.server_context, dispatch_func, exit_predicate, client_mask)
+        # while self.running:
+        #     block_size = triton.next_power_of_2(self.num_locks)
 
-            self.cpu_lock_buffers.fill_(0)
-            time.sleep(1/10000)
-            # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
+        #     self.cpu_lock_buffers.fill_(0)
+        #     time.sleep(1/10000)
+        #     # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
 
-            self.cpu_lock_buffers.copy_(self.lock_buffers, non_blocking=True)
-            torch.cuda.current_stream().synchronize()
-            if not self.running:
-                break
+        #     self.cpu_lock_buffers.copy_(self.lock_buffers, non_blocking=True)
+        #     torch.cuda.current_stream().synchronize()
+        #     if not self.running:
+        #         break
             
-            nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False).squeeze(1).tolist()
+        #     nonzeros = torch.nonzero(self.cpu_lock_buffers, as_tuple=False).squeeze(1).tolist()
             
-            for buf_id in nonzeros:
-                acc_id = self.cpu_lock_buffers[buf_id]
-                if acc_id > 0:
-                    # print(f"Rank {torch.cuda.current_device()} adding buffer {buf_id} -> {acc_id - 1}")
-                    for acc, buf in zip(self.accumulations[acc_id - 1], self.buffers[buf_id]):
-                        acc.add_(buf)
-                    self.task_count += 1
+        #     for buf_id in nonzeros:
+        #         acc_id = self.cpu_lock_buffers[buf_id]
+        #         if acc_id > 0:
+        #             # print(f"Rank {torch.cuda.current_device()} adding buffer {buf_id} -> {acc_id - 1}")
+        #             for acc, buf in zip(self.accumulations[acc_id - 1], self.buffers[buf_id]):
+        #                 acc.add_(buf)
+        #             self.task_count += 1
                     
-                    # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
-                    reset_lock_kernel[(1, )](self.lock_buffers, buf_id)
+        #             # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
+        #             reset_lock_kernel[(1, )](self.lock_buffers, buf_id)
 
 def tensor_from_handle(handle, size, dtype):
     from tensor_ipc import reconstruct_tensor
     return reconstruct_tensor(handle, (size,), dtype)
 
-def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue):
+def reduction_watcher_function(device_id, world_size, accumulations, buffers, request_buffer, response_buffer, cmd_queue, response_queue):
     torch.cuda.set_device(device_id)
     import sys
     # torch.cuda.cudart().cudaProfilerStart()
     buffers = [tensor_from_handle(*buffer) for buffer in buffers]
     accumulations = [tensor_from_handle(*acc) for acc in accumulations]
-    lock_buffers = tensor_from_handle(*lock_buffers)
+    request_buffer = tensor_from_handle(*request_buffer)
+    response_buffer = tensor_from_handle(*response_buffer)
 
-    watcher = ReductionWatcher(accumulations, buffers, lock_buffers)
+    watcher = ReductionWatcher(world_size, accumulations, buffers, request_buffer, response_buffer)
 
     from threading import Thread
     def cmd_thread():
@@ -233,7 +227,7 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
     watcher.run()
     cmd_thread.join()
 
-def start_reduction_watcher(accumulations, buffers, lock_buffers):
+def start_reduction_watcher(accumulations, buffers, request_buffer, response_buffer):
     from torch.multiprocessing import Process
 
     original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
@@ -244,8 +238,9 @@ def start_reduction_watcher(accumulations, buffers, lock_buffers):
     cmd_queue = ctx.Queue()
     response_queue = ctx.Queue()
     device_id = torch.distributed.get_rank() % get_local_world_size()
+    world_size = torch.distributed.get_world_size()
     process = ctx.Process(target=reduction_watcher_function,
-                       args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
+                       args=(device_id, world_size, accumulations, buffers, request_buffer, response_buffer, cmd_queue, response_queue))
     process.start()
     if original_visible_devices is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
@@ -278,14 +273,15 @@ class ReductionService:
     
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
-            self.lock = DistLock(128)
-            lock_buffers_handle = get_nvshmem_handle(self.lock.lock_buffers)
+            self.lock = DistLock(torch.distributed.get_world_size())
+            request_buffer_handle = get_nvshmem_handle(self.lock.request_buffer)
+            response_buffer_handle = get_nvshmem_handle(self.lock.response_buffer)
 
             # Make sure changes are visible to all reduction watchers
             torch.distributed.barrier()
             torch.cuda.synchronize()
 
-            self.reduction_watcher = start_reduction_watcher([], [], lock_buffers_handle)
+            self.reduction_watcher = start_reduction_watcher([], [], request_buffer_handle, response_buffer_handle)
 
         buffer_key = f'rs_buffer_{key}'
         accumulation_key = f'rs_accumulation_{key}'
@@ -396,7 +392,7 @@ class ReductionService:
 
             if len(dst_rank_infos) == 0:
                 continue
-            self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            self.lock.lock(target_rank=matching_rank_in_local_world)
 
             for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
                 dst_buffer = peer_buffers[dst_group_idx]
@@ -451,8 +447,6 @@ class ReductionService:
             call_watcher(self.reduction_watcher, 'stop')
             torch.distributed.barrier()
             torch.cuda.synchronize()
-            self.lock.lock_buffers.fill_(2)
-            nvshmem_free_tensor_sync(self.lock.lock_buffers)
 
 
 
@@ -463,8 +457,7 @@ if __name__ == "__main__":
       torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
       torch.distributed.init_process_group("nccl")
       init_nvshmem()
-      test_request_response()
-      raise Exception("Stop here")
+      # test_request_response()
       world_size = torch.distributed.get_world_size()
       rank = torch.distributed.get_rank()
 
