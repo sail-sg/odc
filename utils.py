@@ -102,31 +102,18 @@ class SymmBufferRegistry:
         world_size = torch.distributed.get_world_size()
         local_world_size = get_local_world_size()
         local_rank = rank % local_world_size
-        peer_tensors = []
-        for node_rank in range(world_size // local_world_size):
-            tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
-            self.allocations.append(tensors[local_rank])
-            peer_tensors.extend(tensors)
-        assert len(peer_tensors) == world_size
-        self.peer_tensors[key] = peer_tensors
-        self.local_tensor[key] = self.peer_tensors[key][rank]
+        
+        print(f"Rank {rank} allocate_symm_buffer {key} with shape {shape} and dtype {dtype}")
+        tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
+        self.allocations.append(tensors[local_rank])
+        self.local_tensor[key] = tensors[local_rank]
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
-        print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")
         return self.local_tensor[key]
     
-    def get_local_peer_tensors(self, local_tensor):
-        peer_tensors = self.get_peer_tensors(local_tensor)
-        local_world_size = get_local_world_size()
-        local_rank = torch.distributed.get_rank() % local_world_size
-        num_nodes = torch.distributed.get_world_size() // local_world_size
-        return [peer_tensors[local_rank + i * local_world_size] for i in range(num_nodes)]
     
     def has_key(self, key):
         return key in self.local_tensor
     
-    def get_peer_tensors(self, local_tensor):
-        buffer_key = self.local_tensor_to_keys[local_tensor.data_ptr()]
-        return self.peer_tensors[buffer_key]
     
     def finalize(self):
         for t in self.allocations:
