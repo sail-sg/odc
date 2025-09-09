@@ -238,18 +238,7 @@ def all_gather_into_tensor_multinode(output_tensor: Tensor, input_tensor: Tensor
 
 
 def all_gather_sync_cache(input_tensor: Tensor, pg: dist.ProcessGroup):
-    local_world_size = get_local_world_size()
-    if local_world_size == torch.distributed.get_world_size():
-       return
-    
-    same_local_rank_pg = get_same_local_rank_pg(pg)
-    same_local_rank_pg_ranks = dist.get_process_group_ranks(group=same_local_rank_pg)
-
-    registry = SymmBufferRegistry.get_instance()
-    # print(registry.get_peer_tensors(input_tensor))
-    tensors = [registry.get_peer_tensors(input_tensor)[r] for r in same_local_rank_pg_ranks]
-    torch.distributed.all_gather(tensors, input_tensor, group=same_local_rank_pg)
-    return tensors
+  return
     
 
 
