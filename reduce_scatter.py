@@ -49,8 +49,9 @@ cmd_buffer = {}
 def remote_request(client_context, server_rank, command):
     assert get_local_world_size() == torch.distributed.get_world_size()
     if cmd_buffer.get(command, None) is None:
-        cmd_buffer[command] = torch.tensor(command, device="cuda")
-    SymmBufferRegistry.get_instance().get_peer_tensors(client_context.request_buffer)[server_rank][torch.distributed.get_rank()] = cmd_buffer[command]
+        cmd_buffer[command] = torch.tensor([command], device="cuda", dtype=client_context.request_buffer.dtype)
+    # SymmBufferRegistry.get_instance().get_peer_tensors(client_context.request_buffer)[server_rank][torch.distributed.get_rank():torch.distributed.get_rank()+1].copy_(cmd_buffer[command])
+    SymmBufferRegistry.get_instance().get_peer_tensors(client_context.request_buffer)[server_rank][torch.distributed.get_rank()]=(cmd_buffer[command][0])
     with torch.cuda.nvtx.range(f"remote_request {server_rank} cmd {command}"):
         nvshmem_request_wait_kernel[(1, )](
             client_context.request_buffer,
