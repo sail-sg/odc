@@ -336,35 +336,34 @@ class ReductionService:
         local_world_size = get_local_world_size()
 
         rank_info = [(r, group_ranks[r], group_ranks[r] % local_world_size) for r in range(group_size)]
+                
         for local_r_offset in range(0, local_world_size):
             dst_local_rank = (torch.distributed.get_rank() + local_r_offset) % local_world_size
             dst_rank_infos = [r for r in rank_info if r[2] == dst_local_rank]
             matching_rank_in_local_world = torch.distributed.get_rank() // local_world_size * local_world_size + dst_local_rank
-            
-            
 
             if len(dst_rank_infos) == 0:
                 continue
-            stream = self.rank_streams[dst_local_rank]
-            event = torch.cuda.Event()
-            main_stream = torch.cuda.current_stream()
-            stream.wait_stream(main_stream)
-            with torch.cuda.stream(stream):
-                with torch.cuda.nvtx.range(f"lock_{buffer_id}"):
-                    self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
-                for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-                    dst_buffer = peer_buffers[dst_group_idx]
-                    dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-                with torch.cuda.nvtx.range(f"notify_{buffer_id}"):
-                    self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
-                event.record()
-                main_stream.wait_event(event)
-            # self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            # stream = self.rank_streams[dst_local_rank]
+            # event = torch.cuda.Event()
+            # main_stream = torch.cuda.current_stream()
+            # stream.wait_stream(main_stream)
+            # with torch.cuda.stream(stream):
+            #     with torch.cuda.nvtx.range(f"lock_{buffer_id}"):
+            #         self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            #     for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
+            #         dst_buffer = peer_buffers[dst_group_idx]
+            #         dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
+            #     with torch.cuda.nvtx.range(f"notify_{buffer_id}"):
+            #         self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+            #     event.record()
+            #     main_stream.wait_event(event)
+            self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
 
-            # for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-            #     dst_buffer = peer_buffers[dst_group_idx]
-            #     dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            # self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+            for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
+                dst_buffer = peer_buffers[dst_group_idx]
+                dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
+            self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
         self.dispatched_tasks += 1
     
     def get_accumulation(self, key):
