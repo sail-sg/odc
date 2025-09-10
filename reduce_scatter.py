@@ -1,3 +1,4 @@
+from collections import defaultdict
 import nvshmem.core
 import torch
 import os
@@ -189,9 +190,9 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
 def start_reduction_watcher(accumulations, buffers, lock_buffers):
     from torch.multiprocessing import Process
 
-    original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-    if original_visible_devices is not None:
-        del os.environ['CUDA_VISIBLE_DEVICES']
+    # original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    # if original_visible_devices is not None:
+    #     del os.environ['CUDA_VISIBLE_DEVICES']
     
     ctx = torch.multiprocessing.get_context("spawn")
     cmd_queue = ctx.Queue()
@@ -200,10 +201,10 @@ def start_reduction_watcher(accumulations, buffers, lock_buffers):
     process = ctx.Process(target=reduction_watcher_function,
                        args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
     process.start()
-    if original_visible_devices is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
-    elif 'CUDA_VISIBLE_DEVICES' in os.environ:
-        del os.environ['CUDA_VISIBLE_DEVICES']
+    # if original_visible_devices is not None:
+    #     os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
+    # elif 'CUDA_VISIBLE_DEVICES' in os.environ:
+    #     del os.environ['CUDA_VISIBLE_DEVICES']
     return cmd_queue, response_queue
 
 def call_watcher(watcher_handle, cmd, *args):
@@ -228,7 +229,11 @@ class ReductionService:
         self.dispatched_tasks = 0
         self.accumulation_dtype = accumulation_dtype
         self.rank_streams = defaultdict(lambda: torch.cuda.Stream())
-        pass
+    
+    def pre_register(self, key, input_tensor, pg: dist.ProcessGroup):
+        assert key not in self.accumulation_indices
+        accum_dtype = self.accumulation_dtype if self.accumulation_dtype is not None else input_tensor.dtype
+        self.register(key, self.infer_output_shape(input_tensor, pg), input_tensor.dtype, accum_dtype)
     
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
@@ -470,7 +475,6 @@ if __name__ == "__main__":
 
       # for i in range(cnt):
       #   reduction_service.register(i, (size // group_size,), grad_dtype, accum_dtype)
-
         
       torch.cuda.synchronize()
       mem_allocated = torch.cuda.memory_allocated() / (1024 ** 2)
@@ -516,10 +520,34 @@ if __name__ == "__main__":
       def reduce_scatter_accumulation_nccl_comm(src_tensor, dest_idx, pg: dist.ProcessGroup):
         reduction_service.reduce_scatter_accumulation_nccl_comm(dest_idx, src_tensor, pg)
 
+    #   for dst_idx in range(cnt):
+    #       reduction_service.pre_register(dst_idx, data[dst_idx], group)
+    #   torch.cuda.synchronize()
+    #   print(f"Rank {rank} pre_register done")
+
       dist.barrier()
       torch.cuda.synchronize()
       comp_stream = torch.cuda.Stream()
-      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation, reduce_scatter_accumulation_nccl_comm]:
+      # warmup
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+        reduction_service.clear_accumulations()
+        torch.cuda.current_stream().synchronize()
+        with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
+          for i in range(cnt * times):
+            dst_idx = i % cnt
+            reduce_scatter_func(data[i], dst_idx, group)
+            compute_buffer[dst_idx] @ compute_param
+          if reduce_scatter_func == reduce_scatter_accumulation or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
+            reduction_service.sync(group)
+            for i in range(cnt):
+              torch.testing.assert_close(nccl_accumulations[i], reduction_service.accumulations[i], rtol=5e-3, atol=5e-3)
+          dist.barrier()
+          torch.cuda.synchronize()
+        dist.barrier()
+        torch.cuda.synchronize()
+      for i in range(cnt):
+          nccl_accumulations[i].zero_()
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
         reduction_service.clear_accumulations()
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
