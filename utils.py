@@ -6,7 +6,7 @@ from typing import List
 
 # From triton_dist.utils
 def init_nvshmem():
-    print(f"init_nvshmem: {os.environ}")
+    # print(f"init_nvshmem: {os.environ}")
     assert torch.distributed.is_initialized()
     # Extract rank, nranks from process group
     num_ranks = torch.distributed.get_world_size()
@@ -124,7 +124,7 @@ class SymmBufferRegistry:
         self.peer_tensors[key] = peer_tensors
         self.local_tensor[key] = self.peer_tensors[key][rank]
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
-        print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")
+        # print(f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}")
         return self.local_tensor[key]
     
     def get_local_peer_tensors(self, local_tensor):
