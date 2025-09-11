@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 from functools import reduce
 import nvshmem.core
@@ -333,7 +334,7 @@ class ReductionService:
             buffer_id = self.buffer_indices[key]
         buffer = self.buffers[buffer_id]
         assert buffer.numel() == reduce(lambda x, y: x * y, output_shape)
-        buffer = buffer.reshape(*output_shape)
+        buffer = buffer.view(*output_shape)
 
         local_peer_accs = SymmBufferRegistry.get_instance().get_local_peer_tensors(acc)
 
@@ -458,8 +459,28 @@ class ReductionService:
 
 
 
+def size_str_to_int(size_str):
+    size_str = size_str.lower()
+    if size_str.endswith('kb'):
+        return int(size_str[:-2]) * (1000)
+    elif size_str.endswith('mb'):
+        return int(size_str[:-2]) * (1000 ** 2)
+    elif size_str.endswith('gb'):
+        return int(size_str[:-2]) * (1000 ** 3)
+    else:
+        return int(size_str)
+
+
 if __name__ == "__main__":
     import os
+    data_size_str = os.environ.get('DATA_SIZE', '256mb')
+    data_size = size_str_to_int(data_size_str)
+    data_dir = os.environ.get('DATA_DIR', 'profile')
+    data_dir = os.path.join(data_dir, data_size_str)
+    print(f"Data size: {data_size_str}, Data dir: {data_dir}")
+    assert data_size > 0
+    os.makedirs(data_dir, exist_ok=True)
+
     torch.cuda.cudart().cudaProfilerStart()
     try:
       torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
@@ -474,7 +495,8 @@ if __name__ == "__main__":
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
       cnt = 10
       times = 10
-      size = 64 * (1000 ** 2)
+    #   size = 64 * (1000 ** 2)
+      size = data_size // accum_dtype.itemsize
       # cnt = 1
       # times = 2
       # size = 16 * (1000 ** 0)
@@ -596,9 +618,16 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
           reduce_scatter_payload = size // group_size* (group_size - 1)* data[0].dtype.itemsize
-          print(f"Rank {rank} {reduce_scatter_func.__name__} reduce_scatter bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 1)) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {reduce_scatter_func.__name__} reduce_scatter bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 0)) / start.elapsed_time(end)}")
           print(f"Rank {rank} {reduce_scatter_func.__name__} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
+        profile_data = {
+            "payload": reduce_scatter_payload,
+            "comm_time": [start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)],
+            "total_time": start.elapsed_time(end),
+        }
+        with open(os.path.join(data_dir, f"{reduce_scatter_func.__name__}-{data_size}-{rank}.json"), "w") as f:
+            json.dump(profile_data, f)
 
       reduction_service.stop()
 
