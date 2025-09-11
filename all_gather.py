@@ -16,6 +16,7 @@ import os
 from typing import List
 from torch import Tensor
 from triton_dist.language.extra import libshmem_device
+from triton.language.extra.cuda.language_extra import __syncthreads, tid
 from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
@@ -73,6 +74,88 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked(
             peer,
         )
 
+
+@triton.jit
+def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
+    remote_tensor_ptr,
+    target_tensor_ptr,
+    elem_per_rank,
+    size_per_elem,
+    rank,
+    world_size,
+    chunk_size,
+    signal_ptr,
+):
+    pid = tl.program_id(axis=0)
+    tidx = tid(axis=0)
+    peer = (pid + rank + 1) % world_size
+    # chunk_size = elem_per_rank // num_chunks
+    num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+    
+    for chunk in range(num_chunks):
+        this_chunk_size = chunk_size
+        if chunk == num_chunks - 1:
+            this_chunk_size = elem_per_rank - chunk * chunk_size
+        libshmem_device.getmem_nbi_block(
+            target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
+            remote_tensor_ptr + (chunk * chunk_size),
+            this_chunk_size * size_per_elem,
+            peer,
+        )
+        if tidx == 0:
+            tl.atomic_add(signal_ptr, 1)
+        __syncthreads()
+        expected = (chunk * 2) * world_size + world_size
+        offsets = tl.arange(0, 1)
+        mask = offsets == 0
+        r = 0
+        while r < expected:
+            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+            r = tl.max(signals)
+        if tidx == 0 and pid == 0:
+            libshmem_device.quiet()
+        __syncthreads()
+
+        if tidx == 0:
+            tl.atomic_add(signal_ptr, 1)
+        __syncthreads()
+        expected = (chunk * 2) * world_size + 2 * world_size
+        offsets = tl.arange(0, 1)
+        mask = offsets == 0
+        r = 0
+        while r < expected:
+            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+            r = tl.max(signals)
+
+    
+
+@triton.jit(do_not_specialize=["chunk_id"])
+def nvshmem_device_producer_all_gather_2d_get_block_kernel_one_chunk(
+    remote_tensor_ptr,
+    target_tensor_ptr,
+    elem_per_rank,
+    size_per_elem,
+    rank,
+    world_size,
+    chunk_size,
+    chunk_id,
+):
+    pid = tl.program_id(axis=0)
+    peer = (pid + rank + 1) % world_size
+    # chunk_size = elem_per_rank // num_chunks
+    num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+    
+    chunk = chunk_id
+    this_chunk_size = chunk_size
+    if chunk == num_chunks - 1:
+        this_chunk_size = elem_per_rank - chunk * chunk_size
+    libshmem_device.getmem_nbi_block(
+        target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
+        remote_tensor_ptr + (chunk * chunk_size),
+        this_chunk_size * size_per_elem,
+        peer,
+    )
+
 @triton.jit
 def nvshmem_device_producer_all_gather_2d_put_block_kernel(
     remote_tensor_ptr,
@@ -81,13 +164,14 @@ def nvshmem_device_producer_all_gather_2d_put_block_kernel(
     size_per_elem,
     rank,
     world_size,
+    chunk_size,
 ):
     pid = tl.program_id(axis=0)
     if pid < world_size:
         np = tl.num_programs(axis=0)
-        peer = (pid  + rank + 1) % world_size
+        peer = (pid  + rank + 1) % world_size #% 8 + 8 * (1 - rank // 8)
 
-        libshmem_device.putmem_block(
+        libshmem_device.putmem_nbi_block(
             target_tensor_ptr + rank * elem_per_rank,
             remote_tensor_ptr,
             elem_per_rank * size_per_elem,
@@ -141,7 +225,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # assert input_tensor.numel() % chunk_size == 0
   cupy_stream = PyTorchStreamWrapper(torch.cuda.current_stream())
   # print(f'chunk size {chunk_size}')
-  
+  signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
   nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked[(torch.distributed.get_world_size(pg), )](
     input_tensor,
     target_tensor,
@@ -153,6 +237,33 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
     num_warps=16,
   )
   # nvshmem.core.quiet(stream=cupy_stream)
+  # num_chunks = ((input_tensor.numel() - 1) // chunk_size) + 1
+  # for chunk_id in range(num_chunks):
+  #   nvshmem_device_producer_all_gather_2d_get_block_kernel_one_chunk[(torch.distributed.get_world_size(pg), )](
+  #     input_tensor,
+  #     target_tensor,
+  #     input_tensor.numel(),
+  #     input_tensor.element_size(),
+  #     torch.distributed.get_rank(pg),
+  #     torch.distributed.get_world_size(pg),
+  #     chunk_size,
+  #     chunk_id,
+  #   )
+  #   nvshmem.core.quiet(stream=cupy_stream)
+
+  # nvshmem_device_producer_all_gather_2d_put_block_kernel[(torch.distributed.get_world_size(pg), )](
+  #   input_tensor,
+  #   target_tensor,
+  #   input_tensor.numel(),
+  #   input_tensor.element_size(),
+  #   torch.distributed.get_rank(pg),
+  #   torch.distributed.get_world_size(pg),
+  #   chunk_size,
+  #   num_warps=32,
+  # )
+
+  
+  
   # for chunk in range(total_chunks):
   #     nvshmem_device_producer_all_gather_2d_get_block_kernel[grid](
   #       input_tensor,
@@ -212,8 +323,8 @@ if __name__ == "__main__":
       rank = torch.distributed.get_rank()
       registry = SymmBufferRegistry.get_instance()
       cnt = 20
-      size = 16 * (2**20)+32
-      comp_sizes = torch.rand(cnt).tolist()
+      size = 16 * (2**20)
+      comp_sizes = [2]
       dtype = torch.int64
 
       group_count = 1
@@ -235,7 +346,30 @@ if __name__ == "__main__":
       compute_buffer = [torch.empty(int(x*16384),8192, dtype=torch.bfloat16, device="cuda") for x in comp_sizes]
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
-
+      def some_compute(x):
+        return x
+        with torch.no_grad():
+          x = x @ compute_param
+          x = x @ compute_param
+          q = x.reshape(1, x.shape[0], 64, 128)
+          k = x.reshape(1,x.shape[0], 64, 128)
+          v = x.reshape(1,x.shape[0], 64, 128)
+          from flash_attn.flash_attn_interface import flash_attn_func
+          x = flash_attn_func(q, k, v, causal=True)
+          x = x.reshape(-1, 8192)
+          for i in range(10):
+            x=x * 2
+            x=x * 1.5
+            x=x + 1
+            x=x - 1
+            x=x + 0.5
+            x=x - 0.5
+            x=x + 0.25
+            x=x - 0.25
+            x=x + 0.125
+            x=x - 0.125
+          x = x @ compute_param
+          return x
 
 
       src_tensors = [torch.empty(size, dtype=dtype, device="cuda") for _ in range(cnt)]
@@ -245,6 +379,7 @@ if __name__ == "__main__":
         # all_gather_sync_cache(src_tensors[i], group)
 
       # for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl, all_gather_into_tensor_multinode]:
+      comp_stream = torch.cuda.Stream()
       for all_gather_func in [all_gather_into_tensor_nccl, all_gather_into_tensor]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
@@ -253,6 +388,7 @@ if __name__ == "__main__":
           start = torch.cuda.Event(enable_timing=True)
           
           for i in range(cnt):
+            torch.distributed.barrier(group)
             if i == 1:
               start.record()
             dst = torch.empty(size * group_size, dtype=dtype, device="cuda")
@@ -261,7 +397,11 @@ if __name__ == "__main__":
             #   for r in range(world_size)
             # ]
             start_events[i].record()
+            comp_stream.wait_stream(torch.cuda.current_stream())
             all_gather_func(dst, src_tensors[i], group)
+            with torch.cuda.stream(comp_stream):
+                some_compute(compute_buffer[0])
+            torch.cuda.current_stream().wait_stream(comp_stream)
             comm_events[i].record()
             # compute_buffer[i] @ compute_param
             compute_events[i].record()

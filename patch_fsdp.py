@@ -68,6 +68,29 @@ def _reduce_grad(state, handle) -> None:
     # grad_to_offload = _accumulate_sharded_grad(state, handle, new_sharded_grad)
     # _post_reduce_grad_callback(state, handle, grad_to_offload)
 
+def wait_for_computation_stream(
+    computation_stream,
+    unshard_stream,
+    pre_unshard_stream,
+):
+    """
+    Has the unshard and pre-unshard streams wait for the computation stream.
+    For example, this should be called in the FSDP root's pre-forward to
+    respect optimizer step computation.
+    """
+    # Tracing does not need to wait
+    import torch.cuda
+    unshard_stream.wait_stream(computation_stream)  # type: ignore[attr-defined]
+    # Having the pre-all-gather stream wait for the current stream even if we
+    # do not leverage the pre-all-gather stream is tolerable since this only
+    # runs once per iteration
+    pre_unshard_stream.wait_stream(computation_stream)  # type: ignore[attr-defined]
+
+    global ag_stream
+    if ag_stream is None:
+        ag_stream = torch.cuda.Stream()
+    ag_stream.wait_stream(computation_stream)
+
 def prepare_gradient_for_optim(self):
     """Prepare the gradient for optimizer computation by moving the sharded gradient to the ``.grad`` attribute."""
     from torch.distributed.utils import _p_assert
@@ -114,7 +137,7 @@ def prepare_gradient_for_optim(self):
         delattr(flat_param, "_saved_grad_shard")
     
 
-
+ag_stream = None
 
 def all_gather_flat_param(self, padded_unsharded_flat_param):
     """
@@ -124,6 +147,7 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
     """
     from torch.distributed.utils import _p_assert
     from torch.distributed.fsdp._common_utils import _no_dispatch_record_stream
+    import torch.cuda
     _p_assert(
         hasattr(self, "process_group") and hasattr(self, "world_size"),
         "Expects a process group and world size to have been set via `shard()`",
@@ -152,11 +176,18 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
         dist.all_gather(tensor_list, sharded_flat_param, group=pg)
     else:
+        # TODO: this is very hacky as currently there's a problem that backward blocks prefetch.
+        global ag_stream
+        if ag_stream is None:
+            ag_stream = torch.cuda.Stream()
+        # This somehow affects convergence, disabling for now
+        # with torch.cuda.stream(ag_stream):
         odc.all_gather_into_tensor(
             padded_unsharded_flat_param,
             sharded_flat_param,
             pg,
         )
+        torch.cuda.current_stream().wait_stream(ag_stream)
 
     if self._offload_params:
         # In case of offloading, `flat_param.data` (i.e. sharded param) is
@@ -184,6 +215,7 @@ def patch_fsdp(reduce_dtype=None):
     reduction_service = odc.ReductionService(accumulation_dtype=reduce_dtype)
     import torch.distributed.fsdp._runtime_utils as _runtime_utils
     _runtime_utils._reduce_grad = _reduce_grad
+    _runtime_utils._wait_for_computation_stream = wait_for_computation_stream
 
     from torch.distributed.fsdp._flat_param import FlatParamHandle
     FlatParamHandle.prepare_gradient_for_optim = prepare_gradient_for_optim
