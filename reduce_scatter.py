@@ -152,13 +152,14 @@ class ReductionWatcher:
             
             for buf_id in nonzeros:
                 acc_id = self.cpu_lock_buffers[buf_id]
+                # TODO: Need to check the memory model for the ordering of 2 atomics:
+                # https://docs.nvidia.com/nvshmem/api/gen/mem-model.html#differences-between-nvshmem-and-openshmem
                 start = self.cpu_accumulation_start_indices[buf_id]
                 if acc_id > 0:
                     # print(f"Rank {torch.cuda.current_device()} adding buffer {buf_id} -> {acc_id - 1}")
                     for acc, buf in zip(self.accumulations[acc_id - 1], self.buffers[buf_id]):
                         size = min(buf.numel(), acc.numel() - start)
                         acc[start:start + size].add_(buf[:size])
-                        # print(f"Rank {torch.cuda.current_device()} adding buffer {buf_id} -> {acc_id - 1} start {start} size {size} acc.numel() {acc.numel()}")
                     if start + size >= acc.numel():
                         assert start + size == acc.numel()
                         self.task_count += 1
@@ -319,8 +320,8 @@ class ReductionService:
         torch.cuda.synchronize()
 
     def get_buffer_shape(self, output_tensor_shape):
-        # MAX_BUFFER_SIZE = 64 * 1000 * 1000
-        MAX_BUFFER_SIZE = 8 * 1000 * 1000
+        # 16mb is too small
+        MAX_BUFFER_SIZE = 32 * 1000 * 1000
         return (min(MAX_BUFFER_SIZE, reduce(lambda x, y: x * y, output_tensor_shape)),)
 
     def get_fixed_buffer_key(self, output_tensor_shape, grad_dtype, index):
@@ -360,7 +361,6 @@ class ReductionService:
             buffer_id = self.buffer_indices[key]
         buffer = self.buffers[buffer_id]
         assert buffer.numel() == reduce(lambda x, y: x * y, buffer_shape)
-        # buffer = buffer.view(*output_tensor_shape)
 
         local_peer_accs = SymmBufferRegistry.get_instance().get_local_peer_tensors(acc)
 
@@ -423,7 +423,6 @@ class ReductionService:
             for start in range(0, data_size, buf_size):
                 self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
                 copy_size = min(buf_size, data_size - start)
-                # print(f"Rank {torch.distributed.get_rank()} copying start {start} size {copy_size} full size {data_size}")
                 for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
                     dst_buffer = peer_buffers[dst_group_idx]
                     input_data = input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size]
@@ -498,7 +497,7 @@ def size_str_to_int(size_str):
 
 if __name__ == "__main__":
     import os
-    data_size_str = os.environ.get('DATA_SIZE', '256mb')
+    data_size_str = os.environ.get('DATA_SIZE', '1024mb')
     data_size = size_str_to_int(data_size_str)
     data_dir = os.environ.get('DATA_DIR', 'profile')
     data_dir = os.path.join(data_dir, data_size_str)
@@ -518,8 +517,8 @@ if __name__ == "__main__":
       grad_dtype = torch.float32
 
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
-      cnt = 10
-      times = 10
+      cnt = 5
+      times = 5
     #   size = 64 * (1000 ** 2)
       size = data_size // accum_dtype.itemsize
       # cnt = 1
