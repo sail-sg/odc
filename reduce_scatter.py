@@ -158,7 +158,10 @@ class ReductionWatcher:
                     for acc, buf in zip(self.accumulations[acc_id - 1], self.buffers[buf_id]):
                         size = min(buf.numel(), acc.numel() - start)
                         acc[start:start + size].add_(buf[:size])
-                    self.task_count += 1
+                        # print(f"Rank {torch.cuda.current_device()} adding buffer {buf_id} -> {acc_id - 1} start {start} size {size} acc.numel() {acc.numel()}")
+                    if start + size >= acc.numel():
+                        assert start + size == acc.numel()
+                        self.task_count += 1
                     
                     # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
                     reset_lock_kernel[(1, )](self.lock_buffers, buf_id)
@@ -420,12 +423,12 @@ class ReductionService:
             for start in range(0, data_size, buf_size):
                 self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
                 copy_size = min(buf_size, data_size - start)
-                print(f"Rank {torch.distributed.get_rank()} copying start {start} size {copy_size} full size {data_size}")
+                # print(f"Rank {torch.distributed.get_rank()} copying start {start} size {copy_size} full size {data_size}")
                 for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
                     dst_buffer = peer_buffers[dst_group_idx]
                     input_data = input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size]
                     dst_buffer[:copy_size].copy_(input_data[start:start+copy_size])
-                self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id, accumulation_start_index=0)
+                self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id, accumulation_start_index=start)
         self.dispatched_tasks += 1
     
     def get_accumulation(self, key):
@@ -580,22 +583,22 @@ if __name__ == "__main__":
       torch.cuda.synchronize()
       # warmup
     #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
-    #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
-    #     reduction_service.clear_accumulations()
-    #     torch.cuda.current_stream().synchronize()
-    #     with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
-    #       for i in range(cnt * times):
-    #         dst_idx = i % cnt
-    #         reduce_scatter_func(data[i], dst_idx, group)
-    #         compute_buffer[dst_idx] @ compute_param
-    #       if reduce_scatter_func == reduce_scatter_accumulation or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
-    #         reduction_service.sync(group)
-    #         for i in range(cnt):
-    #           torch.testing.assert_close(nccl_accumulations[i], reduction_service.accumulations[i], rtol=5e-3, atol=5e-3)
-    #       dist.barrier()
-    #       torch.cuda.synchronize()
-    #     dist.barrier()
-    #     torch.cuda.synchronize()
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
+        reduction_service.clear_accumulations()
+        torch.cuda.current_stream().synchronize()
+        with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
+          for i in range(cnt * times):
+            dst_idx = i % cnt
+            reduce_scatter_func(data[i], dst_idx, group)
+            compute_buffer[dst_idx] @ compute_param
+          if reduce_scatter_func == reduce_scatter_accumulation or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
+            reduction_service.sync(group)
+            for i in range(cnt):
+              torch.testing.assert_close(nccl_accumulations[i], reduction_service.accumulations[i], rtol=5e-3, atol=5e-3)
+          dist.barrier()
+          torch.cuda.synchronize()
+        dist.barrier()
+        torch.cuda.synchronize()
       for i in range(cnt):
           nccl_accumulations[i].zero_()
     #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
