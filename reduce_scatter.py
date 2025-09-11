@@ -281,29 +281,30 @@ class ReductionService:
         #     local_acc.fill_(0)
         #     local_acc_handles.append(get_nvshmem_handle(local_acc))
         # call_watcher(self.reduction_watcher, 'add_accumulation', local_acc_handles)
+        buffer_shape = self.get_buffer_shape(output_tensor_shape)
         
         if os.environ.get('ODC_SINGLE_BUFFER', '0') != '1' and os.environ.get('ODC_NUM_BUFFERS', '0') == '0':
-            buffer = create_and_register(buffer_key, output_tensor_shape, grad_dtype, 'add_buffer')
+            buffer = create_and_register(buffer_key, buffer_shape, grad_dtype, 'add_buffer')
             self.buffer_indices[key] = len(self.buffers)
             self.buffers.append(buffer)
         elif os.environ.get('ODC_NUM_BUFFERS', '0') != '0':
             num_buffers = int(os.environ.get('ODC_NUM_BUFFERS', '0'))
             assert num_buffers > 0, f"Invalid ODC_NUM_BUFFERS {num_buffers}"
-            fixed_buffer_key = (grad_dtype, output_tensor_shape)
+            fixed_buffer_key = (grad_dtype, buffer_shape)
             if fixed_buffer_key not in self.fixed_buffers:
                 bufs = []
                 for i in range(num_buffers):
-                    buffer_key = self.get_fixed_buffer_key(output_tensor_shape, grad_dtype, i)
-                    buffer = create_and_register(buffer_key, output_tensor_shape, grad_dtype, 'add_buffer')
+                    buffer_key = self.get_fixed_buffer_key(buffer_shape, grad_dtype, i)
+                    buffer = create_and_register(buffer_key, buffer_shape, grad_dtype, 'add_buffer')
                     bufs.append(buffer)
                     self.buffer_indices[buffer_key] = len(self.buffers)
                     self.buffers.append(buffer)
                 self.fixed_buffers[fixed_buffer_key] = bufs
         else:
-            shared_buffer_key = (grad_dtype, output_tensor_shape)
+            shared_buffer_key = (grad_dtype, buffer_shape)
             if shared_buffer_key not in self.shared_buffer:
                 cnt = len(self.shared_buffer)
-                buffer = create_and_register(f'shared_buffer_{cnt}', output_tensor_shape, grad_dtype, 'add_buffer')
+                buffer = create_and_register(f'shared_buffer_{cnt}', buffer_shape, grad_dtype, 'add_buffer')
                 self.shared_buffer[shared_buffer_key] = (cnt, buffer)
                 
                 self.buffers.append(buffer)
@@ -313,6 +314,11 @@ class ReductionService:
         # Make sure changes are visible to all reduction watchers
         torch.distributed.barrier()
         torch.cuda.synchronize()
+
+    def get_buffer_shape(self, output_tensor_shape):
+        # MAX_BUFFER_SIZE = 64 * 1000 * 1000
+        MAX_BUFFER_SIZE = 8 * 1000 * 1000
+        return (min(MAX_BUFFER_SIZE, reduce(lambda x, y: x * y, output_tensor_shape)),)
 
     def get_fixed_buffer_key(self, output_tensor_shape, grad_dtype, index):
         numel = reduce(lambda x, y: x * y, output_tensor_shape)
@@ -333,23 +339,25 @@ class ReductionService:
         return (input_tensor.shape[0] // dist.get_world_size(pg),)
 
     def reduce_scatter_accumulation_nccl_comm(self, key, input_tensor, pg: dist.ProcessGroup):
-        output_shape = self.infer_output_shape(input_tensor, pg)
+        output_tensor_shape = self.infer_output_shape(input_tensor, pg)
         if key not in self.accumulation_indices:
             accum_dtype = self.accumulation_dtype if self.accumulation_dtype is not None else input_tensor.dtype
-            self.register(key, output_shape, input_tensor.dtype, accum_dtype)
+            self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype)
 
         acc = self.accumulations[self.accumulation_indices[key]]
+
+        buffer_shape = self.get_buffer_shape(output_tensor_shape)
         # buffer = self.buffers[self.buffer_indices[key]]
         if os.environ.get('ODC_NUM_BUFFERS', '0') != '0':
             index = self.rank_to_fixed_buffer_index(torch.distributed.get_rank())
-            buffer_key = self.get_fixed_buffer_key(output_shape, input_tensor.dtype, index)
+            buffer_key = self.get_fixed_buffer_key(buffer_shape, input_tensor.dtype, index)
             assert buffer_key in self.buffer_indices, f"Buffer key {buffer_key} not found in buffer_indices {self.buffer_indices} fixed_buffers {self.fixed_buffers}"
             buffer_id = self.buffer_indices[buffer_key]
         else:
             buffer_id = self.buffer_indices[key]
         buffer = self.buffers[buffer_id]
-        assert buffer.numel() == reduce(lambda x, y: x * y, output_shape)
-        buffer = buffer.view(*output_shape)
+        assert buffer.numel() == reduce(lambda x, y: x * y, buffer_shape)
+        # buffer = buffer.view(*output_tensor_shape)
 
         local_peer_accs = SymmBufferRegistry.get_instance().get_local_peer_tensors(acc)
 
@@ -364,20 +372,23 @@ class ReductionService:
           local_peer_accs[i // local_world_size].add_(buffer)
 
     def reduce_scatter_accumulation(self, key, input_tensor, pg: dist.ProcessGroup):
+        output_tensor_shape = self.infer_output_shape(input_tensor, pg)
         if key not in self.accumulation_indices:
             accum_dtype = self.accumulation_dtype if self.accumulation_dtype is not None else input_tensor.dtype
-            self.register(key, self.infer_output_shape(input_tensor, pg), input_tensor.dtype, accum_dtype)
+            self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype)
 
         acc = self.accumulations[self.accumulation_indices[key]]
 
+        buffer_shape = self.get_buffer_shape(output_tensor_shape)
         if os.environ.get('ODC_NUM_BUFFERS', '0') != '0':
             index = self.rank_to_fixed_buffer_index(torch.distributed.get_rank())
-            buffer_key = self.get_fixed_buffer_key(self.infer_output_shape(input_tensor, pg), input_tensor.dtype, index)
+            buffer_key = self.get_fixed_buffer_key(buffer_shape, input_tensor.dtype, index)
             assert buffer_key in self.buffer_indices, f"Buffer key {buffer_key} not found in buffer_indices {self.buffer_indices} fixed_buffers {self.fixed_buffers}"
             buffer_id = self.buffer_indices[buffer_key]
         else:
             buffer_id = self.buffer_indices[key]
         buffer = self.buffers[buffer_id]
+        assert buffer.numel() == reduce(lambda x, y: x * y, buffer_shape)
 
         peer_buffers = SymmBufferRegistry.get_instance().get_peer_tensors(buffer)
 
@@ -386,7 +397,8 @@ class ReductionService:
         group_idx = dist.get_rank(pg)
         accumulation_id = self.accumulation_indices[key] + 1
 
-        size = buffer.numel()
+        # size = buffer.numel()
+        size = acc.numel()
         assert input_tensor.numel() == size * group_size
         
         local_world_size = get_local_world_size()
@@ -400,26 +412,20 @@ class ReductionService:
 
             if len(dst_rank_infos) == 0:
                 continue
-            # stream = self.rank_streams[dst_local_rank]
-            # event = torch.cuda.Event()
-            # main_stream = torch.cuda.current_stream()
-            # stream.wait_stream(main_stream)
-            # with torch.cuda.stream(stream):
-            #     with torch.cuda.nvtx.range(f"lock_{buffer_id}"):
-            #         self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
-            #     for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-            #         dst_buffer = peer_buffers[dst_group_idx]
-            #         dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            #     with torch.cuda.nvtx.range(f"notify_{buffer_id}"):
-            #         self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
-            #     event.record()
-            #     main_stream.wait_event(event)
-            self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            dst_group_idx, _, dst_local_rank = dst_rank_infos[0]
+            dst_buffer = peer_buffers[dst_group_idx]
+            buf_size = dst_buffer.numel()
+            data_size = input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size].numel()
 
-            for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-                dst_buffer = peer_buffers[dst_group_idx]
-                dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id, accumulation_start_index=0)
+            for start in range(0, data_size, buf_size):
+                self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+                copy_size = min(buf_size, data_size - start)
+                print(f"Rank {torch.distributed.get_rank()} copying start {start} size {copy_size} full size {data_size}")
+                for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
+                    dst_buffer = peer_buffers[dst_group_idx]
+                    input_data = input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size]
+                    dst_buffer[:copy_size].copy_(input_data[start:start+copy_size])
+                self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id, accumulation_start_index=0)
         self.dispatched_tasks += 1
     
     def get_accumulation(self, key):
@@ -573,25 +579,27 @@ if __name__ == "__main__":
       dist.barrier()
       torch.cuda.synchronize()
       # warmup
-      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
-        reduction_service.clear_accumulations()
-        torch.cuda.current_stream().synchronize()
-        with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
-          for i in range(cnt * times):
-            dst_idx = i % cnt
-            reduce_scatter_func(data[i], dst_idx, group)
-            compute_buffer[dst_idx] @ compute_param
-          if reduce_scatter_func == reduce_scatter_accumulation or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
-            reduction_service.sync(group)
-            for i in range(cnt):
-              torch.testing.assert_close(nccl_accumulations[i], reduction_service.accumulations[i], rtol=5e-3, atol=5e-3)
-          dist.barrier()
-          torch.cuda.synchronize()
-        dist.barrier()
-        torch.cuda.synchronize()
+    #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+    #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
+    #     reduction_service.clear_accumulations()
+    #     torch.cuda.current_stream().synchronize()
+    #     with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
+    #       for i in range(cnt * times):
+    #         dst_idx = i % cnt
+    #         reduce_scatter_func(data[i], dst_idx, group)
+    #         compute_buffer[dst_idx] @ compute_param
+    #       if reduce_scatter_func == reduce_scatter_accumulation or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
+    #         reduction_service.sync(group)
+    #         for i in range(cnt):
+    #           torch.testing.assert_close(nccl_accumulations[i], reduction_service.accumulations[i], rtol=5e-3, atol=5e-3)
+    #       dist.barrier()
+    #       torch.cuda.synchronize()
+    #     dist.barrier()
+    #     torch.cuda.synchronize()
       for i in range(cnt):
           nccl_accumulations[i].zero_()
-      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+    #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
         reduction_service.clear_accumulations()
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
