@@ -39,10 +39,14 @@ def nvshmem_set_kernel(
     target_rank,
     lock_id,
     value,
+    accumulation_start_indices_ptr,
+    accumulation_start_index,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     if pid == 0 and tidx == 0:
+        libshmem_device.atomic_swap(accumulation_start_indices_ptr + lock_id, accumulation_start_index, target_rank)
+        libshmem_device.quiet()
         libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
     __syncthreads()
 
@@ -81,6 +85,8 @@ class DistLock:
         self.num_locks = num_locks
         self.lock_buffers = nvshmem_create_tensor(self.num_locks, torch.int32)
         self.lock_buffers.fill_(0)
+        self.accumulation_start_indices = nvshmem_create_tensor(self.num_locks, torch.int32)
+        self.accumulation_start_indices.fill_(0)
         self.cpu_lock_buffers = torch.empty_like(self.lock_buffers, device="cpu").pin_memory()
         
 
@@ -90,19 +96,23 @@ class DistLock:
         # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
         nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id)
     
-    def notify_data(self, target_rank, buffer_id, accumulation_id):
+    def notify_data(self, target_rank, buffer_id, accumulation_id, accumulation_start_index):
         assert buffer_id < self.num_locks
         assert accumulation_id > 0
         # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
         # nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank, buffer_id, accumulation_id)
-        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id, accumulation_id)
+        assert accumulation_start_index >= 0
+        nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id, accumulation_id,
+                                  self.accumulation_start_indices, accumulation_start_index)
 
 class ReductionWatcher:
-    def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor):
+    def __init__(self, accumulations: List[torch.Tensor], buffers: List[torch.Tensor], lock_buffers: torch.Tensor, accumulation_start_indices: torch.Tensor):
         self.accumulations = accumulations
         self.buffers = buffers
         self.lock_buffers = lock_buffers
+        self.accumulation_start_indices = accumulation_start_indices
         self.cpu_lock_buffers = torch.empty_like(self.lock_buffers, device="cpu").pin_memory()
+        self.cpu_accumulation_start_indices = torch.empty_like(self.accumulation_start_indices, device="cpu").pin_memory()
         self.num_locks = len(lock_buffers)
         self.running = True
         self.task_count = 0
@@ -128,10 +138,12 @@ class ReductionWatcher:
             block_size = triton.next_power_of_2(self.num_locks)
 
             self.cpu_lock_buffers.fill_(0)
+            self.cpu_accumulation_start_indices.fill_(0)
             time.sleep(1/10000)
             # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
 
             self.cpu_lock_buffers.copy_(self.lock_buffers, non_blocking=True)
+            self.cpu_accumulation_start_indices.copy_(self.accumulation_start_indices, non_blocking=True)
             torch.cuda.current_stream().synchronize()
             if not self.running:
                 break
@@ -140,10 +152,12 @@ class ReductionWatcher:
             
             for buf_id in nonzeros:
                 acc_id = self.cpu_lock_buffers[buf_id]
+                start = self.cpu_accumulation_start_indices[buf_id]
                 if acc_id > 0:
                     # print(f"Rank {torch.cuda.current_device()} adding buffer {buf_id} -> {acc_id - 1}")
                     for acc, buf in zip(self.accumulations[acc_id - 1], self.buffers[buf_id]):
-                        acc.add_(buf)
+                        size = min(buf.numel(), acc.numel() - start)
+                        acc[start:start + size].add_(buf[:size])
                     self.task_count += 1
                     
                     # print(f"adding buffer {idx} {self.accumulations[idx]} {self.buffers[idx]}")
@@ -153,15 +167,16 @@ def tensor_from_handle(handle, size, dtype):
     from tensor_ipc import reconstruct_tensor
     return reconstruct_tensor(handle, (size,), dtype)
 
-def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue):
+def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, accumulation_start_indices, cmd_queue, response_queue):
     torch.cuda.set_device(device_id)
     import sys
     # torch.cuda.cudart().cudaProfilerStart()
     buffers = [tensor_from_handle(*buffer) for buffer in buffers]
     accumulations = [tensor_from_handle(*acc) for acc in accumulations]
     lock_buffers = tensor_from_handle(*lock_buffers)
+    accumulation_start_indices = tensor_from_handle(*accumulation_start_indices)
 
-    watcher = ReductionWatcher(accumulations, buffers, lock_buffers)
+    watcher = ReductionWatcher(accumulations, buffers, lock_buffers, accumulation_start_indices)
 
     from threading import Thread
     def cmd_thread():
@@ -179,7 +194,7 @@ def reduction_watcher_function(device_id, accumulations, buffers, lock_buffers, 
     watcher.run()
     cmd_thread.join()
 
-def start_reduction_watcher(accumulations, buffers, lock_buffers):
+def start_reduction_watcher(accumulations, buffers, lock_buffers, accumulation_start_indices):
     from torch.multiprocessing import Process
 
     # original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
@@ -191,7 +206,7 @@ def start_reduction_watcher(accumulations, buffers, lock_buffers):
     response_queue = ctx.Queue()
     device_id = torch.distributed.get_rank() % get_local_world_size()
     process = ctx.Process(target=reduction_watcher_function,
-                       args=(device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue))
+                       args=(device_id, accumulations, buffers, lock_buffers, accumulation_start_indices, cmd_queue, response_queue))
     process.start()
     # if original_visible_devices is not None:
     #     os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
@@ -232,12 +247,12 @@ class ReductionService:
         if self.reduction_watcher is None:
             self.lock = DistLock(128)
             lock_buffers_handle = get_nvshmem_handle(self.lock.lock_buffers)
-
+            accumulation_start_indices_handle = get_nvshmem_handle(self.lock.accumulation_start_indices)
             # Make sure changes are visible to all reduction watchers
             torch.distributed.barrier()
             torch.cuda.synchronize()
 
-            self.reduction_watcher = start_reduction_watcher([], [], lock_buffers_handle)
+            self.reduction_watcher = start_reduction_watcher([], [], lock_buffers_handle, accumulation_start_indices_handle)
 
         buffer_key = f'rs_buffer_{key}'
         accumulation_key = f'rs_accumulation_{key}'
@@ -404,7 +419,7 @@ class ReductionService:
             for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
                 dst_buffer = peer_buffers[dst_group_idx]
                 dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+            self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id, accumulation_start_index=0)
         self.dispatched_tasks += 1
     
     def get_accumulation(self, key):
@@ -456,6 +471,7 @@ class ReductionService:
             torch.cuda.synchronize()
             self.lock.lock_buffers.fill_(2)
             nvshmem_free_tensor_sync(self.lock.lock_buffers)
+            nvshmem_free_tensor_sync(self.lock.accumulation_start_indices)
 
 
 
