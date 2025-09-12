@@ -40,7 +40,12 @@ def _reduce_grad(state, handle) -> None:
         #     group=pg,
         # )
         # print(f"Rank {dist.get_rank()}: reduce_scatter_accumulation")
-        reduction_service.reduce_scatter_accumulation(id(handle.flat_param), padded_unsharded_grad, pg)
+        import os
+        if os.environ.get("ODC_NCCL_COMM", "0") == "1":
+          rs_func = reduction_service.reduce_scatter_accumulation_nccl_comm
+        else:
+          rs_func = reduction_service.reduce_scatter_accumulation
+        rs_func(id(handle.flat_param), padded_unsharded_grad, pg)
         handle.flat_param._saved_grad_shard = reduction_service.get_accumulation(id(handle.flat_param))
 
         # if uses_hybrid_sharded_strategy:
@@ -152,7 +157,12 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
         dist.all_gather(tensor_list, sharded_flat_param, group=pg)
     else:
-        odc.all_gather_into_tensor(
+        import os
+        if os.environ.get("ODC_NCCL_COMM", "0") == "1":
+          ag_func = odc.all_gather_into_tensor_nccl_comm
+        else:
+          ag_func = odc.all_gather_into_tensor
+        ag_func(
             padded_unsharded_flat_param,
             sharded_flat_param,
             pg,

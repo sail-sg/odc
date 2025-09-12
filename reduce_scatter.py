@@ -480,6 +480,7 @@ if __name__ == "__main__":
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
       def some_compute(x):
+        return x
         with torch.no_grad():
           x = x @ compute_param
           x = x @ compute_param
@@ -518,7 +519,7 @@ if __name__ == "__main__":
       dist.barrier()
       torch.cuda.synchronize()
       comp_stream = torch.cuda.Stream()
-      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation, reduce_scatter_accumulation_nccl_comm]:
         reduction_service.clear_accumulations()
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
