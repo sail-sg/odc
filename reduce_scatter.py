@@ -12,7 +12,7 @@ from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, n
 from typing import List
 import time
 from dataclasses import dataclass
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream
 import torch.distributed as dist
 from collections import defaultdict
 
@@ -51,6 +51,7 @@ def nvshmem_reduce_scatter_kernel(
     chunk_size,
     next_request_id,
     accumulation_command,
+    signal_ptr,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
@@ -75,28 +76,70 @@ def nvshmem_reduce_scatter_kernel(
         this_chunk_size = chunk_size
         if chunk == num_chunks - 1:
             this_chunk_size = elem_per_rank - chunk * chunk_size
-        libshmem_device.putmem_block(
+        libshmem_device.putmem_nbi_block(
             output_tensor_ptr + (chunk * chunk_size),
             input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
             this_chunk_size * size_per_elem,
             peer,
         )
 
-    # libshmem_device.quiet()
+        if tidx == 0:
+            tl.atomic_add(signal_ptr, 1)
+        __syncthreads()
+        expected = (chunk * 2) * world_size + world_size
+        offsets = tl.arange(0, 1)
+        mask = offsets == 0
+        r = 0
+        while r < expected:
+            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+            r = tl.max(signals)
+        if tidx == 0 and pid == 0:
+            libshmem_device.quiet()
+        __syncthreads()
 
+        if tidx == 0:
+            tl.atomic_add(signal_ptr, 1)
+        __syncthreads()
+        expected = (chunk * 2) * world_size + 2 * world_size
+        offsets = tl.arange(0, 1)
+        mask = offsets == 0
+        r = 0
+        while r < expected:
+            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+            r = tl.max(signals)
+    
     if tidx == 0:
-      libshmem_device.int_p(request_buffer_ptr + rank, accumulation_command, peer)
-    # libshmem_device.quiet()
+        tl.atomic_add(signal_ptr, 1)
     __syncthreads()
+    expected = num_chunks * world_size * 2 + world_size
+    offsets = tl.arange(0, 1)
+    mask = offsets == 0
+    r = 0
+    while r < expected:
+        signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+        r = tl.max(signals)
 
-    next_request_id += 1
+    if pid == 0:
+        if tidx == 0:
+          libshmem_device.quiet()
+        __syncthreads()
 
-    if tidx == 0:
-      r=next_request_id-1
-      while r != next_request_id:
-        libshmem_device.quiet()
-        r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
-    __syncthreads()
+
+        if tidx == 0:
+            for peer in range(world_size):
+              libshmem_device.int_p(request_buffer_ptr + rank, accumulation_command, peer)
+        __syncthreads()
+
+        
+
+        if tidx == 0:
+          next_request_id += 1
+          for peer in range(world_size):
+              r=next_request_id-1
+              while r != next_request_id:
+                libshmem_device.quiet()
+                r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
+        __syncthreads()
 
 @triton.jit(do_not_specialize=["next_request_id", "accumulation_command"])
 def pre(
@@ -244,7 +287,6 @@ def server_loop(server_context, dispatch_func, exit_predicate, client_mask=set()
             if len(client_mask) > 0 and client_rank not in client_mask:
                 continue
             command = request_buffer_cpu[client_rank]
-            # print(f"Rank {torch.distributed.get_rank()} received command {command} from client {client_rank}")
             acked = dispatch_func(client_rank, command)
             if not acked:
                 with torch.cuda.nvtx.range(f"ack {client_rank} cmd {command}"):
@@ -286,6 +328,8 @@ class DistLock:
         self.world_size = world_size
         self.request_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer('request_buffer', (self.world_size,), torch.int32)
         self.response_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer('response_buffer', (self.world_size,), torch.int32)
+        self.request_buffer.fill_(0)
+        self.response_buffer.fill_(0)
         self.client_context = ClientContext(self.request_buffer, self.response_buffer, 1)
         self.server_context = ServerContext(self.request_buffer, self.response_buffer, [1] * self.world_size)
         
@@ -511,20 +555,28 @@ class ReductionService:
         # chunk_size = buffer.numel()
         # assert buffer.shape[0] % chunk_size == 0
 
-        nvshmem_reduce_scatter_kernel[(world_size, )](
-          input_tensor_ptr = input_tensor_symm,
-          output_tensor_ptr = buffer,
-          request_buffer_ptr = self.lock.request_buffer,
-          response_buffer_ptr = self.lock.response_buffer,
-          elem_per_rank = buffer.numel(),
-          size_per_elem = buffer.element_size(),
-          rank = torch.distributed.get_rank(pg),
-          world_size = world_size,
-          chunk_size = chunk_size,
-          next_request_id = self.lock.client_context.next_request_id,
-          accumulation_command = accumulation_command,
-          num_warps=32,
-        )
+        signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+        
+        get_comm_stream().wait_stream(torch.cuda.current_stream())
+
+        with torch.cuda.stream(get_comm_stream()):
+            nvshmem_reduce_scatter_kernel[(world_size, )](
+              input_tensor_ptr = input_tensor_symm,
+              output_tensor_ptr = buffer,
+              request_buffer_ptr = self.lock.request_buffer,
+              response_buffer_ptr = self.lock.response_buffer,
+              elem_per_rank = buffer.numel(),
+              size_per_elem = buffer.element_size(),
+              rank = torch.distributed.get_rank(pg),
+              world_size = world_size,
+              chunk_size = chunk_size,
+              next_request_id = self.lock.client_context.next_request_id,
+              accumulation_command = accumulation_command,
+              signal_ptr = signal_ptr,
+              num_warps=32,
+            )
+        torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
         # pre[(world_size, )](
         #   input_tensor_ptr = input_tensor_symm,
@@ -623,7 +675,7 @@ if __name__ == "__main__":
       # times = 2
       # size = 16 * (1000 ** 0)
       # comp_sizes = torch.rand(cnt).tolist()
-      comp_sizes = [1]
+      comp_sizes = [2]
 
       
       
@@ -658,7 +710,7 @@ if __name__ == "__main__":
       mem_allocated = torch.cuda.memory_allocated() / (1024 ** 2)
       mem_reserved = torch.cuda.memory_reserved() / (1024 ** 2)
       print(f"[Rank {rank}] CUDA memory allocated: {mem_allocated:.2f} MB, reserved: {mem_reserved:.2f} MB")
-      compute_buffer = [torch.empty(int(x*131072),8192, dtype=torch.bfloat16, device="cuda") for x in comp_sizes]
+      compute_buffer = [torch.empty(int(x*16384),8192, dtype=torch.bfloat16, device="cuda") for x in comp_sizes]
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
       def some_compute(x):

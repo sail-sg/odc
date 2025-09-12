@@ -162,4 +162,10 @@ def get_local_world_size():
         return int(os.environ["LOCAL_WORLD_SIZE"])
     
     
-    
+
+stream = None
+def get_comm_stream():
+    global stream
+    if stream is None:
+        stream = torch.cuda.Stream()
+    return stream

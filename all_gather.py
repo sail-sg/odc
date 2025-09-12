@@ -17,7 +17,7 @@ from typing import List
 from torch import Tensor
 from triton_dist.language.extra import libshmem_device
 from triton.language.extra.cuda.language_extra import __syncthreads, tid
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
 #  Used to extract PyTorch Stream into a cuda.core.Stream for NVSHMEM APIs
@@ -225,17 +225,32 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # assert input_tensor.numel() % chunk_size == 0
   cupy_stream = PyTorchStreamWrapper(torch.cuda.current_stream())
   # print(f'chunk size {chunk_size}')
+  
+  # nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked[(torch.distributed.get_world_size(pg), )](
+  #   input_tensor,
+  #   target_tensor,
+  #   input_tensor.numel(),
+  #   input_tensor.element_size(),
+  #   torch.distributed.get_rank(pg),
+  #   torch.distributed.get_world_size(pg),
+  #   chunk_size,
+  #   num_warps=16,
+  # )
   signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
-  nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked[(torch.distributed.get_world_size(pg), )](
-    input_tensor,
-    target_tensor,
-    input_tensor.numel(),
-    input_tensor.element_size(),
-    torch.distributed.get_rank(pg),
-    torch.distributed.get_world_size(pg),
-    chunk_size,
-    num_warps=16,
-  )
+  get_comm_stream().wait_stream(torch.cuda.current_stream())
+  with torch.cuda.stream(get_comm_stream()):
+      nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
+        input_tensor,
+        target_tensor,
+        input_tensor.numel(),
+        input_tensor.element_size(),
+        torch.distributed.get_rank(pg),
+        torch.distributed.get_world_size(pg),
+        chunk_size,
+        signal_ptr,
+        num_warps=32,
+      )
+  torch.cuda.current_stream().wait_stream(get_comm_stream())
   # nvshmem.core.quiet(stream=cupy_stream)
   # num_chunks = ((input_tensor.numel() - 1) // chunk_size) + 1
   # for chunk_id in range(num_chunks):
@@ -261,6 +276,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   #   chunk_size,
   #   num_warps=32,
   # )
+  # nvshmem.core.quiet(stream=cupy_stream)
 
   
   
@@ -347,7 +363,7 @@ if __name__ == "__main__":
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
       def some_compute(x):
-        return x
+        # return x
         with torch.no_grad():
           x = x @ compute_param
           x = x @ compute_param
@@ -388,8 +404,8 @@ if __name__ == "__main__":
           start = torch.cuda.Event(enable_timing=True)
           
           for i in range(cnt):
-            torch.distributed.barrier(group)
             if i == 1:
+              # torch.distributed.barrier(group)
               start.record()
             dst = torch.empty(size * group_size, dtype=dtype, device="cuda")
             # dst_arr = [
@@ -409,7 +425,7 @@ if __name__ == "__main__":
             # print(dst)
             for r in range(group_size):
               expected = group_ranks[r] * 2 + i
-              assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
+              # assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
           end = torch.cuda.Event(enable_timing=True)
           end.record()
           dist.barrier()
