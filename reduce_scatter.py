@@ -1,3 +1,4 @@
+import math
 from typing import Mapping, Tuple
 from functools import reduce
 
@@ -490,16 +491,46 @@ class ReductionService:
     def get_buffer_shape(self, output_tensor_shape, output_tensor_dtype):
         # 64mb will hurt performance
         # DEFAULT_MAX_BUFFER_SIZE = 128 * 1000 * 1000 * 1000
-        # DEFAULT_MAX_BUFFER_SIZE = 64 * 1000 * 1000
-        DEFAULT_MAX_BUFFER_SIZE = 16
+        DEFAULT_MAX_BUFFER_SIZE = 64 * 1000 * 1000
         max_buffer_size = int(os.environ.get('ODC_MAX_BUFFER_SIZE', DEFAULT_MAX_BUFFER_SIZE))
         output_count = reduce(lambda x, y: x * y, output_tensor_shape)
         if max_buffer_size <= 0:
             return (output_count,)
         assert max_buffer_size % output_tensor_dtype.itemsize == 0
         max_buffer_count = max_buffer_size // output_tensor_dtype.itemsize
-        print(f"max_buffer_count: {max_buffer_count} output_count: {output_count} max_buffer_size: {max_buffer_size} output_tensor_dtype.itemsize: {output_tensor_dtype.itemsize}")
-        return (min(max_buffer_count, output_count),)
+        # s: output_count
+        # r: world_size
+        # k: divice number
+        # d: r * k * d = s
+        # m: max_buffer_count
+        # find k so that
+        # 1. d <= m
+        # 2. (s / r) % k == 0
+        # m >= s // k
+        # k >= s // m
+        world_size = torch.distributed.get_world_size()
+        assert output_count % world_size == 0
+        output_rank_count = output_count // world_size
+        min_k = math.ceil(output_count / max_buffer_count)
+        assert isinstance(min_k, int)
+        assert min_k <= output_count
+        import numpy as np
+        candidates0 = np.arange(1, math.floor(math.sqrt(output_rank_count)), dtype=int)
+        candidates1 = np.floor_divide(output_rank_count, candidates0)
+        mask0 = (output_rank_count % candidates0 == 0) & (candidates0 >= min_k)
+        if mask0.any():
+            k = candidates0[mask0].min()
+        else:
+            mask1 = (output_rank_count % candidates1 == 0) & (candidates1 >= min_k)
+            assert mask1.any(), "output_rank_count should be a candidate for k"
+            k = candidates1[mask1].min()
+        assert min_k <= k <= output_rank_count
+        assert output_count % k == 0
+        capped_count = output_count // k
+        print(f"max_buffer_count: {max_buffer_count} output_count: {output_count} k: {k} capped_count: {capped_count}")
+        assert capped_count <= max_buffer_count
+        assert capped_count > world_size and capped_count % world_size == 0
+        return (capped_count,)
 
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
@@ -594,7 +625,7 @@ class ReductionService:
         accumulation_id = self.accumulation_indices[key] + 1
 
         accumulation_command = (buffer_id << 16) | accumulation_id
-        # assert (buffer.numel() * buffer.element_size()) % (2**6) == 0, 'better align to 64 for efficiency'
+        assert (buffer.numel() * buffer.element_size()) % (2**6) == 0, 'better align to 64 for efficiency'
         chunk_size = (2**20 // buffer.element_size())
         # chunk_size = buffer.numel()
         # assert buffer.shape[0] % chunk_size == 0
@@ -602,18 +633,15 @@ class ReductionService:
         # signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
 
         
-        # get_comm_stream().wait_stream(torch.cuda.current_stream())
-        main_stream = torch.cuda.current_stream()
+        get_comm_stream().wait_stream(torch.cuda.current_stream())
 
         rank = os.environ['RANK']
         with torch.cuda.stream(get_comm_stream()):
-            # for i, start in enumerate(range(0, input_tensor.numel(), buf_size)):
-            print(f"input_tensor: {input_tensor.numel()}, buf_size: {buf_size}, world_size: {world_size}, k: {k}, d: {d} input_tensor_symm: {input_tensor_symm.numel()} {input_tensor_symm.shape} input_tensor_split {input_tensor_split.shape}")
+            signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
             for i in range(k):
-                get_comm_stream().wait_stream(main_stream)
-                signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
                 assert input_tensor_symm.numel() == input_tensor_split[:, i, :].numel()
-                # TODO: remove contiguous
+                signal_ptr.fill_(0)
+                # TODO: remove contiguous to avoid creating a new tensor
                 input_tensor_symm.copy_(input_tensor_split[:, i, :].contiguous().view(-1))
                 print(f"Rank {rank} client {i}th buf_size: {buf_size} {buffer.numel()} type size: {buffer.element_size()} next_request_id: {self.lock.client_context.next_request_id}")
                 nvshmem_reduce_scatter_kernel[(world_size, )](
@@ -631,11 +659,9 @@ class ReductionService:
                     signal_ptr = signal_ptr,
                     num_warps=32,
                 )
-                # torch.cuda.current_stream().synchronize()
-                print(f"Rank {rank} client {i} done")
                 self.lock.client_context.next_request_id += 2 # One for lock, another for notification
-                main_stream.wait_stream(get_comm_stream())
                 self.dispatched_tasks += 1
+        torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
         # pre[(world_size, )](
         #   input_tensor_ptr = input_tensor_symm,
@@ -727,12 +753,12 @@ if __name__ == "__main__":
 
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
       cnt = 1
-    #   times = 10
-      times = 1
-    #   size = 128 * (1024 ** 2) + 1024
+      times = 10
+    #   times = 1
+      size = 128 * (1024 ** 2) + 1024
       # TODO: need to support not aligned size
     #   size = 128 * (1000 ** 2)
-      size = 32
+    #   size = 32
       # cnt = 1
       # times = 2
       # size = 16 * (1000 ** 0)
@@ -757,8 +783,7 @@ if __name__ == "__main__":
       print(f"Rank {rank} group: {group_ranks}")
 
       data = [
-        # torch.rand(size, dtype=grad_dtype, device="cuda")
-        torch.arange(size, dtype=grad_dtype, device="cuda")
+        torch.rand(size, dtype=grad_dtype, device="cuda")
         for _ in range(cnt * times)
       ]
       # data = torch.arange(cnt * times * size, dtype=grad_dtype, device="cuda").reshape(cnt * times, size) / group_size / times
@@ -857,7 +882,7 @@ if __name__ == "__main__":
             reduction_service.sync(group)
             for i in range(cnt):
               pass
-              print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.accumulations[i]}")
+              # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.accumulations[i]}")
               torch.testing.assert_close(nccl_accumulations[i], reduction_service.accumulations[i], rtol=5e-3, atol=5e-3)
             # print(f"Rank {rank} reduction_service: {reduction_service.buffers[0][0]}")
           else:
