@@ -396,7 +396,6 @@ class ReductionWatcher:
                 size = min(buf.numel(), acc.numel() - start)
                 with torch.cuda.nvtx.range(f"add client {client_rank} buffer {buffer_id} accumulation {accumulation_id}"):
                     acc[start:start+size].add_(buf[:size])
-                print(f"Rank {rank} server client_rank {repr(client_rank)} buffer_id {repr(buffer_id)} accumulation_id {accumulation_id} start {start} size {size} buf {buf.numel()} acc {acc.numel()} buffer {buf.detach().cpu()} acc {acc.detach().cpu()}")
                 if start + size >= acc.numel():
                     assert start + size == acc.numel()
                     self.server_context.accumulation_start[(buffer_id, client_rank)] = 0
@@ -486,7 +485,7 @@ class ReductionService:
         self.dispatched_tasks = 0
         self.accumulation_dtype = accumulation_dtype
         self.rank_streams = defaultdict(lambda: torch.cuda.Stream())
-        pass
+        self.buffer_shape_cache = {}
     
     def get_buffer_shape(self, output_tensor_shape, output_tensor_dtype):
         # 64mb will hurt performance
@@ -496,6 +495,11 @@ class ReductionService:
         output_count = reduce(lambda x, y: x * y, output_tensor_shape)
         if max_buffer_size <= 0:
             return (output_count,)
+
+        key = (tuple(output_tensor_shape), output_tensor_dtype)
+        if key in self.buffer_shape_cache:
+            return self.buffer_shape_cache[key]
+
         assert max_buffer_size % output_tensor_dtype.itemsize == 0
         max_buffer_count = max_buffer_size // output_tensor_dtype.itemsize
         # s: output_count
@@ -527,9 +531,10 @@ class ReductionService:
         assert min_k <= k <= output_rank_count
         assert output_count % k == 0
         capped_count = output_count // k
-        print(f"max_buffer_count: {max_buffer_count} output_count: {output_count} k: {k} capped_count: {capped_count}")
+        print(f"max_buffer_count: {max_buffer_count} output_count: {output_count} num_sub_buffers: {k} capped_count: {capped_count}")
         assert capped_count <= max_buffer_count
         assert capped_count > world_size and capped_count % world_size == 0
+        self.buffer_shape_cache[key] = (capped_count,)
         return (capped_count,)
 
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
@@ -604,6 +609,7 @@ class ReductionService:
         buf_size = reduce(lambda x, y: x * y, buffer_shape)
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
         assert output_size % buf_size == 0
+        # k: number of sub buffers
         k = output_size // buf_size
         world_size = torch.distributed.get_world_size(pg)
         assert input_tensor.numel() % k == 0
@@ -630,20 +636,17 @@ class ReductionService:
         # chunk_size = buffer.numel()
         # assert buffer.shape[0] % chunk_size == 0
 
-        # signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
-
-        
         get_comm_stream().wait_stream(torch.cuda.current_stream())
 
-        rank = os.environ['RANK']
         with torch.cuda.stream(get_comm_stream()):
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
             for i in range(k):
                 assert input_tensor_symm.numel() == input_tensor_split[:, i, :].numel()
                 signal_ptr.fill_(0)
-                # TODO: remove contiguous to avoid creating a new tensor
-                input_tensor_symm.copy_(input_tensor_split[:, i, :].contiguous().view(-1))
-                print(f"Rank {rank} client {i}th buf_size: {buf_size} {buffer.numel()} type size: {buffer.element_size()} next_request_id: {self.lock.client_context.next_request_id}")
+                # input_tensor_symm.copy_(input_tensor_split[:, i, :].contiguous().view(-1))
+                d = input_tensor_split[0, i, :].numel()
+                for j in range(input_tensor_split.shape[0]):
+                    input_tensor_symm[j * d:(j + 1) * d].copy_(input_tensor_split[j, i, :].view(-1))
                 nvshmem_reduce_scatter_kernel[(world_size, )](
                     input_tensor_ptr = input_tensor_symm,
                     output_tensor_ptr = buffer,
@@ -703,8 +706,6 @@ class ReductionService:
         #   next_request_id = self.lock.client_context.next_request_id,
         #   accumulation_command = accumulation_command,
         # )
-            
-        # self.dispatched_tasks += 1
         
     def get_accumulation(self, key):
         acc = self.accumulations[self.accumulation_indices[key]]
@@ -754,11 +755,7 @@ if __name__ == "__main__":
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
       cnt = 1
       times = 10
-    #   times = 1
       size = 128 * (1024 ** 2) + 1024
-      # TODO: need to support not aligned size
-    #   size = 128 * (1000 ** 2)
-    #   size = 32
       # cnt = 1
       # times = 2
       # size = 16 * (1000 ** 0)
@@ -850,13 +847,12 @@ if __name__ == "__main__":
           compute_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
           start = torch.cuda.Event(enable_timing=True)
 
-          start.record()
           for i in range(cnt * times):
             dst_idx = i % cnt
             torch.distributed.barrier(group)
             
-            # if i == cnt:
-            #   start.record()
+            if i == cnt:
+              start.record()
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
             #   for r in range(world_size)
