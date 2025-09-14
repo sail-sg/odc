@@ -17,7 +17,7 @@ from typing import List
 from torch import Tensor
 from triton_dist.language.extra import libshmem_device
 from triton.language.extra.cuda.language_extra import __syncthreads, tid
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream, BufferSplitter
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
 #  Used to extract PyTorch Stream into a cuda.core.Stream for NVSHMEM APIs
@@ -203,6 +203,8 @@ def nvshmem_device_producer_all_gather_2d_put_block_kernel(
 #     )
 
 shaped_buffer = {}
+buffer_splitter = BufferSplitter()
+
 class PyTorchStreamWrapper:
     def __init__(self, pt_stream):
         self.pt_stream = pt_stream
@@ -213,9 +215,21 @@ class PyTorchStreamWrapper:
         return (0, stream_id)  # Return format required by CUDA Python
 
 def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
-  if (output_tensor.shape, output_tensor.dtype) not in shaped_buffer:
-    shaped_buffer[(output_tensor.shape, output_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(f'ag_buffer_{output_tensor.shape}_{output_tensor.dtype}', output_tensor.shape, output_tensor.dtype)
-  target_tensor = shaped_buffer[(output_tensor.shape, output_tensor.dtype)]
+  buffer_shape = buffer_splitter.get_buffer_shape(output_tensor.shape, output_tensor.dtype)
+  if (buffer_shape, output_tensor.dtype) not in shaped_buffer:
+    shaped_buffer[(buffer_shape, output_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(f'ag_buffer_{buffer_shape}_{output_tensor.dtype}', buffer_shape, output_tensor.dtype)
+  target_tensor = shaped_buffer[(buffer_shape, output_tensor.dtype)]
+
+  output_size = output_tensor.numel()
+  buf_size = target_tensor.numel()
+  assert output_size >= buf_size, f"output_size: {output_size} < buf_size: {buf_size}"
+  assert output_size % buf_size == 0, f"output_size: {output_size} % buf_size: {buf_size} != 0"
+  num_chunks = output_size // buf_size
+  input_chunk_size = input_tensor.numel() // num_chunks
+  d = buf_size // group_size
+  input_tensor_split = input_tensor.view(-1).view(num_chunks, d)
+  output_tensor_split = output_tensor.view(group_size, num_chunks, d)
+  target_tensor_split = target_tensor.view(group_size, d)
 
   # peers = SymmBufferRegistry.get_instance().get_peer_tensors(input_tensor)
   grid = (torch.distributed.get_world_size(pg),)
@@ -236,20 +250,24 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   #   chunk_size,
   #   num_warps=16,
   # )
-  signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
   get_comm_stream().wait_stream(torch.cuda.current_stream())
   with torch.cuda.stream(get_comm_stream()):
-      nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
-        input_tensor,
-        target_tensor,
-        input_tensor.numel(),
-        input_tensor.element_size(),
-        torch.distributed.get_rank(pg),
-        torch.distributed.get_world_size(pg),
-        chunk_size,
-        signal_ptr,
-        num_warps=32,
-      )
+        signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
+        for i in range(num_chunks):
+            sub_input_tensor = input_tensor_split[i]
+            nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
+                sub_input_tensor,
+                target_tensor,
+                sub_input_tensor.numel(),
+                sub_input_tensor.element_size(),
+                torch.distributed.get_rank(pg),
+                torch.distributed.get_world_size(pg),
+                chunk_size,
+                signal_ptr,
+                num_warps=32,
+            )
+            for j in range(group_size):
+                output_tensor_split[j, i, :].copy_(target_tensor_split[j, :])
   torch.cuda.current_stream().wait_stream(get_comm_stream())
   # nvshmem.core.quiet(stream=cupy_stream)
   # num_chunks = ((input_tensor.numel() - 1) // chunk_size) + 1
@@ -316,7 +334,6 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # torch.distributed.barrier(group=pg)
   # torch.cuda.synchronize()
   # print(f"Rank {torch.distributed.get_rank(pg)} target_tensor: {target_tensor} input_tensor: {input_tensor}")
-  output_tensor.copy_(target_tensor)
 
 
 
@@ -393,6 +410,12 @@ if __name__ == "__main__":
         src_tensors[i].fill_(i + rank*2)
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
         # all_gather_sync_cache(src_tensors[i], group)
+      concated_src_tensors = []
+      for i in range(cnt):
+        concated_src_tensor = torch.empty(size * group_size, dtype=dtype, device="cuda")
+        for r in range(group_size):
+          concated_src_tensor[r * size:(r + 1) * size].fill_(i + r*2)
+        concated_src_tensors.append(concated_src_tensor)
 
       # for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl, all_gather_into_tensor_multinode]:
       comp_stream = torch.cuda.Stream()
@@ -430,6 +453,7 @@ if __name__ == "__main__":
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
+          torch.testing.assert_close(dst, concated_src_tensors[i], rtol=0, atol=0)
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* dtype.itemsize
           print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
@@ -442,6 +466,7 @@ if __name__ == "__main__":
       traceback.print_exc()
     finally:
       registry.finalize()
+      torch.distributed.destroy_process_group()
 
 # for t in local_tensors:
 #   nvshmem.core.free_tensor(t)

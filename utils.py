@@ -1,3 +1,6 @@
+import math
+from functools import reduce
+
 import torch
 import nvshmem
 import os
@@ -169,3 +172,58 @@ def get_comm_stream():
     if stream is None:
         stream = torch.cuda.Stream()
     return stream
+
+
+class BufferSplitter:
+    def __init__(self):
+        self.buffer_shape_cache = {}
+
+    def get_buffer_shape(self, output_tensor_shape, output_tensor_dtype):
+        # 64mb will hurt performance
+        # DEFAULT_MAX_BUFFER_SIZE = 128 * 1000 * 1000 * 1000
+        DEFAULT_MAX_BUFFER_SIZE = 64 * 1000 * 1000
+        max_buffer_size = int(os.environ.get('ODC_MAX_BUFFER_SIZE', DEFAULT_MAX_BUFFER_SIZE))
+        output_count = reduce(lambda x, y: x * y, output_tensor_shape)
+        if max_buffer_size <= 0:
+            return (output_count,)
+
+        key = (tuple(output_tensor_shape), output_tensor_dtype)
+        if key in self.buffer_shape_cache:
+            return self.buffer_shape_cache[key]
+
+        assert max_buffer_size % output_tensor_dtype.itemsize == 0
+        max_buffer_count = max_buffer_size // output_tensor_dtype.itemsize
+        # s: output_count
+        # r: world_size
+        # k: divice number
+        # d: r * k * d = s
+        # m: max_buffer_count
+        # find k so that
+        # 1. d <= m
+        # 2. (s / r) % k == 0
+        # m >= s // k
+        # k >= s // m
+        world_size = torch.distributed.get_world_size()
+        assert output_count % world_size == 0
+        output_rank_count = output_count // world_size
+        min_k = math.ceil(output_count / max_buffer_count)
+        assert isinstance(min_k, int)
+        assert min_k <= output_count
+        import numpy as np
+        candidates0 = np.arange(1, math.floor(math.sqrt(output_rank_count)), dtype=int)
+        candidates1 = np.floor_divide(output_rank_count, candidates0)
+        mask0 = (output_rank_count % candidates0 == 0) & (candidates0 >= min_k)
+        if mask0.any():
+            k = candidates0[mask0].min()
+        else:
+            mask1 = (output_rank_count % candidates1 == 0) & (candidates1 >= min_k)
+            assert mask1.any(), "output_rank_count should be a candidate for k"
+            k = candidates1[mask1].min()
+        assert min_k <= k <= output_rank_count
+        assert output_count % k == 0
+        capped_count = output_count // k
+        print(f"max_buffer_count: {max_buffer_count} output_count: {output_count} num_sub_buffers: {k} capped_count: {capped_count}")
+        assert capped_count <= max_buffer_count
+        assert capped_count > world_size and capped_count % world_size == 0
+        self.buffer_shape_cache[key] = (capped_count,)
+        return (capped_count,)
