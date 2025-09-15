@@ -530,6 +530,9 @@ class ReductionService:
 
         shared_buffer_key = (grad_dtype, buffer_shape)
         if shared_buffer_key not in self.shared_buffer:
+            output_size = reduce(lambda x, y: x * y, output_tensor_shape)
+            buffer_size = reduce(lambda x, y: x * y, buffer_shape)
+            print(f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buffer_size)} buffer_size: {buffer_size}")
             cnt = len(self.shared_buffer)
             buffers = create_and_register_buffer(f'shared_buffer_{cnt}', buffer_shape, grad_dtype, 'add_buffer')
             self.shared_buffer[shared_buffer_key] = (cnt, buffers)
@@ -556,20 +559,11 @@ class ReductionService:
         if key not in self.accumulation_indices:
             self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype)
         
-        buffer_shape = self.buffer_splitter.get_buffer_shape(output_tensor_shape, accum_dtype)
-        buf_size = reduce(lambda x, y: x * y, buffer_shape)
+        buf_size = self.buffer_splitter.get_buffer_size(output_tensor_shape, accum_dtype)
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
-        assert output_size % buf_size == 0
-        # k: number of sub buffers
-        k = output_size // buf_size
         world_size = torch.distributed.get_world_size(pg)
-        assert input_tensor.numel() % k == 0
-        input_buf_size = input_tensor.numel() // k
-        assert input_buf_size % world_size == 0
-        assert input_tensor.numel() % buf_size == 0
-        d = input_buf_size // world_size
-        input_tensor_split = input_tensor.view(-1).view(world_size, k, d)
-        assert input_tensor_split.data_ptr() == input_tensor.data_ptr()
+
+        input_buf_size = buf_size * world_size
         input_tensor_symm_shape = (input_buf_size,)
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(
@@ -590,20 +584,21 @@ class ReductionService:
         get_comm_stream().wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(get_comm_stream()):
+            input_tensor_split = input_tensor.view(-1).view(world_size, -1)
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
-            for i in range(k):
-                assert input_tensor_symm.numel() == input_tensor_split[:, i, :].numel()
+            for start in range(0, output_size, buf_size):
+                size = min(buf_size, output_size - start)
+                input_size = size * world_size
+                input_tensor_symm_split = input_tensor_symm[:input_size].view(world_size, -1)
+                for r in range(world_size):
+                    input_tensor_symm_split[r, :].copy_(input_tensor_split[r, start:start+size])
                 signal_ptr.fill_(0)
-                # input_tensor_symm.copy_(input_tensor_split[:, i, :].contiguous().view(-1))
-                d = input_tensor_split[0, i, :].numel()
-                for j in range(input_tensor_split.shape[0]):
-                    input_tensor_symm[j * d:(j + 1) * d].copy_(input_tensor_split[j, i, :].view(-1))
                 nvshmem_reduce_scatter_kernel[(world_size, )](
-                    input_tensor_ptr = input_tensor_symm,
-                    output_tensor_ptr = buffer,
+                    input_tensor_ptr = input_tensor_symm_split.view(-1),
+                    output_tensor_ptr = buffer[:size],
                     request_buffer_ptr = self.lock.request_buffer,
                     response_buffer_ptr = self.lock.response_buffer,
-                    elem_per_rank = buffer.numel(),
+                    elem_per_rank = size,
                     size_per_elem = buffer.element_size(),
                     rank = torch.distributed.get_rank(pg),
                     world_size = world_size,
