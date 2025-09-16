@@ -175,17 +175,25 @@ def get_comm_stream():
 
 
 class BufferSplitter:
-    def get_buffer_size(self, output_tensor_shape, output_tensor_dtype):
+    def get_max_global_buffer_size(self):
         DEFAULT_MAX_BUFFER_SIZE = 64 * 1000 * 1000
         max_buffer_size = int(os.environ.get('ODC_MAX_BUFFER_SIZE', DEFAULT_MAX_BUFFER_SIZE))
-        output_count = reduce(lambda x, y: x * y, output_tensor_shape)
+        return max_buffer_size
+
+    def get_global_buffer_size(self, original_buffer_shape):
+        original_size = reduce(lambda x, y: x * y, original_buffer_shape)
+        max_buffer_size = self.get_max_global_buffer_size()
         if max_buffer_size <= 0:
-            return output_count
-        assert max_buffer_size % output_tensor_dtype.itemsize == 0
-        max_buffer_count = max_buffer_size // output_tensor_dtype.itemsize
-        buf_size = min(max_buffer_count, output_count)
+            return original_size
+        buf_size = min(max_buffer_size, original_size)
         return buf_size
 
-    def get_buffer_shape(self, output_tensor_shape, output_tensor_dtype):
-        buf_size = self.get_buffer_size(output_tensor_shape, output_tensor_dtype)
-        return (buf_size,)
+    def get_local_buffer_size(self, original_buffer_shape, world_size):
+        original_size = reduce(lambda x, y: x * y, original_buffer_shape)
+        max_buffer_size = self.get_max_global_buffer_size()
+        if max_buffer_size <= 0:
+            return original_size
+        assert max_buffer_size % world_size == 0, f"ODC_MAX_BUFFER_SIZE: {max_buffer_size} % world_size: {world_size} != 0"
+        local_max_buffer_size = max_buffer_size // world_size
+        buf_size = min(local_max_buffer_size, original_size)
+        return buf_size
