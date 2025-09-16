@@ -74,9 +74,7 @@ def nvshmem_reduce_scatter_kernel(
         r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
     __syncthreads()
 
-    num_chunks = elem_per_rank // chunk_size
-    if num_chunks == 0:
-        num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+    num_chunks = tl.cdiv(elem_per_rank, chunk_size)
     for chunk in range(num_chunks):
         this_chunk_size = chunk_size
         if chunk == num_chunks - 1:
@@ -526,7 +524,9 @@ class ReductionService:
         self.accumulation_indices[key] = len(self.accumulations)
         self.accumulations.append(acc)
         
-        buffer_shape = self.buffer_splitter.get_buffer_shape(output_tensor_shape, grad_dtype)
+        world_size = torch.distributed.get_world_size()
+        buffer_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+        buffer_shape = (buffer_size,)
 
         shared_buffer_key = (grad_dtype, buffer_shape)
         if shared_buffer_key not in self.shared_buffer:
@@ -559,11 +559,11 @@ class ReductionService:
         if key not in self.accumulation_indices:
             self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype)
         
-        buf_size = self.buffer_splitter.get_buffer_size(output_tensor_shape, accum_dtype)
-        output_size = reduce(lambda x, y: x * y, output_tensor_shape)
         world_size = torch.distributed.get_world_size(pg)
+        local_buf_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+        output_size = reduce(lambda x, y: x * y, output_tensor_shape)
 
-        input_buf_size = buf_size * world_size
+        input_buf_size = local_buf_size * world_size
         input_tensor_symm_shape = (input_buf_size,)
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(
@@ -586,8 +586,8 @@ class ReductionService:
         with torch.cuda.stream(get_comm_stream()):
             input_tensor_split = input_tensor.view(-1).view(world_size, -1)
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
-            for start in range(0, output_size, buf_size):
-                size = min(buf_size, output_size - start)
+            for start in range(0, output_size, local_buf_size):
+                size = min(local_buf_size, output_size - start)
                 input_size = size * world_size
                 input_tensor_symm_split = input_tensor_symm[:input_size].view(world_size, -1)
                 for r in range(world_size):
