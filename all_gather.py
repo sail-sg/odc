@@ -6,6 +6,7 @@ It runs a kernel expressed with Triton
 
 Run this program with `torchrun --nproc-per-node <NGPUs> torch_triton_interop.py`
 """
+import math
 
 import torch.distributed as dist
 import torch
@@ -17,7 +18,7 @@ from typing import List
 from torch import Tensor
 from triton_dist.language.extra import libshmem_device
 from triton.language.extra.cuda.language_extra import __syncthreads, tid
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream, BufferSplitter
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
 #  Used to extract PyTorch Stream into a cuda.core.Stream for NVSHMEM APIs
@@ -203,6 +204,8 @@ def nvshmem_device_producer_all_gather_2d_put_block_kernel(
 #     )
 
 shaped_buffer = {}
+buffer_splitter = BufferSplitter()
+
 class PyTorchStreamWrapper:
     def __init__(self, pt_stream):
         self.pt_stream = pt_stream
@@ -213,9 +216,15 @@ class PyTorchStreamWrapper:
         return (0, stream_id)  # Return format required by CUDA Python
 
 def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
-  if (output_tensor.shape, output_tensor.dtype) not in shaped_buffer:
-    shaped_buffer[(output_tensor.shape, output_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(f'ag_buffer_{output_tensor.shape}_{output_tensor.dtype}', output_tensor.shape, output_tensor.dtype)
-  target_tensor = shaped_buffer[(output_tensor.shape, output_tensor.dtype)]
+  buf_size = buffer_splitter.get_buffer_size(output_tensor.shape, output_tensor.dtype)
+  buffer_shape = (buf_size,)
+  output_size = output_tensor.numel()
+  assert output_size >= buf_size, f"output_size: {output_size} < buf_size: {buf_size}"
+
+  if (buffer_shape, output_tensor.dtype) not in shaped_buffer:
+    print(f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buf_size)} buf_size: {buf_size}")
+    shaped_buffer[(buffer_shape, output_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(f'ag_buffer_{buffer_shape}_{output_tensor.dtype}', buffer_shape, output_tensor.dtype)
+  target_tensor = shaped_buffer[(buffer_shape, output_tensor.dtype)]
 
   # peers = SymmBufferRegistry.get_instance().get_peer_tensors(input_tensor)
   grid = (torch.distributed.get_world_size(pg),)
@@ -236,20 +245,31 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   #   chunk_size,
   #   num_warps=16,
   # )
-  signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
   get_comm_stream().wait_stream(torch.cuda.current_stream())
   with torch.cuda.stream(get_comm_stream()):
-      nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
-        input_tensor,
-        target_tensor,
-        input_tensor.numel(),
-        input_tensor.element_size(),
-        torch.distributed.get_rank(pg),
-        torch.distributed.get_world_size(pg),
-        chunk_size,
-        signal_ptr,
-        num_warps=32,
-      )
+        output_tensor_split = output_tensor.view(group_size, -1)
+        assert buf_size % group_size == 0
+        rank_buf_size = buf_size // group_size
+        signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
+        for start in range(0, input_tensor.numel(), rank_buf_size):
+            size = min(rank_buf_size, input_tensor.numel() - start)
+            sub_input_tensor = input_tensor.view(-1)[start:start+size]
+            target_buf_size = size * group_size
+            assert target_buf_size <= buf_size
+            target_tensor_split = target_tensor[:target_buf_size].view(group_size, size)
+            nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
+                sub_input_tensor,
+                target_tensor_split.view(-1),
+                sub_input_tensor.numel(),
+                sub_input_tensor.element_size(),
+                torch.distributed.get_rank(pg),
+                torch.distributed.get_world_size(pg),
+                chunk_size,
+                signal_ptr,
+                num_warps=32,
+            )
+            for r in range(group_size):
+                output_tensor_split[r, start:start+size].copy_(target_tensor_split[r, :])
   torch.cuda.current_stream().wait_stream(get_comm_stream())
   # nvshmem.core.quiet(stream=cupy_stream)
   # num_chunks = ((input_tensor.numel() - 1) // chunk_size) + 1
@@ -316,7 +336,6 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # torch.distributed.barrier(group=pg)
   # torch.cuda.synchronize()
   # print(f"Rank {torch.distributed.get_rank(pg)} target_tensor: {target_tensor} input_tensor: {input_tensor}")
-  output_tensor.copy_(target_tensor)
 
 
 
@@ -363,7 +382,7 @@ if __name__ == "__main__":
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
       def some_compute(x):
-        # return x
+        return x
         with torch.no_grad():
           x = x @ compute_param
           x = x @ compute_param
@@ -393,6 +412,12 @@ if __name__ == "__main__":
         src_tensors[i].fill_(i + rank*2)
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
         # all_gather_sync_cache(src_tensors[i], group)
+      concated_src_tensors = []
+      for i in range(cnt):
+        concated_src_tensor = torch.empty(size * group_size, dtype=dtype, device="cuda")
+        for r in range(group_size):
+          concated_src_tensor[r * size:(r + 1) * size].fill_(i + r*2)
+        concated_src_tensors.append(concated_src_tensor)
 
       # for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl, all_gather_into_tensor_multinode]:
       comp_stream = torch.cuda.Stream()
@@ -430,6 +455,7 @@ if __name__ == "__main__":
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
+          torch.testing.assert_close(dst, concated_src_tensors[i], rtol=0, atol=0)
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* dtype.itemsize
           print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
@@ -442,6 +468,8 @@ if __name__ == "__main__":
       traceback.print_exc()
     finally:
       registry.finalize()
+      torch.distributed.destroy_process_group()
+    torch.cuda.cudart().cudaProfilerStop()
 
 # for t in local_tensors:
 #   nvshmem.core.free_tensor(t)
