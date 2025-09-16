@@ -216,7 +216,7 @@ class PyTorchStreamWrapper:
         return (0, stream_id)  # Return format required by CUDA Python
 
 def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
-  buf_size = buffer_splitter.get_buffer_size(output_tensor.shape, output_tensor.dtype)
+  buf_size = buffer_splitter.get_global_buffer_size(output_tensor.shape)
   buffer_shape = (buf_size,)
   output_size = output_tensor.numel()
   assert output_size >= buf_size, f"output_size: {output_size} < buf_size: {buf_size}"
@@ -245,18 +245,22 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   #   chunk_size,
   #   num_warps=16,
   # )
+
+  world_size = torch.distributed.get_world_size(pg)
   get_comm_stream().wait_stream(torch.cuda.current_stream())
   with torch.cuda.stream(get_comm_stream()):
-        output_tensor_split = output_tensor.view(group_size, -1)
-        assert buf_size % group_size == 0
-        rank_buf_size = buf_size // group_size
-        signal_ptr = torch.zeros(1, dtype=torch.int32, device="cuda")
-        for start in range(0, input_tensor.numel(), rank_buf_size):
-            size = min(rank_buf_size, input_tensor.numel() - start)
+        output_tensor_split = output_tensor.view(world_size, -1)
+        assert buf_size % world_size == 0
+        local_buf_size = buf_size // world_size
+        signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
+        for start in range(0, input_tensor.numel(), local_buf_size):
+            size = min(local_buf_size, input_tensor.numel() - start)
             sub_input_tensor = input_tensor.view(-1)[start:start+size]
-            target_buf_size = size * group_size
+            assert (sub_input_tensor.numel() * sub_input_tensor.element_size()) % (2**6) == 0, 'better align to 64 for efficiency'
+            target_buf_size = size * world_size
             assert target_buf_size <= buf_size
-            target_tensor_split = target_tensor[:target_buf_size].view(group_size, size)
+            target_tensor_split = target_tensor[:target_buf_size].view(world_size, size)
+            signal_ptr.fill_(0)
             nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
                 sub_input_tensor,
                 target_tensor_split.view(-1),
@@ -268,7 +272,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
                 signal_ptr,
                 num_warps=32,
             )
-            for r in range(group_size):
+            for r in range(world_size):
                 output_tensor_split[r, start:start+size].copy_(target_tensor_split[r, :])
   torch.cuda.current_stream().wait_stream(get_comm_stream())
   # nvshmem.core.quiet(stream=cupy_stream)
@@ -412,12 +416,6 @@ if __name__ == "__main__":
         src_tensors[i].fill_(i + rank*2)
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
         # all_gather_sync_cache(src_tensors[i], group)
-      concated_src_tensors = []
-      for i in range(cnt):
-        concated_src_tensor = torch.empty(size * group_size, dtype=dtype, device="cuda")
-        for r in range(group_size):
-          concated_src_tensor[r * size:(r + 1) * size].fill_(i + r*2)
-        concated_src_tensors.append(concated_src_tensor)
 
       # for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl, all_gather_into_tensor_multinode]:
       comp_stream = torch.cuda.Stream()
@@ -450,12 +448,11 @@ if __name__ == "__main__":
             # print(dst)
             for r in range(group_size):
               expected = group_ranks[r] * 2 + i
-              # assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
+              assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
           end = torch.cuda.Event(enable_timing=True)
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
-          torch.testing.assert_close(dst, concated_src_tensors[i], rtol=0, atol=0)
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* dtype.itemsize
           print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")

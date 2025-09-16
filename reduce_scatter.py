@@ -20,6 +20,11 @@ from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, 
 import torch.distributed as dist
 from collections import defaultdict
 
+
+# Need to be even for the protocol
+MAX_REQUEST_COUNT = 2 * 100000
+
+
 @triton.jit(do_not_specialize=["server_rank", "command", "request_id"])
 def nvshmem_request_wait_kernel(
   request_buffer_ptr,
@@ -74,9 +79,7 @@ def nvshmem_reduce_scatter_kernel(
         r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
     __syncthreads()
 
-    num_chunks = elem_per_rank // chunk_size
-    if num_chunks == 0:
-        num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+    num_chunks = tl.cdiv(elem_per_rank, chunk_size)
     for chunk in range(num_chunks):
         this_chunk_size = chunk_size
         if chunk == num_chunks - 1:
@@ -282,6 +285,8 @@ def ack(server_context, client_rank):
     server_context.request_buffer[client_rank] = 0
     server_context.response_buffer[client_rank] = server_context.next_request_id[client_rank]
     server_context.next_request_id[client_rank] += 1
+    if server_context.next_request_id[client_rank] > MAX_REQUEST_COUNT:
+        server_context.next_request_id[client_rank] = 1
 
 def server_loop(server_context, dispatch_func, exit_predicate, client_mask=set()):
     request_buffer_cpu = torch.empty_like(server_context.request_buffer, device="cpu").pin_memory()
@@ -526,7 +531,9 @@ class ReductionService:
         self.accumulation_indices[key] = len(self.accumulations)
         self.accumulations.append(acc)
         
-        buffer_shape = self.buffer_splitter.get_buffer_shape(output_tensor_shape, grad_dtype)
+        world_size = torch.distributed.get_world_size()
+        buffer_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+        buffer_shape = (buffer_size,)
 
         shared_buffer_key = (grad_dtype, buffer_shape)
         if shared_buffer_key not in self.shared_buffer:
@@ -559,11 +566,11 @@ class ReductionService:
         if key not in self.accumulation_indices:
             self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype)
         
-        buf_size = self.buffer_splitter.get_buffer_size(output_tensor_shape, accum_dtype)
-        output_size = reduce(lambda x, y: x * y, output_tensor_shape)
         world_size = torch.distributed.get_world_size(pg)
+        local_buf_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+        output_size = reduce(lambda x, y: x * y, output_tensor_shape)
 
-        input_buf_size = buf_size * world_size
+        input_buf_size = local_buf_size * world_size
         input_tensor_symm_shape = (input_buf_size,)
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(
@@ -586,8 +593,8 @@ class ReductionService:
         with torch.cuda.stream(get_comm_stream()):
             input_tensor_split = input_tensor.view(-1).view(world_size, -1)
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
-            for start in range(0, output_size, buf_size):
-                size = min(buf_size, output_size - start)
+            for start in range(0, output_size, local_buf_size):
+                size = min(local_buf_size, output_size - start)
                 input_size = size * world_size
                 input_tensor_symm_split = input_tensor_symm[:input_size].view(world_size, -1)
                 for r in range(world_size):
@@ -609,6 +616,8 @@ class ReductionService:
                     num_warps=32,
                 )
                 self.lock.client_context.next_request_id += 2 # One for lock, another for notification
+                if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
+                    self.lock.client_context.next_request_id = 1
                 self.dispatched_tasks += 1
         torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
