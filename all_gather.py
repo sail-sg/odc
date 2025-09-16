@@ -272,8 +272,11 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
                 signal_ptr,
                 num_warps=32,
             )
-            for r in range(world_size):
-                output_tensor_split[r, start:start+size].copy_(target_tensor_split[r, :])
+            if buf_size == output_size:
+                output_tensor.copy_(target_tensor)
+            else:
+                for r in range(world_size):
+                    output_tensor_split[r, start:start+size].copy_(target_tensor_split[r, :])
   torch.cuda.current_stream().wait_stream(get_comm_stream())
   # nvshmem.core.quiet(stream=cupy_stream)
   # num_chunks = ((input_tensor.numel() - 1) // chunk_size) + 1

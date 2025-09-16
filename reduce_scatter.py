@@ -569,6 +569,7 @@ class ReductionService:
         world_size = torch.distributed.get_world_size(pg)
         local_buf_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
+        assert local_buf_size <= output_size
 
         input_buf_size = local_buf_size * world_size
         input_tensor_symm_shape = (input_buf_size,)
@@ -597,8 +598,11 @@ class ReductionService:
                 size = min(local_buf_size, output_size - start)
                 input_size = size * world_size
                 input_tensor_symm_split = input_tensor_symm[:input_size].view(world_size, -1)
-                for r in range(world_size):
-                    input_tensor_symm_split[r, :].copy_(input_tensor_split[r, start:start+size])
+                if local_buf_size < output_size:
+                    for r in range(world_size):
+                        input_tensor_symm_split[r, :].copy_(input_tensor_split[r, start:start+size])
+                else:
+                    input_tensor_symm.copy_(input_tensor.view(-1))
                 signal_ptr.fill_(0)
                 nvshmem_reduce_scatter_kernel[(world_size, )](
                     input_tensor_ptr = input_tensor_symm_split.view(-1),
