@@ -20,6 +20,11 @@ from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, 
 import torch.distributed as dist
 from collections import defaultdict
 
+
+# Need to be even for the protocol
+MAX_REQUEST_COUNT = 2 * 100000
+
+
 @triton.jit(do_not_specialize=["server_rank", "command", "request_id"])
 def nvshmem_request_wait_kernel(
   request_buffer_ptr,
@@ -280,6 +285,8 @@ def ack(server_context, client_rank):
     server_context.request_buffer[client_rank] = 0
     server_context.response_buffer[client_rank] = server_context.next_request_id[client_rank]
     server_context.next_request_id[client_rank] += 1
+    if server_context.next_request_id[client_rank] > MAX_REQUEST_COUNT:
+        server_context.next_request_id[client_rank] = 1
 
 def server_loop(server_context, dispatch_func, exit_predicate, client_mask=set()):
     request_buffer_cpu = torch.empty_like(server_context.request_buffer, device="cpu").pin_memory()
@@ -609,6 +616,8 @@ class ReductionService:
                     num_warps=32,
                 )
                 self.lock.client_context.next_request_id += 2 # One for lock, another for notification
+                if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
+                    self.lock.client_context.next_request_id = 1
                 self.dispatched_tasks += 1
         torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
