@@ -47,7 +47,7 @@ def nvshmem_request_wait_kernel(
   __syncthreads()
 
 
-@triton.jit(do_not_specialize=["next_request_id", "accumulation_command"])
+@triton.jit(do_not_specialize=["next_request_id", "accumulation_command", "need_lock", "need_accumulation"])
 def nvshmem_reduce_scatter_kernel(
     input_tensor_ptr,
     output_tensor_ptr,
@@ -61,22 +61,25 @@ def nvshmem_reduce_scatter_kernel(
     next_request_id,
     accumulation_command,
     signal_ptr,
+    need_lock,
+    need_accumulation,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     peer = (pid + rank + 1) % world_size
     # chunk_size = elem_per_rank // num_chunks
 
-    if tidx == 0:
+    if tidx == 0 and need_lock:
       libshmem_device.int_p(request_buffer_ptr + rank, -1, peer)
     # libshmem_device.quiet()
     __syncthreads()
 
-    if tidx == 0:
+    if tidx == 0 and need_lock:
       r=next_request_id-1
       while r != next_request_id:
         libshmem_device.quiet()
         r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
+      next_request_id += 1
     __syncthreads()
 
     num_chunks = tl.cdiv(elem_per_rank, chunk_size)
@@ -127,7 +130,7 @@ def nvshmem_reduce_scatter_kernel(
         signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
         r = tl.max(signals)
 
-    if pid == 0:
+    if pid == 0 and need_accumulation:
         if tidx == 0:
           libshmem_device.quiet()
         __syncthreads()
@@ -141,7 +144,6 @@ def nvshmem_reduce_scatter_kernel(
         
 
         if tidx == 0:
-          next_request_id += 1
           for peer in range(world_size):
               r=next_request_id-1
               while r != next_request_id:
@@ -532,8 +534,11 @@ class ReductionService:
         self.accumulations.append(acc)
         
         world_size = torch.distributed.get_world_size()
-        buffer_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
-        buffer_shape = (buffer_size,)
+        if os.getenv('ODC_RS_SPLIT_TRANS_BUFFER', '0') == '1':
+            buffer_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+            buffer_shape = (buffer_size,)
+        else:
+            buffer_shape = output_tensor_shape
 
         shared_buffer_key = (grad_dtype, buffer_shape)
         if shared_buffer_key not in self.shared_buffer:
@@ -591,6 +596,7 @@ class ReductionService:
 
         get_comm_stream().wait_stream(torch.cuda.current_stream())
 
+        split_trans_buffer = buffer.numel() < output_size
         with torch.cuda.stream(get_comm_stream()):
             input_tensor_split = input_tensor.view(-1).view(world_size, -1)
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
@@ -598,31 +604,45 @@ class ReductionService:
                 size = min(local_buf_size, output_size - start)
                 input_size = size * world_size
                 input_tensor_symm_split = input_tensor_symm[:input_size].view(world_size, -1)
+                assert local_buf_size <= buffer.numel()
                 if local_buf_size < output_size:
                     for r in range(world_size):
                         input_tensor_symm_split[r, :].copy_(input_tensor_split[r, start:start+size])
                 else:
                     input_tensor_symm.copy_(input_tensor.view(-1))
+                if split_trans_buffer:
+                    buf = buffer[:size]
+                else:
+                    buf = buffer[start:start+size]
                 signal_ptr.fill_(0)
+                need_lock = split_trans_buffer or start == 0
+                need_accumulation = split_trans_buffer or start + size == output_size
                 nvshmem_reduce_scatter_kernel[(world_size, )](
                     input_tensor_ptr = input_tensor_symm_split.view(-1),
-                    output_tensor_ptr = buffer[:size],
+                    output_tensor_ptr = buf,
                     request_buffer_ptr = self.lock.request_buffer,
                     response_buffer_ptr = self.lock.response_buffer,
                     elem_per_rank = size,
-                    size_per_elem = buffer.element_size(),
+                    size_per_elem = buf.element_size(),
                     rank = torch.distributed.get_rank(pg),
                     world_size = world_size,
                     chunk_size = chunk_size,
                     next_request_id = self.lock.client_context.next_request_id,
                     accumulation_command = accumulation_command,
                     signal_ptr = signal_ptr,
+                    need_lock = need_lock,
+                    need_accumulation = need_accumulation,
                     num_warps=32,
                 )
-                self.lock.client_context.next_request_id += 2 # One for lock, another for notification
+                # One for lock, another for notification
+                if need_lock:
+                    self.lock.client_context.next_request_id += 1
+                if need_accumulation:
+                    self.lock.client_context.next_request_id += 1
                 if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
                     self.lock.client_context.next_request_id = 1
-                self.dispatched_tasks += 1
+                if need_accumulation:
+                    self.dispatched_tasks += 1
         torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
         # pre[(world_size, )](
