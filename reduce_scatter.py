@@ -391,9 +391,9 @@ class ReductionWatcher:
                     self.server_context.accumulation_start[(buffer_id, client_rank)] = 0
                 else:
                     self.server_context.accumulation_start[(buffer_id, client_rank)] += size
+                torch.cuda.current_stream().synchronize()
                 self.task_count += 1
                 # client_mask.remove(client_rank)
-                torch.cuda.current_stream().synchronize()
                 return False
         def exit_predicate():
             return not self.running
