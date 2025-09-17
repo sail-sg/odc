@@ -104,7 +104,8 @@ class DistLock:
         # print(f"Rank {torch.distributed.get_rank()} notify_data {target_rank} {buffer_id} {accumulation_id} {peer_tensors}")
         # peer_tensor = peer_tensors[target_rank % get_local_world_size()]
         # print(f"Rank {torch.distributed.get_rank()} notify_data {target_rank} {buffer_id} {accumulation_id} {peer_tensor}")
-        peer_tensor[buffer_id] = cmd_buffer[accumulation_id]
+        # peer_tensor[buffer_id] = cmd_buffer[accumulation_id]
+        peer_tensor[buffer_id].copy_(cmd_buffer[accumulation_id], non_blocking=True)
         # nvshmem_set_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id, accumulation_id)
 
 class ReductionWatcher:
@@ -398,25 +399,24 @@ class ReductionService:
             if len(dst_rank_infos) == 0:
                 continue
 
-            # stream = self.rank_streams[dst_local_rank]
-            # event = torch.cuda.Event()
-            # events.append(event)
-            # stream.wait_stream(torch.cuda.current_stream())
-            # with torch.cuda.stream(stream):
-            #     self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            stream = self.rank_streams[dst_local_rank]
+            event = torch.cuda.Event()
+            events.append(event)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
 
-            #     for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-            #         dst_buffer = peer_buffers[dst_group_idx]
-            #         dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            #     self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
-            #     event.record()
+                for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
+                    dst_buffer = peer_buffers[dst_group_idx]
+                    dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size], non_blocking=True)
+                self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+                event.record()
 
-            self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
-
-            for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
-                dst_buffer = peer_buffers[dst_group_idx]
-                dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size])
-            self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
+            # self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
+            # for (dst_group_idx, dst_rank, dst_local_rank) in dst_rank_infos:
+            #     dst_buffer = peer_buffers[dst_group_idx]
+            #     dst_buffer.copy_(input_tensor[dst_group_idx * size:(dst_group_idx + 1) * size], non_blocking=True)
+            # self.lock.notify_data(target_rank=matching_rank_in_local_world, buffer_id=buffer_id, accumulation_id=accumulation_id)
         self.dispatched_tasks += 1
         for event in events:
             torch.cuda.current_stream().wait_event(event)
@@ -487,7 +487,7 @@ def size_str_to_int(size_str):
 
 if __name__ == "__main__":
     import os
-    data_size_str = os.environ.get('DATA_SIZE', '256mb')
+    data_size_str = os.environ.get('DATA_SIZE', '64mb')
     data_size = size_str_to_int(data_size_str)
     data_dir = os.environ.get('DATA_DIR', 'profile')
     data_dir = os.path.join(data_dir, data_size_str)
@@ -509,8 +509,7 @@ if __name__ == "__main__":
       reduction_service = ReductionService(accumulation_dtype=accum_dtype)
       cnt = 1
       times = 10
-    #   size = 64 * (1000 ** 2)
-      size = data_size // accum_dtype.itemsize
+      size = data_size
       # cnt = 1
       # times = 2
       # size = 16 * (1000 ** 0)
@@ -597,14 +596,15 @@ if __name__ == "__main__":
       torch.cuda.synchronize()
       comp_stream = torch.cuda.Stream()
       # warmup
-      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+    #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
         reduction_service.clear_accumulations()
         torch.cuda.current_stream().synchronize()
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           for i in range(cnt * times):
             dst_idx = i % cnt
             reduce_scatter_func(data[i], dst_idx, group)
-            compute_buffer[dst_idx] @ compute_param
+            # compute_buffer[dst_idx] @ compute_param
           if reduce_scatter_func == reduce_scatter_accumulation or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
             reduction_service.sync(group)
             for i in range(cnt):
@@ -615,14 +615,22 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
       for i in range(cnt):
           nccl_accumulations[i].zero_()
-      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+      def wait_kernel_launch():
+        with torch.cuda.nvtx.range("wait-kernel-launch"):
+          for _ in range(4):
+            with torch.no_grad():
+                compute_buffer[0] @ compute_param
+    #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation_nccl_comm, reduce_scatter_accumulation]:
+      for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation]:
         reduction_service.clear_accumulations()
+        wait_kernel_launch()
         with torch.cuda.nvtx.range(reduce_scatter_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
           compute_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt * times)]
           start = torch.cuda.Event(enable_timing=True)
           
+        #   dist.barrier()
           start.record()
           for i in range(cnt * times):
             dst_idx = i % cnt
