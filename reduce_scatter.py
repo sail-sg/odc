@@ -21,7 +21,6 @@ import torch.distributed as dist
 from collections import defaultdict
 
 
-# Need to be even for the protocol
 MAX_REQUEST_COUNT = 2 * 100000
 
 
@@ -47,7 +46,7 @@ def nvshmem_request_wait_kernel(
   __syncthreads()
 
 
-@triton.jit(do_not_specialize=["next_request_id", "accumulation_command", "need_lock", "need_accumulation"])
+@triton.jit(do_not_specialize=["next_request_id", "accumulation_command", "need_accumulation"])
 def nvshmem_reduce_scatter_kernel(
     input_tensor_ptr,
     output_tensor_ptr,
@@ -61,26 +60,12 @@ def nvshmem_reduce_scatter_kernel(
     next_request_id,
     accumulation_command,
     signal_ptr,
-    need_lock,
     need_accumulation,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     peer = (pid + rank + 1) % world_size
     # chunk_size = elem_per_rank // num_chunks
-
-    if tidx == 0 and need_lock:
-      libshmem_device.int_p(request_buffer_ptr + rank, -1, peer)
-    # libshmem_device.quiet()
-    __syncthreads()
-
-    if tidx == 0 and need_lock:
-      r=next_request_id-1
-      while r != next_request_id:
-        libshmem_device.quiet()
-        r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
-      next_request_id += 1
-    __syncthreads()
 
     num_chunks = tl.cdiv(elem_per_rank, chunk_size)
     for chunk in range(num_chunks):
@@ -392,8 +377,6 @@ class ReductionWatcher:
                 # client_mask.add(client_rank)
                 return False
             else:
-                with torch.cuda.nvtx.range(f"ack client {client_rank} cmd {command}"):
-                    ack(self.server_context, client_rank)
                 buffer_id = command >> 16
                 accumulation_id = command & 0xFFFF
 
@@ -410,7 +393,8 @@ class ReductionWatcher:
                     self.server_context.accumulation_start[(buffer_id, client_rank)] += size
                 self.task_count += 1
                 # client_mask.remove(client_rank)
-                return True
+                torch.cuda.current_stream().synchronize()
+                return False
         def exit_predicate():
             return not self.running
         self.server_context = ServerContext(self.request_buffer, self.response_buffer, [1] * self.world_size, defaultdict(lambda: 0))
@@ -534,7 +518,7 @@ class ReductionService:
         self.accumulations.append(acc)
         
         world_size = torch.distributed.get_world_size()
-        if os.getenv('ODC_RS_SPLIT_TRANS_BUFFER', '0') == '1':
+        if os.getenv('ODC_RS_DISABLE_SPLIT_TRANS_BUFFER', '0') != '1':
             buffer_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
             buffer_shape = (buffer_size,)
         else:
@@ -615,7 +599,6 @@ class ReductionService:
                 else:
                     buf = buffer[start:start+size]
                 signal_ptr.fill_(0)
-                need_lock = split_trans_buffer or start == 0
                 need_accumulation = split_trans_buffer or start + size == output_size
                 nvshmem_reduce_scatter_kernel[(world_size, )](
                     input_tensor_ptr = input_tensor_symm_split.view(-1),
@@ -630,18 +613,13 @@ class ReductionService:
                     next_request_id = self.lock.client_context.next_request_id,
                     accumulation_command = accumulation_command,
                     signal_ptr = signal_ptr,
-                    need_lock = need_lock,
                     need_accumulation = need_accumulation,
                     num_warps=32,
                 )
-                # One for lock, another for notification
-                if need_lock:
-                    self.lock.client_context.next_request_id += 1
                 if need_accumulation:
                     self.lock.client_context.next_request_id += 1
-                if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
-                    self.lock.client_context.next_request_id = 1
-                if need_accumulation:
+                    if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
+                        self.lock.client_context.next_request_id = 1
                     self.dispatched_tasks += 1
         torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
