@@ -11,7 +11,7 @@ import numpy as np
 from pathlib import Path
 import re
 
-def parse_payload_size(dir_name):
+def parse_input_size(dir_name):
     """Parse payload size from directory name (e.g., '16mb' -> 16*1000*1000)"""
     dir_name = dir_name.lower()
     if dir_name.endswith('kb'):
@@ -38,12 +38,12 @@ def load_profile_data(profile_dir="profile"):
             
         # Parse payload size from directory name
         try:
-            payload_size = parse_payload_size(subdir)
+            input_size = parse_input_size(subdir)
         except ValueError:
             print(f"Skipping directory with invalid name: {subdir}")
             continue
             
-        data[payload_size] = {
+        data[input_size] = {
             'reduce_scatter_accumulation': [],      # Your implementation
             'reduce_scatter_accumulation_nccl': []  # NCCL implementation
         }
@@ -61,8 +61,8 @@ def load_profile_data(profile_dir="profile"):
             func_name, payload, rank = match.groups()
             payload = int(payload)
             
-            if func_name not in data[payload_size]:
-                print(f"Unknown function name: {func_name}")
+            if func_name not in data[input_size]:
+                # print(f"Unknown function name: {func_name}")
                 continue
                 
             # Load JSON data
@@ -70,7 +70,7 @@ def load_profile_data(profile_dir="profile"):
             try:
                 with open(filepath, 'r') as f:
                     profile_data = json.load(f)
-                    data[payload_size][func_name].append(profile_data)
+                    data[input_size][func_name].append(profile_data)
             except Exception as e:
                 print(f"Error loading {filepath}: {e}")
     
@@ -92,7 +92,12 @@ def analyze_data(data):
             total_times = []
             reduce_scatter_payloads = []
             
+            total_count = None
             for profile in profiles:
+                if total_count is None:
+                    total_count = len(profile['comm_time'])
+                else:
+                    assert total_count == len(profile['comm_time'])
                 comm_times.extend(profile['comm_time'])
                 total_times.append(profile['total_time'])
                 reduce_scatter_payloads.append(profile['payload'])
@@ -115,7 +120,7 @@ def analyze_data(data):
             # print(f"Payload size: {payload_mb} MB, Comm times: {comm_times[:10]}, bandwidths: {bandwidths[:10]}")
             # if payload_size == 64 * 1000 * 1000:
                 # print(f"Payload size: {payload_mb} MB, total_times: {total_times}, Comm times: {np.mean(comm_times)}, bandwidths: {np.mean(bandwidths)} mean bandwidth: {payload_mb * 1000 / np.mean(comm_times)} MB/s")
-            # TODO: add total_bandwidth
+            total_bandwidth = payload_mb * total_count / total_times
             results[payload_size][impl_name] = {
                 'comm_times': comm_times,
                 'total_times': total_times,
@@ -127,7 +132,9 @@ def analyze_data(data):
                 'avg_bandwidth': np.mean(bandwidths),
                 'std_bandwidth': np.std(bandwidths),
                 'avg_total_time': np.mean(total_times),
-                'std_total_time': np.std(total_times)
+                'std_total_time': np.std(total_times),
+                'avg_total_bandwidth': np.mean(total_bandwidth),
+                'std_total_bandwidth': np.std(total_bandwidth),
             }
     
     return results
@@ -148,7 +155,7 @@ def plot_results(results):
     
     # Colors for implementations
     colors = {'reduce_scatter_accumulation': 'blue', 'reduce_scatter_accumulation_nccl': 'red'}
-    labels = {'reduce_scatter_accumulation': 'Custom Implementation', 'reduce_scatter_accumulation_nccl': 'NCCL'}
+    labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
     
     # Plot 1: Average Communication Time
     ax1.set_title('Average Communication Time')
@@ -273,7 +280,7 @@ def print_summary(results):
         for impl_name in ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl']:
             if impl_name in results[payload_size]:
                 data = results[payload_size][impl_name]
-                impl_label = "Custom Implementation" if impl_name == "reduce_scatter_accumulation" else "NCCL"
+                impl_label = "ODC" if impl_name == "reduce_scatter_accumulation" else "NCCL"
                 
                 print(f"{impl_label}:")
                 print(f"  Avg Comm Time: {data['avg_comm_time']:.3f} ± {data['std_comm_time']:.3f} ms")
@@ -314,13 +321,89 @@ def main(data_dir):
     print("Creating plots...")
     fig = plot_results(results)
     
-    print("Printing summary...")
-    print_summary(results)
+    # print("Printing summary...")
+    # print_summary(results)
     
     print("\nAnalysis complete!")
+
+
+def plot_multi_total_bandwidth(data_dirs):
+    """Plot avg_total_bandwidth from multiple data directories, one chart per directory"""
+    if not data_dirs:
+        print("No data directories provided")
+        return
+    
+    # Load and analyze data for each directory
+    all_results = {}
+    for data_dir in data_dirs:
+        print(f"Loading data from {data_dir}...")
+        data = load_profile_data(data_dir)
+        if data:
+            results = analyze_data(data)
+            all_results[data_dir] = results
+            print(f"Loaded data for {len(data)} payload sizes from {data_dir}")
+        else:
+            print(f"No data found in {data_dir}")
+    
+    if not all_results:
+        print("No data found in any directory")
+        return
+    
+    # Create subplots - one for each data directory
+    num_dirs = len(all_results)
+    fig, axes = plt.subplots(1, num_dirs, figsize=(6*num_dirs, 5))
+    if num_dirs == 1:
+        axes = [axes]  # Make it iterable for single subplot
+    
+    fig.suptitle('Bus Bandwidth', fontsize=16)
+    
+    # Colors and markers for implementations
+    colors = {'reduce_scatter_accumulation': 'blue', 'reduce_scatter_accumulation_nccl': 'red'}
+    markers = {'reduce_scatter_accumulation': 'o', 'reduce_scatter_accumulation_nccl': 's'}
+    labels = {'reduce_scatter_accumulation': 'Custom Implementation', 'reduce_scatter_accumulation_nccl': 'NCCL'}
+    
+    for idx, (data_dir, results) in enumerate(all_results.items()):
+        ax = axes[idx]
+        ax.set_title(f'{data_dir}')
+        ax.set_xlabel('Payload Size')
+        ax.set_ylabel('Total Bandwidth (MB/s)')
+        
+        # Sort payload sizes for proper x-axis ordering
+        payload_sizes = sorted(results.keys())
+        payload_labels = [f"{size/(1000*1000):.0f}MB" for size in payload_sizes]
+        
+        ax.set_xticks(range(len(payload_sizes)))
+        ax.set_xticklabels(payload_labels)
+        
+        # Plot avg_total_bandwidth for each implementation
+        for impl_name in ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl']:
+            bandwidths = []
+            # bandwidth_stds = []
+            for payload_size in payload_sizes:
+                if impl_name in results[payload_size]:
+                    bandwidths.append(results[payload_size][impl_name]['avg_total_bandwidth'])
+                    # bandwidth_stds.append(results[payload_size][impl_name]['std_total_bandwidth'])
+                else:
+                    bandwidths.append(0)
+                    # bandwidth_stds.append(0)
+            
+            ax.errorbar(range(len(payload_sizes)), bandwidths,
+                       marker=markers[impl_name], color=colors[impl_name], label=labels[impl_name], capsize=5)
+        
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
 
 if __name__ == "__main__":
     # data_dir = "proc-profile2"
     # data_dir = "multi-buf-profile"
     data_dir = "fxbuf-profile"
-    main(data_dir)
+    # main(data_dir)
+    plot_multi_total_bandwidth([
+        data_dir,
+    ])

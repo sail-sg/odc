@@ -666,6 +666,8 @@ if __name__ == "__main__":
           print(f"Rank {rank} {reduce_scatter_func.__name__} reduce_scatter bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 0)) / start.elapsed_time(end)}")
           print(f"Rank {rank} {reduce_scatter_func.__name__} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
+        if reduce_scatter_func == reduce_scatter_accumulation_nccl_comm:
+            continue
         profile_data = {
             "payload": reduce_scatter_payload,
             "comm_time": [start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)],
@@ -682,4 +684,5 @@ if __name__ == "__main__":
       traceback.print_exc()
     finally:
       SymmBufferRegistry.get_instance().finalize()
+      torch.distributed.destroy_process_group()
     torch.cuda.cudart().cudaProfilerStop()
