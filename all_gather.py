@@ -7,6 +7,7 @@ It runs a kernel expressed with Triton
 Run this program with `torchrun --nproc-per-node <NGPUs> torch_triton_interop.py`
 """
 
+import json
 import torch.distributed as dist
 import torch
 import triton
@@ -89,7 +90,27 @@ def all_gather_into_tensor_nccl(output_tensor: Tensor, input_tensor: Tensor, pg:
     return dist.all_gather_into_tensor(output_tensor, input_tensor, group=pg)
 
 
+def size_str_to_int(size_str):
+    size_str = size_str.lower()
+    if size_str.endswith('kb'):
+        return int(size_str[:-2]) * (1000)
+    elif size_str.endswith('mb'):
+        return int(size_str[:-2]) * (1000 ** 2)
+    elif size_str.endswith('gb'):
+        return int(size_str[:-2]) * (1000 ** 3)
+    else:
+        return int(size_str)
+
+
 if __name__ == "__main__":
+    data_size_str = os.environ.get('DATA_SIZE', '16mb')
+    data_size = size_str_to_int(data_size_str)
+    data_dir = os.environ.get('DATA_DIR', 'ag-profile')
+    data_dir = os.path.join(data_dir, data_size_str)
+    print(f"Data size: {data_size_str}, Data dir: {data_dir}")
+    assert data_size > 0
+    os.makedirs(data_dir, exist_ok=True)
+
     torch.cuda.cudart().cudaProfilerStart()
     try:
       torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
@@ -99,7 +120,8 @@ if __name__ == "__main__":
       rank = torch.distributed.get_rank()
       registry = SymmBufferRegistry.get_instance()
       cnt = 20
-      size = 16 * (1000 ** 2)
+    #   size = 16 * (1000 ** 2)
+      size = data_size
       comp_sizes = torch.rand(cnt).tolist()
 
       group_count = 1
@@ -130,16 +152,32 @@ if __name__ == "__main__":
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
         all_gather_sync_cache(src_tensors[i], group)
 
-      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl]:
+      # warmup
+      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
+        with torch.cuda.nvtx.range(all_gather_func.__name__):
+          for i in range(cnt):
+            dst = torch.empty(size * group_size, dtype=torch.long, device="cuda")
+            all_gather_func(dst, src_tensors[i], group)
+            for r in range(group_size):
+              expected = group_ranks[r] * 100 + i
+              assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
+          end = torch.cuda.Event(enable_timing=True)
+          end.record()
+          dist.barrier()
+          torch.cuda.synchronize()
+
+    #   for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl]:
+      for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           compute_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           start = torch.cuda.Event(enable_timing=True)
           
+          start.record()
           for i in range(cnt):
-            if i == 1:
-              start.record()
+            # if i == 1:
+            #   start.record()
             dst = torch.empty(size * group_size, dtype=torch.long, device="cuda")
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
@@ -152,18 +190,27 @@ if __name__ == "__main__":
             compute_events[i].record()
             
             # print(dst)
-            for r in range(group_size):
-              expected = group_ranks[r] * 100 + i
-              assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
+            # for r in range(group_size):
+            #   expected = group_ranks[r] * 100 + i
+            #   assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
           end = torch.cuda.Event(enable_timing=True)
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* torch.long.itemsize
-          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
+          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 0) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
+        if all_gather_func == all_gather_into_tensor_nccl_comm:
+            continue
+        profile_data = {
+            "payload": all_gather_payload,
+            "comm_time": [start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)],
+            "total_time": start.elapsed_time(end),
+        }
+        with open(os.path.join(data_dir, f"{all_gather_func.__name__}-{data_size}-{rank}.json"), "w") as f:
+            json.dump(profile_data, f)
 
     except Exception as e:
       print(e)

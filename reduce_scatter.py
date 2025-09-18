@@ -489,7 +489,7 @@ if __name__ == "__main__":
     import os
     data_size_str = os.environ.get('DATA_SIZE', '64mb')
     data_size = size_str_to_int(data_size_str)
-    data_dir = os.environ.get('DATA_DIR', 'profile')
+    data_dir = os.environ.get('DATA_DIR', 'rs-profile')
     data_dir = os.path.join(data_dir, data_size_str)
     print(f"Data size: {data_size_str}, Data dir: {data_dir}")
     assert data_size > 0
