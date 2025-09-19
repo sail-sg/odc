@@ -9,6 +9,8 @@ from typing import List
 
 # From triton_dist.utils
 def init_nvshmem():
+    assert 'NVSHMEM_HOME' in os.environ
+    os.environ['LD_LIBRARY_PATH'] = os.environ['NVSHMEM_HOME'] + '/lib:' + os.environ['LD_LIBRARY_PATH']
     print(f"init_nvshmem: {os.environ}")
     assert torch.distributed.is_initialized()
     # Extract rank, nranks from process group
@@ -54,6 +56,7 @@ def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.T
     rank_on_same_node_end = rank_on_same_node_start + local_world_size
     torch.cuda.synchronize()
     tensor = nvshmem_create_tensor(shape, dtype=dtype)
+    print(f"Rank {rank} create tensor {tensor.data_ptr()} with shape {shape} and dtype {dtype}")
     torch.cuda.synchronize()
     return [get_peer_tensor(tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
 
@@ -176,7 +179,7 @@ def get_comm_stream():
 
 class BufferSplitter:
     def get_max_global_buffer_size(self):
-        DEFAULT_MAX_BUFFER_SIZE = 64 * 1000 * 1000
+        DEFAULT_MAX_BUFFER_SIZE = 64 * 1024 * 1024
         max_buffer_size = int(os.environ.get('ODC_MAX_BUFFER_SIZE', DEFAULT_MAX_BUFFER_SIZE))
         return max_buffer_size
 

@@ -460,6 +460,7 @@ def call_watcher(watcher_handle, cmd, *args):
 
 def get_nvshmem_handle(tensor):
     from tensor_ipc import get_ipc_handle
+    print(f"Rank {torch.distributed.get_rank()} get_nvshmem_handle {tensor.data_ptr()} with shape {tensor.shape} and dtype {tensor.dtype}")
     handle = get_ipc_handle(tensor)
     return handle, tensor.numel(), tensor.dtype
 
@@ -674,15 +675,7 @@ class ReductionService:
         torch.distributed.all_gather_object(dispatched_task_list, self.dispatched_tasks, group=pg)
         torch.cuda.synchronize()
 
-        local_world_size = get_local_world_size()
-        if local_world_size == torch.distributed.get_world_size():
-           target = sum(dispatched_task_list)
-        else:
-           assert torch.distributed.get_world_size(pg) == torch.distributed.get_world_size(), "Cached AG only supports pure data parallelism"
-           local_world_start = torch.distributed.get_rank() // local_world_size * local_world_size
-           local_world_end = local_world_start + local_world_size
-           target = sum(dispatched_task_list[local_world_start:local_world_end])
-
+        target = sum(dispatched_task_list)
         call_watcher(self.reduction_watcher, 'wait_and_reset_task_count', target)
         self.dispatched_tasks = 0
 
