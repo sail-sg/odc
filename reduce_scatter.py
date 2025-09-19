@@ -680,8 +680,11 @@ if __name__ == "__main__":
             "payload": reduce_scatter_payload,
             "comm_time": [start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)],
             "total_time": start.elapsed_time(end),
+            "num_ranks": world_size,
+            "num_nodes": 1,
         }
-        with open(os.path.join(data_dir, f"{reduce_scatter_func.__name__}-{data_size}-{rank}.json"), "w") as f:
+        num_nodes = 1
+        with open(os.path.join(data_dir, f"{reduce_scatter_func.__name__}-{data_size}-{num_nodes}-{world_size}-{rank}.json"), "w") as f:
             json.dump(profile_data, f)
 
       reduction_service.stop()

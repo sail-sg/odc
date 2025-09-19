@@ -208,8 +208,10 @@ if __name__ == "__main__":
             "payload": all_gather_payload,
             "comm_time": [start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)],
             "total_time": start.elapsed_time(end),
+            "num_ranks": world_size,
         }
-        with open(os.path.join(data_dir, f"{all_gather_func.__name__}-{data_size}-{rank}.json"), "w") as f:
+        num_nodes = 1
+        with open(os.path.join(data_dir, f"{all_gather_func.__name__}-{data_size}-{num_nodes}-{world_size}-{rank}.json"), "w") as f:
             json.dump(profile_data, f)
 
     except Exception as e:

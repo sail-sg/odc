@@ -60,13 +60,13 @@ def load_profile_data(profile_dir="profile", operation_type="reduce_scatter"):
             if not filename.endswith('.json'):
                 continue
                 
-            # Parse filename: <func>-<payload>-<rank>.json
-            match = re.match(r'(.+)-(\d+)-(\d+)\.json', filename)
-            if not match:
-                continue
-                
-            func_name, payload, rank = match.groups()
+            # Parse filename: <func>-<payload>-<num_nodes>-<num_ranks>-<rank>.json
+            match = re.match(r'(.+)-(\d+)-(\d+)-(\d+)-(\d+)\.json', filename)
+            assert match, f"Invalid filename: {filename}"
+            func_name, payload, num_nodes, num_ranks, rank = match.groups()
             payload = int(payload)
+            num_nodes = int(num_nodes)
+            num_ranks = int(num_ranks)
             
             if func_name not in data[input_size]:
                 # print(f"Unknown function name: {func_name}")
@@ -77,6 +77,9 @@ def load_profile_data(profile_dir="profile", operation_type="reduce_scatter"):
             try:
                 with open(filepath, 'r') as f:
                     profile_data = json.load(f)
+                    # Add num_nodes and num_ranks to profile data
+                    profile_data['num_nodes'] = num_nodes
+                    profile_data['num_ranks'] = num_ranks
                     data[input_size][func_name].append(profile_data)
             except Exception as e:
                 print(f"Error loading {filepath}: {e}")
@@ -88,56 +91,81 @@ def analyze_data(data, operation_type="reduce_scatter"):
     results = {}
     
     for payload_size, implementations in data.items():
-        results[payload_size] = {}
+        # Group by (num_nodes, num_ranks) first
+        grouped_data = {}
         
         for impl_name, profiles in implementations.items():
             if not profiles:
                 continue
-                
-            # Extract communication times
-            comm_times = []
-            total_times = []
-            operation_payloads = []
             
-            total_count = None
+            # Group profiles by (num_nodes, num_ranks)
             for profile in profiles:
-                if total_count is None:
-                    total_count = len(profile['comm_time'])
-                else:
-                    assert total_count == len(profile['comm_time'])
-                comm_times.extend(profile['comm_time'])
-                total_times.append(profile['total_time'])
-                operation_payloads.append(profile['payload'])
+                num_nodes = profile.get('num_nodes', 1)
+                num_ranks = profile.get('num_ranks', 1)
+                key = (num_nodes, num_ranks, payload_size)
+                
+                if key not in grouped_data:
+                    grouped_data[key] = {}
+                if impl_name not in grouped_data[key]:
+                    grouped_data[key][impl_name] = []
+                
+                grouped_data[key][impl_name].append(profile)
+        
+        # Process each group
+        for key, impl_data in grouped_data.items():
+            if key not in results:
+                results[key] = {}
             
-            # Compute statistics
-            comm_times = np.array(comm_times)
-            total_times = np.array(total_times)
-            operation_payloads = np.array(operation_payloads)
-            assert np.all(operation_payloads == operation_payloads[0])
-            
-            # Convert payload to MB for bandwidth calculation
-            payload_mb = operation_payloads[0] / (1000 * 1000)
-            
-            # Calculate bandwidth (MB/s)
-            # comm_time is in milliseconds, so convert to seconds
-            bandwidths = (payload_mb / (comm_times / 1000))
-            
-            total_bandwidth = payload_mb * total_count / total_times
-            results[payload_size][impl_name] = {
-                'comm_times': comm_times,
-                'total_times': total_times,
-                'payloads': operation_payloads,
-                'payload_mb': payload_mb,
-                'bandwidths': bandwidths,
-                'avg_comm_time': np.mean(comm_times),
-                'std_comm_time': np.std(comm_times),
-                'avg_bandwidth': np.mean(bandwidths),
-                'std_bandwidth': np.std(bandwidths),
-                'avg_total_time': np.mean(total_times),
-                'std_total_time': np.std(total_times),
-                'avg_total_bandwidth': np.mean(total_bandwidth),
-                'std_total_bandwidth': np.std(total_bandwidth),
-            }
+            for impl_name, profiles in impl_data.items():
+                if not profiles:
+                    continue
+                    
+                # Extract communication times
+                comm_times = []
+                total_times = []
+                operation_payloads = []
+                
+                total_count = None
+                for profile in profiles:
+                    if total_count is None:
+                        total_count = len(profile['comm_time'])
+                    else:
+                        assert total_count == len(profile['comm_time'])
+                    comm_times.extend(profile['comm_time'])
+                    total_times.append(profile['total_time'])
+                    operation_payloads.append(profile['payload'])
+                
+                # Compute statistics
+                comm_times = np.array(comm_times)
+                total_times = np.array(total_times)
+                operation_payloads = np.array(operation_payloads)
+                assert np.all(operation_payloads == operation_payloads[0])
+                
+                # Convert payload to MB for bandwidth calculation
+                payload_mb = operation_payloads[0] / (1000 * 1000)
+                
+                # Calculate bandwidth (MB/s)
+                # comm_time is in milliseconds, so convert to seconds
+                bandwidths = (payload_mb / (comm_times / 1000))
+                
+                total_bandwidth = payload_mb * total_count / total_times
+                results[key][impl_name] = {
+                    'comm_times': comm_times,
+                    'total_times': total_times,
+                    'payloads': operation_payloads,
+                    'payload_mb': payload_mb,
+                    'bandwidths': bandwidths,
+                    'avg_comm_time': np.mean(comm_times),
+                    'std_comm_time': np.std(comm_times),
+                    'avg_bandwidth': np.mean(bandwidths),
+                    'std_bandwidth': np.std(bandwidths),
+                    'avg_total_time': np.mean(total_times),
+                    'std_total_time': np.std(total_times),
+                    'avg_total_bandwidth': np.mean(total_bandwidth),
+                    'std_total_bandwidth': np.std(total_bandwidth),
+                    'num_nodes': profiles[0]['num_nodes'],
+                    'num_ranks': profiles[0]['num_ranks'],
+                }
     
     return results
 
@@ -147,123 +175,98 @@ def plot_results(results, operation_type="reduce_scatter"):
         print("No data to plot")
         return
     
-    # Sort payload sizes for proper x-axis ordering
-    payload_sizes = sorted(results.keys())
-    payload_labels = [f"{size/(1000*1000):.0f}MB" for size in payload_sizes]
+    # Group results by (num_nodes, num_ranks) for separate plots
+    grouped_results = {}
+    for (num_nodes, num_ranks, payload_size), impl_data in results.items():
+        key = (num_nodes, num_ranks)
+        if key not in grouped_results:
+            grouped_results[key] = {}
+        grouped_results[key][payload_size] = impl_data
     
-    # Create figure with subplots
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    # Create subplots for each (num_nodes, num_ranks) combination
+    num_groups = len(grouped_results)
+    fig, axes = plt.subplots(2, num_groups, figsize=(6*num_groups, 10))
+    if num_groups == 1:
+        axes = axes.reshape(2, 1)
     
     # Set title based on operation type
+    operation_label = "Reduce-Scatter" if operation_type == "reduce_scatter" else "All-Gather"
+    fig.suptitle(f'{operation_label} Performance Comparison: ODC vs NCCL', fontsize=16)
+    
+    # Set implementation names and labels based on operation type
     if operation_type == "reduce_scatter":
-        fig.suptitle('Reduce-Scatter Performance Comparison: ODC vs NCCL', fontsize=16)
         impl_names = ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl']
-        labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
+        base_labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
     else:  # all_gather
-        fig.suptitle('All-Gather Performance Comparison: ODC vs NCCL', fontsize=16)
         impl_names = ['all_gather_into_tensor', 'all_gather_into_tensor_nccl']
-        labels = {'all_gather_into_tensor': 'ODC', 'all_gather_into_tensor_nccl': 'NCCL'}
+        base_labels = {'all_gather_into_tensor': 'ODC', 'all_gather_into_tensor_nccl': 'NCCL'}
     
     # Colors for implementations
     colors = {impl_names[0]: 'blue', impl_names[1]: 'red'}
     
-    # Plot 1: Average Communication Time
-    ax1.set_title('Average Communication Time')
-    ax1.set_xlabel('Payload Size')
-    ax1.set_ylabel('Time (ms)')
-    ax1.set_xticks(range(len(payload_sizes)))
-    ax1.set_xticklabels(payload_labels)
-    
-    for impl_name in impl_names:
-        comm_times = []
-        comm_stds = []
-        for payload_size in payload_sizes:
-            if impl_name in results[payload_size]:
-                comm_times.append(results[payload_size][impl_name]['avg_comm_time'])
-                comm_stds.append(results[payload_size][impl_name]['std_comm_time'])
-            else:
-                comm_times.append(0)
-                comm_stds.append(0)
+    for idx, ((num_nodes, num_ranks), group_results) in enumerate(grouped_results.items()):
+        # Sort payload sizes for proper x-axis ordering
+        payload_sizes = sorted(group_results.keys())
+        payload_labels = [f"{size/(1000*1000):.0f}MB" for size in payload_sizes]
         
-        ax1.errorbar(range(len(payload_sizes)), comm_times, yerr=comm_stds, 
-                    marker='o', color=colors[impl_name], label=labels[impl_name], capsize=5)
-    
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Average Bandwidth
-    ax2.set_title('Average Bandwidth')
-    ax2.set_xlabel('Payload Size')
-    ax2.set_ylabel('Bandwidth (MB/s)')
-    ax2.set_xticks(range(len(payload_sizes)))
-    ax2.set_xticklabels(payload_labels)
-    
-    for impl_name in impl_names:
-        bandwidths = []
-        bandwidth_stds = []
-        for payload_size in payload_sizes:
-            if impl_name in results[payload_size]:
-                bandwidths.append(results[payload_size][impl_name]['avg_bandwidth'])
-                bandwidth_stds.append(results[payload_size][impl_name]['std_bandwidth'])
+        # Create labels with node and rank info
+        labels = {}
+        for impl_name in impl_names:
+            base_label = base_labels[impl_name]
+            if impl_name.startswith('reduce_scatter_accumulation') and not impl_name.endswith('_nccl'):
+                labels[impl_name] = f"{base_label}-n{num_nodes}-r{num_ranks}"
             else:
-                bandwidths.append(0)
-                bandwidth_stds.append(0)
+                labels[impl_name] = f"{base_label}-n{num_nodes}-r{num_ranks}"
         
-        ax2.errorbar(range(len(payload_sizes)), bandwidths, yerr=bandwidth_stds, 
-                    marker='s', color=colors[impl_name], label=labels[impl_name], capsize=5)
-    
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Total Time Comparison
-    ax3.set_title('Average Total Time')
-    ax3.set_xlabel('Payload Size')
-    ax3.set_ylabel('Time (ms)')
-    ax3.set_xticks(range(len(payload_sizes)))
-    ax3.set_xticklabels(payload_labels)
-    
-    for impl_name in impl_names:
-        total_times = []
-        total_stds = []
-        for payload_size in payload_sizes:
-            if impl_name in results[payload_size]:
-                total_times.append(results[payload_size][impl_name]['avg_total_time'])
-                total_stds.append(results[payload_size][impl_name]['std_total_time'])
-            else:
-                total_times.append(0)
-                total_stds.append(0)
+        # Plot 1: Average Communication Time
+        ax1 = axes[0, idx]
+        ax1.set_title(f'Comm Time (n{num_nodes}-r{num_ranks})')
+        ax1.set_xlabel('Payload Size')
+        ax1.set_ylabel('Time (ms)')
+        ax1.set_xticks(range(len(payload_sizes)))
+        ax1.set_xticklabels(payload_labels)
         
-        ax3.errorbar(range(len(payload_sizes)), total_times, yerr=total_stds, 
-                    marker='^', color=colors[impl_name], label=labels[impl_name], capsize=5)
-    
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    # Plot 4: Performance Ratio (Custom/NCCL)
-    ax4.set_title('Performance Ratio (Custom / NCCL)')
-    ax4.set_xlabel('Payload Size')
-    ax4.set_ylabel('Ratio (Custom/NCCL)')
-    ax4.set_xticks(range(len(payload_sizes)))
-    ax4.set_xticklabels(payload_labels)
-    ax4.axhline(y=1.0, color='black', linestyle='--', alpha=0.5, label='Equal Performance')
-    
-    ratios = []
-    for payload_size in payload_sizes:
-        if (impl_names[0] in results[payload_size] and 
-            impl_names[1] in results[payload_size]):
-            custom_time = results[payload_size][impl_names[0]]['avg_comm_time']
-            nccl_time = results[payload_size][impl_names[1]]['avg_comm_time']
-            if nccl_time > 0:
-                ratio = custom_time / nccl_time
-                ratios.append(ratio)
-            else:
-                ratios.append(1.0)
-        else:
-            ratios.append(1.0)
-    
-    ax4.plot(range(len(payload_sizes)), ratios, marker='D', color='green', linewidth=2, markersize=8)
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
+        for impl_name in impl_names:
+            comm_times = []
+            comm_stds = []
+            for payload_size in payload_sizes:
+                if impl_name in group_results[payload_size]:
+                    comm_times.append(group_results[payload_size][impl_name]['avg_comm_time'])
+                    comm_stds.append(group_results[payload_size][impl_name]['std_comm_time'])
+                else:
+                    comm_times.append(0)
+                    comm_stds.append(0)
+            
+            ax1.errorbar(range(len(payload_sizes)), comm_times, yerr=comm_stds, 
+                        marker='o', color=colors[impl_name], label=labels[impl_name], capsize=5)
+        
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Average Bandwidth
+        ax2 = axes[1, idx]
+        ax2.set_title(f'Bandwidth (n{num_nodes}-r{num_ranks})')
+        ax2.set_xlabel('Payload Size')
+        ax2.set_ylabel('Bandwidth (MB/s)')
+        ax2.set_xticks(range(len(payload_sizes)))
+        ax2.set_xticklabels(payload_labels)
+        
+        for impl_name in impl_names:
+            bandwidths = []
+            bandwidth_stds = []
+            for payload_size in payload_sizes:
+                if impl_name in group_results[payload_size]:
+                    bandwidths.append(group_results[payload_size][impl_name]['avg_bandwidth'])
+                    bandwidth_stds.append(group_results[payload_size][impl_name]['std_bandwidth'])
+                else:
+                    bandwidths.append(0)
+                    bandwidth_stds.append(0)
+            
+            ax2.errorbar(range(len(payload_sizes)), bandwidths, yerr=bandwidth_stds, 
+                        marker='s', color=colors[impl_name], label=labels[impl_name], capsize=5)
+        
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.show()
@@ -281,25 +284,19 @@ def print_summary(results, operation_type="reduce_scatter"):
         print("No data available for analysis")
         return
     
-    # Sort payload sizes
-    payload_sizes = sorted(results.keys())
+    # Sort keys by (num_nodes, num_ranks, payload_size)
+    sorted_keys = sorted(results.keys())
     
-    # Set implementation names based on operation type
-    if operation_type == "reduce_scatter":
-        impl_names = ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl']
-        impl_labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
-    else:  # all_gather
-        impl_names = ['all_gather_into_tensor', 'all_gather_into_tensor_nccl']
-        impl_labels = {'all_gather_into_tensor': 'ODC', 'all_gather_into_tensor_nccl': 'NCCL'}
-    
-    for payload_size in payload_sizes:
-        print(f"\nPayload Size: {payload_size/(1000*1000):.1f} MB ({payload_size:,} bytes)")
-        print("-" * 60)
+    for (num_nodes, num_ranks, payload_size) in sorted_keys:
+        print(f"\nConfiguration: n{num_nodes}-r{num_ranks}, Payload Size: {payload_size/(1024*1024):.1f} MB ({payload_size:,} bytes)")
+        print("-" * 80)
+        
+        impl_names = ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl'] if operation_type == "reduce_scatter" else ['all_gather_into_tensor', 'all_gather_into_tensor_nccl']
         
         for impl_name in impl_names:
-            if impl_name in results[payload_size]:
-                data = results[payload_size][impl_name]
-                impl_label = impl_labels[impl_name]
+            if impl_name in results[(num_nodes, num_ranks, payload_size)]:
+                data = results[(num_nodes, num_ranks, payload_size)][impl_name]
+                impl_label = f"ODC-n{num_nodes}-r{num_ranks}" if not impl_name.endswith('_nccl') else f"NCCL-n{num_nodes}-r{num_ranks}"
                 
                 print(f"{impl_label}:")
                 print(f"  Avg Comm Time: {data['avg_comm_time']:.3f} ± {data['std_comm_time']:.3f} ms")
@@ -307,20 +304,17 @@ def print_summary(results, operation_type="reduce_scatter"):
                 print(f"  Avg Total Time: {data['avg_total_time']:.3f} ± {data['std_total_time']:.3f} ms")
         
         # Compare performance if both implementations exist
-        if (impl_names[0] in results[payload_size] and 
-            impl_names[1] in results[payload_size]):
-            custom_time = results[payload_size][impl_names[0]]['avg_comm_time']
-            nccl_time = results[payload_size][impl_names[1]]['avg_comm_time']
-            
+        if (impl_names[0] in results[(num_nodes, num_ranks, payload_size)] and 
+            impl_names[1] in results[(num_nodes, num_ranks, payload_size)]):
+            custom_time = results[(num_nodes, num_ranks, payload_size)][impl_names[0]]['avg_comm_time']
+            nccl_time = results[(num_nodes, num_ranks, payload_size)][impl_names[1]]['avg_comm_time']
             if nccl_time > 0:
                 ratio = custom_time / nccl_time
+                print(f"Performance Ratio (ODC/NCCL): {ratio:.3f}")
                 if ratio < 1.0:
-                    print(f"  Performance: Custom is {1/ratio:.2f}x FASTER than NCCL")
-                elif ratio > 1.0:
-                    print(f"  Performance: Custom is {ratio:.2f}x SLOWER than NCCL")
+                    print(f"ODC is {1/ratio:.1f}x faster than NCCL")
                 else:
-                    print(f"  Performance: Custom and NCCL are EQUAL")
-            print()
+                    print(f"NCCL is {ratio:.1f}x faster than ODC")
 
 def main(data_dir, operation_type="reduce_scatter"):
     """Main function to run the analysis"""
@@ -367,11 +361,29 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
         print("No data found in any directory")
         return
     
-    # Create subplots - one for each data directory
+    # Group results by (num_nodes, num_ranks) for each directory
+    grouped_all_results = {}
+    for data_dir, results in all_results.items():
+        grouped_results = {}
+        for (num_nodes, num_ranks, payload_size), impl_data in results.items():
+            key = (num_nodes, num_ranks)
+            if key not in grouped_results:
+                grouped_results[key] = {}
+            grouped_results[key][payload_size] = impl_data
+        grouped_all_results[data_dir] = grouped_results
+    
+    # Create subplots - one for each data directory and (num_nodes, num_ranks) combination
     num_dirs = len(all_results)
-    fig, axes = plt.subplots(1, num_dirs, figsize=(6*num_dirs, 5))
-    if num_dirs == 1:
-        axes = [axes]  # Make it iterable for single subplot
+    max_groups = max(len(groups) for groups in grouped_all_results.values()) if grouped_all_results else 1
+    # print(f"num_dirs: {num_dirs}, max_groups: {max_groups}")
+    fig, axes = plt.subplots(num_dirs, max_groups, figsize=(6*max_groups, 5*num_dirs))
+    if num_dirs == 1 and max_groups == 1:
+        axes = [[axes]]
+    elif num_dirs == 1:
+        axes = [axes]
+    elif max_groups == 1:
+        axes = [[ax] for ax in axes]
+    print(f"num_dirs: {num_dirs}, max_groups: {max_groups} axes: {axes}")
     
     # Set title based on operation type
     operation_label = "Reduce-Scatter" if operation_type == "reduce_scatter" else "All-Gather"
@@ -380,42 +392,49 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
     # Set implementation names and labels based on operation type
     if operation_type == "reduce_scatter":
         impl_names = ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl']
-        labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
+        base_labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
     else:  # all_gather
         impl_names = ['all_gather_into_tensor', 'all_gather_into_tensor_nccl']
-        labels = {'all_gather_into_tensor': 'ODC', 'all_gather_into_tensor_nccl': 'NCCL'}
+        base_labels = {'all_gather_into_tensor': 'ODC', 'all_gather_into_tensor_nccl': 'NCCL'}
     
     # Colors and markers for implementations
     colors = {impl_names[0]: 'blue', impl_names[1]: 'red'}
     markers = {impl_names[0]: 'o', impl_names[1]: 's'}
     
-    for idx, (data_dir, results) in enumerate(all_results.items()):
-        ax = axes[idx]
-        ax.set_title(f'{data_dir}')
-        ax.set_xlabel('Payload Size')
-        ax.set_ylabel('Total Bandwidth (MB/s)')
-        
-        # Sort payload sizes for proper x-axis ordering
-        payload_sizes = sorted(results.keys())
-        payload_labels = [f"{size/(1000*1000):.0f}MB" for size in payload_sizes]
-        
-        ax.set_xticks(range(len(payload_sizes)))
-        ax.set_xticklabels(payload_labels)
-        
-        # Plot field for each implementation
-        for impl_name in impl_names:
-            bandwidths = []
-            for payload_size in payload_sizes:
-                if impl_name in results[payload_size]:
-                    bandwidths.append(results[payload_size][impl_name][field])
-                else:
-                    bandwidths.append(0)
+    for dir_idx, (data_dir, grouped_results) in enumerate(grouped_all_results.items()):
+        for group_idx, ((num_nodes, num_ranks), group_data) in enumerate(grouped_results.items()):
+            ax = axes[dir_idx][group_idx]  # if num_dirs > 1 else axes[group_idx]
+            ax.set_title(f'{data_dir} (n{num_nodes}-r{num_ranks})')
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Total Bandwidth (MB/s)')
             
-            ax.errorbar(range(len(payload_sizes)), bandwidths,
-                       marker=markers[impl_name], color=colors[impl_name], label=labels[impl_name], capsize=5)
-        
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+            # Sort payload sizes for proper x-axis ordering
+            payload_sizes = sorted(group_data.keys())
+            payload_labels = [f"{size/(1000*1000):.0f}MB" for size in payload_sizes]
+            
+            ax.set_xticks(range(len(payload_sizes)))
+            ax.set_xticklabels(payload_labels)
+            
+            # Create labels with node and rank info
+            labels = {}
+            for impl_name in impl_names:
+                base_label = base_labels[impl_name]
+                labels[impl_name] = f"{base_label}-n{num_nodes}-r{num_ranks}"
+            
+            # Plot field for each implementation
+            for impl_name in impl_names:
+                bandwidths = []
+                for payload_size in payload_sizes:
+                    if impl_name in group_data[payload_size]:
+                        bandwidths.append(group_data[payload_size][impl_name][field])
+                    else:
+                        bandwidths.append(0)
+                
+                ax.errorbar(range(len(payload_sizes)), bandwidths,
+                           marker=markers[impl_name], color=colors[impl_name], label=labels[impl_name], capsize=5)
+            
+            ax.legend()
+            ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.show()
@@ -425,7 +444,7 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
 
 if __name__ == "__main__":
     # Example usage for all_gather data
-    data_dir = "fxbuf-profile"
+    data_dir = "rs-profile"
     
     # For all_gather analysis
     # main(data_dir, operation_type="all_gather")
