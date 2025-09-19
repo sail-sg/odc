@@ -3,9 +3,9 @@
 # Array of buffer size strings
 # BUFFER_SIZES=("256kb" "512kb" "1mb" "2mb" "4mb" "8mb" "16mb" "32mb" "64mb")
 PROFILE_ADD_SYNC=0
-DUMP_PROFILE_DATA=1
 NUM_NODES=1
 BUFFER_SIZES=("46799360" "233061376" "233373696" "544997376")
+export DUMP_PROFILE_DATA=1
 export RUN_REDUCE_SCATTER=0
 if [ $RUN_REDUCE_SCATTER -eq 1 ]; then
     DATA_DIR="rs-profile"
@@ -48,6 +48,10 @@ for num_gpus in "${NUM_GPUS_ARRAY[@]}"; do
         fi
         echo "Running with DATA_SIZE=$size and NUM_GPUS=$num_gpus"
         DATA_SIZE=$size NUM_GPUS=$num_gpus bash run.sh
+        if [ $? -ne 0 ]; then
+            echo "Error: Failed to run with DATA_SIZE=$size and NUM_GPUS=$num_gpus"
+            exit 1
+        fi
         echo "Completed DATA_SIZE=$size with NUM_GPUS=$num_gpus"
         echo "----------------------------------------"
     done

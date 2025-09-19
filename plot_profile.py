@@ -86,7 +86,7 @@ def load_profile_data(profile_dir="profile", operation_type="reduce_scatter"):
     
     return data
 
-def analyze_data(data, operation_type="reduce_scatter"):
+def analyze_data(data):
     """Analyze the loaded data and compute statistics"""
     results = {}
     
@@ -287,13 +287,10 @@ def main(data_dir, operation_type="reduce_scatter"):
     print(f"Loaded data for {len(data)} payload sizes")
     
     print("Analyzing data...")
-    results = analyze_data(data, operation_type)
+    results = analyze_data(data)
     
     print("Creating plots...")
     fig = plot_results(results, operation_type)
-    
-    print("Printing summary...")
-    print_summary(results, operation_type)
     
     print("\nAnalysis complete!")
 
@@ -309,7 +306,7 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
         print(f"Loading data from {data_dir}...")
         data = load_profile_data(data_dir, operation_type)
         if data:
-            results = analyze_data(data, operation_type)
+            results = analyze_data(data)
             all_results[data_dir] = results
             print(f"Loaded data for {len(data)} payload sizes from {data_dir}")
         else:
@@ -405,7 +402,6 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
 
 if __name__ == "__main__":
     # Example usage for all_gather data
-    data_dir = "rs-profile"
     
     # For all_gather analysis
     # main(data_dir, operation_type="all_gather")
@@ -414,4 +410,9 @@ if __name__ == "__main__":
     # main(data_dir, operation_type="reduce_scatter")
     
     # For multi-directory bandwidth comparison
-    plot_multi_bandwidth([data_dir], "avg_bandwidth", operation_type="reduce_scatter")
+    data_dirs = [
+        "rs-profile",
+        # "ag-profile",
+    ]
+    # plot_multi_bandwidth(data_dirs, "avg_bandwidth", operation_type="all_gather")
+    plot_multi_bandwidth(data_dirs, "avg_bandwidth", operation_type="reduce_scatter")

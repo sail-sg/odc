@@ -120,7 +120,8 @@ if __name__ == "__main__":
       world_size = torch.distributed.get_world_size()
       rank = torch.distributed.get_rank()
       registry = SymmBufferRegistry.get_instance()
-      cnt = 20
+    #   cnt = 20
+      cnt = 10
     #   size = 16 * (1000 ** 2)
       assert data_size % world_size == 0
       size = data_size // world_size
