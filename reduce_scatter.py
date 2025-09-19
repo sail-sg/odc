@@ -491,6 +491,7 @@ if __name__ == "__main__":
     data_size = size_str_to_int(data_size_str)
     data_dir = os.environ.get('DATA_DIR', 'rs-profile')
     data_dir = os.path.join(data_dir, data_size_str)
+    add_sync = os.environ.get('PROFILE_ADD_SYNC', '0') == '1'
     print(f"Data size: {data_size_str}, Data dir: {data_dir}")
     assert data_size > 0
     os.makedirs(data_dir, exist_ok=True)
@@ -549,6 +550,8 @@ if __name__ == "__main__":
       print(f"[Rank {rank}] CUDA memory allocated: {mem_allocated:.2f} MB, reserved: {mem_reserved:.2f} MB")
       compute_buffer = [torch.empty(int(x*131072),8192, dtype=torch.bfloat16, device="cuda") for x in comp_sizes]
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
+
+      sync_inputs = [torch.empty(world_size, dtype=grad_dtype, device="cuda") for _ in range(world_size)]
 
       def some_compute(x):
         return x
@@ -643,12 +646,13 @@ if __name__ == "__main__":
             # ]
             start_events[i].record()
             comp_stream.wait_stream(torch.cuda.current_stream())
-            
             reduce_scatter_func(data[i], dst_idx, group)
-            with torch.cuda.stream(comp_stream):
-                some_compute(compute_buffer[0])
             torch.cuda.current_stream().wait_stream(comp_stream)
             comm_events[i].record()
+            if add_sync:
+                torch.distributed.all_reduce(sync_inputs, group=group)
+            with torch.cuda.stream(comp_stream):
+                some_compute(compute_buffer[0])
             # compute_buffer[dst_idx] @ compute_param
             compute_events[i].record()
             
@@ -684,8 +688,9 @@ if __name__ == "__main__":
             "num_nodes": 1,
         }
         num_nodes = 1
-        with open(os.path.join(data_dir, f"{reduce_scatter_func.__name__}-{data_size}-{num_nodes}-{world_size}-{rank}.json"), "w") as f:
-            json.dump(profile_data, f)
+        if os.environ.get('DUMP_PROFILE_DATA', '0') == '1':
+            with open(os.path.join(data_dir, f"{reduce_scatter_func.__name__}-{data_size}-{num_nodes}-{world_size}-{rank}.json"), "w") as f:
+                json.dump(profile_data, f)
 
       reduction_service.stop()
 

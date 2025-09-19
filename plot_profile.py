@@ -273,48 +273,6 @@ def plot_results(results, operation_type="reduce_scatter"):
     
     return fig
 
-def print_summary(results, operation_type="reduce_scatter"):
-    """Print a summary of the results"""
-    operation_label = "REDUCE-SCATTER" if operation_type == "reduce_scatter" else "ALL-GATHER"
-    print("\n" + "="*80)
-    print(f"{operation_label} PERFORMANCE ANALYSIS SUMMARY")
-    print("="*80)
-    
-    if not results:
-        print("No data available for analysis")
-        return
-    
-    # Sort keys by (num_nodes, num_ranks, payload_size)
-    sorted_keys = sorted(results.keys())
-    
-    for (num_nodes, num_ranks, payload_size) in sorted_keys:
-        print(f"\nConfiguration: n{num_nodes}-r{num_ranks}, Payload Size: {payload_size/(1024*1024):.1f} MB ({payload_size:,} bytes)")
-        print("-" * 80)
-        
-        impl_names = ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl'] if operation_type == "reduce_scatter" else ['all_gather_into_tensor', 'all_gather_into_tensor_nccl']
-        
-        for impl_name in impl_names:
-            if impl_name in results[(num_nodes, num_ranks, payload_size)]:
-                data = results[(num_nodes, num_ranks, payload_size)][impl_name]
-                impl_label = f"ODC-n{num_nodes}-r{num_ranks}" if not impl_name.endswith('_nccl') else f"NCCL-n{num_nodes}-r{num_ranks}"
-                
-                print(f"{impl_label}:")
-                print(f"  Avg Comm Time: {data['avg_comm_time']:.3f} ± {data['std_comm_time']:.3f} ms")
-                print(f"  Avg Bandwidth: {data['avg_bandwidth']:.1f} ± {data['std_bandwidth']:.1f} MB/s")
-                print(f"  Avg Total Time: {data['avg_total_time']:.3f} ± {data['std_total_time']:.3f} ms")
-        
-        # Compare performance if both implementations exist
-        if (impl_names[0] in results[(num_nodes, num_ranks, payload_size)] and 
-            impl_names[1] in results[(num_nodes, num_ranks, payload_size)]):
-            custom_time = results[(num_nodes, num_ranks, payload_size)][impl_names[0]]['avg_comm_time']
-            nccl_time = results[(num_nodes, num_ranks, payload_size)][impl_names[1]]['avg_comm_time']
-            if nccl_time > 0:
-                ratio = custom_time / nccl_time
-                print(f"Performance Ratio (ODC/NCCL): {ratio:.3f}")
-                if ratio < 1.0:
-                    print(f"ODC is {1/ratio:.1f}x faster than NCCL")
-                else:
-                    print(f"NCCL is {ratio:.1f}x faster than ODC")
 
 def main(data_dir, operation_type="reduce_scatter"):
     """Main function to run the analysis"""
@@ -402,11 +360,13 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
     markers = {impl_names[0]: 'o', impl_names[1]: 's'}
     
     for dir_idx, (data_dir, grouped_results) in enumerate(grouped_all_results.items()):
-        for group_idx, ((num_nodes, num_ranks), group_data) in enumerate(grouped_results.items()):
+        # Sort groups by (num_nodes, num_ranks) for consistent ordering
+        sorted_groups = sorted(grouped_results.items(), key=lambda x: (x[0][0], x[0][1]))
+        for group_idx, ((num_nodes, num_ranks), group_data) in enumerate(sorted_groups):
             ax = axes[dir_idx][group_idx]  # if num_dirs > 1 else axes[group_idx]
             ax.set_title(f'{data_dir} (n{num_nodes}-r{num_ranks})')
             ax.set_xlabel('Payload Size')
-            ax.set_ylabel('Total Bandwidth (MB/s)')
+            ax.set_ylabel('Total Bandwidth (GB/s)')
             
             # Sort payload sizes for proper x-axis ordering
             payload_sizes = sorted(group_data.keys())
@@ -426,7 +386,8 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
                 bandwidths = []
                 for payload_size in payload_sizes:
                     if impl_name in group_data[payload_size]:
-                        bandwidths.append(group_data[payload_size][impl_name][field])
+                        # Convert from MB/s to GB/s
+                        bandwidths.append(group_data[payload_size][impl_name][field] / 1000)
                     else:
                         bandwidths.append(0)
                 

@@ -103,10 +103,11 @@ def size_str_to_int(size_str):
 
 
 if __name__ == "__main__":
-    data_size_str = os.environ.get('DATA_SIZE', '16mb')
+    data_size_str = os.environ.get('DATA_SIZE', '64mb')
     data_size = size_str_to_int(data_size_str)
     data_dir = os.environ.get('DATA_DIR', 'ag-profile')
     data_dir = os.path.join(data_dir, data_size_str)
+    add_sync = os.environ.get('PROFILE_ADD_SYNC', '0') == '1'
     print(f"Data size: {data_size_str}, Data dir: {data_dir}")
     assert data_size > 0
     os.makedirs(data_dir, exist_ok=True)
@@ -121,7 +122,8 @@ if __name__ == "__main__":
       registry = SymmBufferRegistry.get_instance()
       cnt = 20
     #   size = 16 * (1000 ** 2)
-      size = data_size
+      assert data_size % world_size == 0
+      size = data_size // world_size
       comp_sizes = torch.rand(cnt).tolist()
 
       group_count = 1
@@ -143,8 +145,7 @@ if __name__ == "__main__":
       compute_buffer = [torch.empty(int(x*16384),8192, dtype=torch.bfloat16, device="cuda") for x in comp_sizes]
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
-
-
+      sync_inputs = [torch.empty(world_size, dtype=torch.long, device="cuda") for _ in range(world_size)]
 
       src_tensors = [torch.empty(size, dtype=torch.long, device="cuda") for _ in range(cnt)]
       for i in range(cnt):
@@ -186,6 +187,8 @@ if __name__ == "__main__":
             start_events[i].record()
             all_gather_func(dst, src_tensors[i], group)
             comm_events[i].record()
+            if add_sync:
+                torch.distributed.all_reduce(sync_inputs, group=group)
             # compute_buffer[i] @ compute_param
             compute_events[i].record()
             
@@ -199,7 +202,7 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* torch.long.itemsize
-          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 0) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 0) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
         if all_gather_func == all_gather_into_tensor_nccl_comm:
@@ -211,8 +214,9 @@ if __name__ == "__main__":
             "num_ranks": world_size,
         }
         num_nodes = 1
-        with open(os.path.join(data_dir, f"{all_gather_func.__name__}-{data_size}-{num_nodes}-{world_size}-{rank}.json"), "w") as f:
-            json.dump(profile_data, f)
+        if os.environ.get('DUMP_PROFILE_DATA', '0') == '1':
+            with open(os.path.join(data_dir, f"{all_gather_func.__name__}-{data_size}-{num_nodes}-{world_size}-{rank}.json"), "w") as f:
+                json.dump(profile_data, f)
 
     except Exception as e:
       print(e)
