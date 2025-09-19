@@ -88,45 +88,50 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
     signal_ptr,
 ):
     pid = tl.program_id(axis=0)
-    tidx = tid(axis=0)
-    peer = (pid + rank + 1) % world_size
-    # chunk_size = elem_per_rank // num_chunks
-    num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+    np = tl.num_programs(axis=0)
+    num_nodes = world_size // np
     
-    for chunk in range(num_chunks):
-        this_chunk_size = chunk_size
-        if chunk == num_chunks - 1:
-            this_chunk_size = elem_per_rank - chunk * chunk_size
-        libshmem_device.getmem_nbi_block(
-            target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
-            remote_tensor_ptr + (chunk * chunk_size),
-            this_chunk_size * size_per_elem,
-            peer,
-        )
-        if tidx == 0:
-            tl.atomic_add(signal_ptr, 1)
-        __syncthreads()
-        expected = (chunk * 2) * world_size + world_size
-        offsets = tl.arange(0, 1)
-        mask = offsets == 0
-        r = 0
-        while r < expected:
-            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-            r = tl.max(signals)
-        if tidx == 0 and pid == 0:
-            libshmem_device.quiet()
-        __syncthreads()
+    tidx = tid(axis=0)
+    expected = 0
+    for i in range(num_nodes):
+      peer_node = (i + rank // np) % num_nodes
+      peer = (pid + peer_node * np) % world_size
+      # chunk_size = elem_per_rank // num_chunks
+      num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+      for chunk in range(num_chunks):
+          this_chunk_size = chunk_size
+          if chunk == num_chunks - 1:
+              this_chunk_size = elem_per_rank - chunk * chunk_size
+          libshmem_device.getmem_nbi_block(
+              target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
+              remote_tensor_ptr + (chunk * chunk_size),
+              this_chunk_size * size_per_elem,
+              peer,
+          )
+          if tidx == 0:
+              tl.atomic_add(signal_ptr, 1)
+          __syncthreads()
+          expected += np
+          offsets = tl.arange(0, 1)
+          mask = offsets == 0
+          r = 0
+          while r < expected:
+              signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+              r = tl.max(signals)
+          if tidx == 0 and pid == 0:
+              libshmem_device.quiet()
+          __syncthreads()
 
-        if tidx == 0:
-            tl.atomic_add(signal_ptr, 1)
-        __syncthreads()
-        expected = (chunk * 2) * world_size + 2 * world_size
-        offsets = tl.arange(0, 1)
-        mask = offsets == 0
-        r = 0
-        while r < expected:
-            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-            r = tl.max(signals)
+          if tidx == 0:
+              tl.atomic_add(signal_ptr, 1)
+          __syncthreads()
+          expected += np
+          offsets = tl.arange(0, 1)
+          mask = offsets == 0
+          r = 0
+          while r < expected:
+              signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+              r = tl.max(signals)
 
     
 
@@ -261,7 +266,9 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
             assert target_buf_size <= buf_size
             target_tensor_split = target_tensor[:target_buf_size].view(world_size, size)
             signal_ptr.fill_(0)
-            nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(torch.distributed.get_world_size(pg), )](
+            assert world_size % 8 == 0
+            grid_size = 8 if world_size == 32 else world_size
+            nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(grid_size, )](
                 sub_input_tensor,
                 target_tensor_split.view(-1),
                 sub_input_tensor.numel(),
@@ -431,7 +438,7 @@ if __name__ == "__main__":
           
           for i in range(cnt):
             if i == 1:
-              # torch.distributed.barrier(group)
+              torch.distributed.barrier(group)
               start.record()
             dst = torch.empty(size * group_size, dtype=dtype, device="cuda")
             # dst_arr = [

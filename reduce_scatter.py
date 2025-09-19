@@ -64,50 +64,56 @@ def nvshmem_reduce_scatter_kernel(
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
-    peer = (pid + rank + 1) % world_size
+    np = tl.num_programs(axis=0)
+    num_nodes = world_size // np
+    expected = 0
+
+    for i in range(num_nodes):
+      peer_node = (i + rank // np) % num_nodes
+      peer = (pid + peer_node * np) % world_size
     # chunk_size = elem_per_rank // num_chunks
 
-    num_chunks = tl.cdiv(elem_per_rank, chunk_size)
-    for chunk in range(num_chunks):
-        this_chunk_size = chunk_size
-        if chunk == num_chunks - 1:
-            this_chunk_size = elem_per_rank - chunk * chunk_size
-        libshmem_device.putmem_nbi_block(
-            output_tensor_ptr + (chunk * chunk_size),
-            input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
-            this_chunk_size * size_per_elem,
-            peer,
-        )
+      num_chunks = tl.cdiv(elem_per_rank, chunk_size)
+      for chunk in range(num_chunks):
+          this_chunk_size = chunk_size
+          if chunk == num_chunks - 1:
+              this_chunk_size = elem_per_rank - chunk * chunk_size
+          libshmem_device.putmem_nbi_block(
+              output_tensor_ptr + (chunk * chunk_size),
+              input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
+              this_chunk_size * size_per_elem,
+              peer,
+          )
 
-        if tidx == 0:
-            tl.atomic_add(signal_ptr, 1)
-        __syncthreads()
-        expected = (chunk * 2) * world_size + world_size
-        offsets = tl.arange(0, 1)
-        mask = offsets == 0
-        r = 0
-        while r < expected:
-            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-            r = tl.max(signals)
-        if tidx == 0 and pid == 0:
-            libshmem_device.quiet()
-        __syncthreads()
+          if tidx == 0:
+              tl.atomic_add(signal_ptr, 1)
+          __syncthreads()
+          expected += np
+          offsets = tl.arange(0, 1)
+          mask = offsets == 0
+          r = 0
+          while r < expected:
+              signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+              r = tl.max(signals)
+          if tidx == 0 and pid == 0:
+              libshmem_device.quiet()
+          __syncthreads()
 
-        if tidx == 0:
-            tl.atomic_add(signal_ptr, 1)
-        __syncthreads()
-        expected = (chunk * 2) * world_size + 2 * world_size
-        offsets = tl.arange(0, 1)
-        mask = offsets == 0
-        r = 0
-        while r < expected:
-            signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-            r = tl.max(signals)
+          if tidx == 0:
+              tl.atomic_add(signal_ptr, 1)
+          __syncthreads()
+          expected += np
+          offsets = tl.arange(0, 1)
+          mask = offsets == 0
+          r = 0
+          while r < expected:
+              signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+              r = tl.max(signals)
     
     if tidx == 0:
         tl.atomic_add(signal_ptr, 1)
     __syncthreads()
-    expected = num_chunks * world_size * 2 + world_size
+    expected += np
     offsets = tl.arange(0, 1)
     mask = offsets == 0
     r = 0
@@ -601,7 +607,9 @@ class ReductionService:
                     buf = buffer[start:start+size]
                 signal_ptr.fill_(0)
                 need_accumulation = split_trans_buffer or start + size == output_size
-                nvshmem_reduce_scatter_kernel[(world_size, )](
+                assert world_size % 8 == 0
+                grid_size = 8 if world_size == 32 else world_size
+                nvshmem_reduce_scatter_kernel[(grid_size, )](
                     input_tensor_ptr = input_tensor_symm_split.view(-1),
                     output_tensor_ptr = buf,
                     request_buffer_ptr = self.lock.request_buffer,
