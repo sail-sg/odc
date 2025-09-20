@@ -15,6 +15,7 @@ import triton.language as tl
 import nvshmem.core
 import os
 from typing import List
+from collections import defaultdict
 from torch import Tensor
 from triton_dist.language.extra import libshmem_device
 from triton.language.extra.cuda.language_extra import __syncthreads, tid
@@ -239,7 +240,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # assert input_tensor.numel() % chunk_size == 0
   cupy_stream = PyTorchStreamWrapper(torch.cuda.current_stream())
   # print(f'chunk size {chunk_size}')
-  
+
   # nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked[(torch.distributed.get_world_size(pg), )](
   #   input_tensor,
   #   target_tensor,
@@ -312,8 +313,55 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # )
   # nvshmem.core.quiet(stream=cupy_stream)
 
+
+send_streams = defaultdict(lambda: torch.cuda.Stream())
+recv_streams = defaultdict(lambda: torch.cuda.Stream())
+
+
+def all_gather_into_tensor_nccl_p2p(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
+    buf_size = buffer_splitter.get_global_buffer_size(output_tensor.shape)
+
+    world_size = torch.distributed.get_world_size(pg)
   
-  
+    global send_streams, recv_streams
+    for r in range(world_size):
+        send_streams[r].wait_stream(torch.cuda.current_stream())
+        recv_streams[r].wait_stream(torch.cuda.current_stream())
+
+    assert buf_size % world_size == 0
+    local_buf_size = buf_size // world_size
+    target_tensor_split = output_tensor.view(world_size, -1)
+
+    handles = []
+    rank = torch.distributed.get_rank(pg)
+    for start in range(0, input_tensor.numel(), local_buf_size):
+        size = min(local_buf_size, input_tensor.numel() - start)
+        sub_input_tensor = input_tensor.view(-1)[start:start+size]
+        assert (sub_input_tensor.numel() * sub_input_tensor.element_size()) % (2**6) == 0, 'better align to 64 for efficiency'
+        for i in range(world_size):
+            peer = i ^ rank
+            buf = target_tensor_split[peer, start:start+size]
+            if peer == rank:
+                buf.copy_(sub_input_tensor)
+                continue
+            def send():
+                with torch.cuda.stream(send_streams[peer]):
+                    torch.distributed.isend(sub_input_tensor, peer, group=pg)
+            def recv():
+                with torch.cuda.stream(recv_streams[peer]):
+                    handles.append(torch.distributed.irecv(buf, peer, group=pg))
+            if rank < peer:
+                send()
+                recv()
+            else:
+                recv()
+                send()
+        torch.cuda.current_stream().synchronize()
+    for handle in handles:
+        handle.wait()
+    torch.cuda.current_stream().synchronize()
+
+
   # for chunk in range(total_chunks):
   #     nvshmem_device_producer_all_gather_2d_get_block_kernel[grid](
   #       input_tensor,
@@ -429,7 +477,7 @@ if __name__ == "__main__":
 
       # for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl, all_gather_into_tensor_multinode]:
       comp_stream = torch.cuda.Stream()
-      for all_gather_func in [all_gather_into_tensor_nccl, all_gather_into_tensor]:
+      for all_gather_func in [all_gather_into_tensor_nccl, all_gather_into_tensor_nccl_p2p, all_gather_into_tensor]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
@@ -465,7 +513,7 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* dtype.itemsize
-          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 
