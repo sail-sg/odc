@@ -108,7 +108,7 @@ if __name__ == "__main__":
     data_dir = os.environ.get('DATA_DIR', 'ag-profile')
     data_dir = os.path.join(data_dir, data_size_str)
     add_sync = os.environ.get('PROFILE_ADD_SYNC', '0') == '1'
-    print(f"Data size: {data_size_str}, Data dir: {data_dir}")
+    print(f"Data size: {data_size_str}, Data dir: {data_dir} add_sync: {add_sync}")
     assert data_size > 0
     os.makedirs(data_dir, exist_ok=True)
 
@@ -146,9 +146,9 @@ if __name__ == "__main__":
       compute_buffer = [torch.empty(int(x*16384),8192, dtype=torch.bfloat16, device="cuda") for x in comp_sizes]
       compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
-      sync_inputs = [torch.empty(world_size, dtype=torch.long, device="cuda") for _ in range(world_size)]
+      sync_inputs = torch.zeros(world_size, dtype=torch.long, device="cuda")
 
-      src_tensors = [torch.empty(size, dtype=torch.long, device="cuda") for _ in range(cnt)]
+      src_tensors = [torch.empty(size, dtype=torch.bfloat16, device="cuda") for _ in range(cnt)]
       for i in range(cnt):
         src_tensors[i].fill_(i + rank*100)
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
@@ -158,7 +158,7 @@ if __name__ == "__main__":
       for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           for i in range(cnt):
-            dst = torch.empty(size * group_size, dtype=torch.long, device="cuda")
+            dst = torch.empty(size * group_size, dtype=torch.bfloat16, device="cuda")
             all_gather_func(dst, src_tensors[i], group)
             for r in range(group_size):
               expected = group_ranks[r] * 100 + i
@@ -180,7 +180,7 @@ if __name__ == "__main__":
           for i in range(cnt):
             # if i == 1:
             #   start.record()
-            dst = torch.empty(size * group_size, dtype=torch.long, device="cuda")
+            dst = torch.empty(size * group_size, dtype=torch.bfloat16, device="cuda")
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
             #   for r in range(world_size)
@@ -202,7 +202,7 @@ if __name__ == "__main__":
           dist.barrier()
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
-          all_gather_payload = size * (group_size - 1)* torch.long.itemsize
+          all_gather_payload = size * (group_size - 1)* torch.bfloat16.itemsize
           print(f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 0) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")

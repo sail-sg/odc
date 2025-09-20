@@ -2,17 +2,20 @@
 
 # Array of buffer size strings
 # BUFFER_SIZES=("256kb" "512kb" "1mb" "2mb" "4mb" "8mb" "16mb" "32mb" "64mb")
-PROFILE_ADD_SYNC=0
+export PROFILE_ADD_SYNC=1
 NUM_NODES=1
-BUFFER_SIZES=("46799360" "233061376" "233373696" "544997376")
+# BUFFER_SIZES=("46799360" "233061376" "233373696" "544997376")
+BUFFER_SIZES=("46799360" "233061376" "275273728" "487610368")
 export DUMP_PROFILE_DATA=1
 export RUN_REDUCE_SCATTER=0
 if [ $RUN_REDUCE_SCATTER -eq 1 ]; then
     DATA_DIR="rs-profile"
+    NSYS_PREFIX="rs"
     ODC_FUNC="reduce_scatter_accumulation"
     NCCL_FUNC="reduce_scatter_accumulation_nccl"
 else
     DATA_DIR="ag-profile"
+    NSYS_PREFIX="ag"
     ODC_FUNC="all_gather_into_tensor"
     NCCL_FUNC="all_gather_into_tensor_nccl"
 fi
@@ -47,7 +50,16 @@ for num_gpus in "${NUM_GPUS_ARRAY[@]}"; do
             continue
         fi
         echo "Running with DATA_SIZE=$size and NUM_GPUS=$num_gpus"
-        DATA_SIZE=$size NUM_GPUS=$num_gpus bash run.sh
+        export DATA_SIZE=$size
+        export NUM_GPUS=$num_gpus
+        # bash run.sh
+        nsys profile -s none -t nvtx,cuda \
+            --wait=primary \
+            --output "data/prof-${NSYS_PREFIX}-r${NUM_GPUS}-d${DATA_SIZE}.nsys-rep" \
+            --force-overwrite true \
+            --capture-range=cudaProfilerApi \
+            --capture-range-end=stop \
+            bash run.sh
         if [ $? -ne 0 ]; then
             echo "Error: Failed to run with DATA_SIZE=$size and NUM_GPUS=$num_gpus"
             exit 1
