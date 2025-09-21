@@ -482,8 +482,6 @@ class ReductionService:
         self.input_buffer = {}
         self.dispatched_tasks = 0
         self.accumulation_dtype = accumulation_dtype
-        self.send_streams = defaultdict(lambda: torch.cuda.Stream())
-        self.recv_streams = defaultdict(lambda: torch.cuda.Stream())
         self.buffer_shape_cache = {}
         self.buffer_splitter = BufferSplitter()
 
@@ -608,7 +606,7 @@ class ReductionService:
                     buf = buffer[start:start+size]
                 signal_ptr.fill_(0)
                 need_accumulation = split_trans_buffer or start + size == output_size
-                assert world_size % 8 == 0
+                assert world_size % 8 == 0 or world_size < 8
                 grid_size = 8 if world_size == 32 else world_size
                 nvshmem_reduce_scatter_kernel[(grid_size, )](
                     input_tensor_ptr = input_tensor_symm_split.view(-1),
@@ -712,14 +710,11 @@ class ReductionService:
 
         split_trans_buffer = buffer.numel() < output_size
         input_tensor_split = input_tensor.view(-1).view(world_size, -1)
-        for r in range(world_size):
-            self.send_streams[r].wait_stream(torch.cuda.current_stream())
-            self.recv_streams[r].wait_stream(torch.cuda.current_stream())
         handles = defaultdict(list)
         for start in range(0, output_size, local_buf_size):
             size = min(local_buf_size, output_size - start)
             need_accumulation = split_trans_buffer or start + size == output_size
-            # assert world_size % 8 == 0
+            assert world_size % 8 == 0 or world_size < 8
             bufs = []
             for i in range(world_size):
                 peer = i ^ rank
@@ -731,16 +726,16 @@ class ReductionService:
                     buf = peer_buffer[start:start+size]
                 bufs.append(buf)
                 send_data = input_tensor_split[peer, start:start+size]
-                if peer == torch.distributed.get_rank(pg):
+                if peer == rank:
                     buf.copy_(send_data)
                     continue
                 def send():
-                    with torch.cuda.stream(self.send_streams[peer]):
+                    with torch.cuda.nvtx.range(f"send_{rank}->{peer}"):
                         torch.distributed.isend(send_data, peer, group=pg)
                 def recv():
-                    with torch.cuda.stream(self.recv_streams[peer]):
+                    with torch.cuda.nvtx.range(f"recv_{peer}->{rank}"):
                         handle = torch.distributed.irecv(buf, peer, group=pg)
-                        handles[peer].append(handle)
+                    handles[peer].append(handle)
                 if rank < peer:
                     send()
                     recv()
@@ -749,7 +744,7 @@ class ReductionService:
                     send()
             if need_accumulation:
                 for peer in range(world_size):
-                    if peer != torch.distributed.get_rank(pg):
+                    if peer != rank:
                         for handle in handles[peer]:
                             handle.wait()
                     acc[start:start+size].add_(bufs[peer])
@@ -857,6 +852,13 @@ if __name__ == "__main__":
       def reduce_scatter_accumulation_nccl_p2p(src_tensor, dest_idx, pg: dist.ProcessGroup):
         reduction_service.reduce_scatter_accumulation_nccl_p2p(dest_idx, src_tensor, pg)
 
+      sync_input_tensor = torch.empty(world_size, dtype=torch.int32, device="cuda")
+
+      def wait_kernel_launch():
+        with torch.cuda.nvtx.range("wait_kernel_launch"):
+          for _ in range(5):
+            compute_buffer[0] @ compute_param
+
       dist.barrier()
       torch.cuda.synchronize()
       comp_stream = torch.cuda.Stream()
@@ -871,21 +873,23 @@ if __name__ == "__main__":
 
           for i in range(cnt * times):
             dst_idx = i % cnt
-            torch.distributed.barrier(group)
+            # torch.distributed.barrier(group)
+            torch.distributed.all_reduce(sync_input_tensor, group=group)
             
             if i == cnt:
+              wait_kernel_launch()
               start.record()
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
             #   for r in range(world_size)
             # ]
             start_events[i].record()
-            comp_stream.wait_stream(torch.cuda.current_stream())
+            # comp_stream.wait_stream(torch.cuda.current_stream())
             
             reduce_scatter_func(data[i], dst_idx, group)
-            with torch.cuda.stream(comp_stream):
-                some_compute(compute_buffer[0])
-            torch.cuda.current_stream().wait_stream(comp_stream)
+            # with torch.cuda.stream(comp_stream):
+            #     some_compute(compute_buffer[0])
+            # torch.cuda.current_stream().wait_stream(comp_stream)
             comm_events[i].record()
             # compute_buffer[dst_idx] @ compute_param
             compute_events[i].record()
@@ -910,7 +914,7 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
           reduce_scatter_payload = size // group_size* (group_size - 1)* data[0].dtype.itemsize
-          print(f"Rank {rank} reduce_scatter bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 1)) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {reduce_scatter_func.__name__} bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 1)) / start.elapsed_time(end)}")
           print(f"Rank {rank} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 
