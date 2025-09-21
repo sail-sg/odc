@@ -710,6 +710,9 @@ class ReductionService:
 
         split_trans_buffer = buffer.numel() < output_size
         input_tensor_split = input_tensor.view(-1).view(world_size, -1)
+
+        batch_p2p = os.environ.get("DISABLE_BATCH_P2P", "0") != "1"
+        ops = []
         handles = defaultdict(list)
         for start in range(0, output_size, local_buf_size):
             size = min(local_buf_size, output_size - start)
@@ -731,11 +734,17 @@ class ReductionService:
                     continue
                 def send():
                     with torch.cuda.nvtx.range(f"send_{rank}->{peer}"):
-                        torch.distributed.isend(send_data, peer, group=pg)
+                        if batch_p2p:
+                            ops.append(dist.P2POp(dist.isend, send_data, peer, group=pg))
+                        else:
+                            torch.distributed.isend(send_data, peer, group=pg)
                 def recv():
                     with torch.cuda.nvtx.range(f"recv_{peer}->{rank}"):
-                        handle = torch.distributed.irecv(buf, peer, group=pg)
-                    handles[peer].append(handle)
+                        if batch_p2p:
+                            ops.append(dist.P2POp(dist.irecv, buf, peer, group=pg))
+                        else:
+                            handle = torch.distributed.irecv(buf, peer, group=pg)
+                            handles[peer].append(handle)
                 if rank < peer:
                     send()
                     recv()
@@ -743,10 +752,17 @@ class ReductionService:
                     recv()
                     send()
             if need_accumulation:
+                if batch_p2p:
+                    reqs = dist.batch_isend_irecv(ops)
+                    for req in reqs:
+                        req.wait()
+                    ops.clear()
                 for peer in range(world_size):
                     if peer != rank:
-                        for handle in handles[peer]:
-                            handle.wait()
+                        if not batch_p2p:
+                            for handle in handles[peer]:
+                                handle.wait()
+                            handles[peer].clear()
                     acc[start:start+size].add_(bufs[peer])
 
 

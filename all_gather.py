@@ -322,8 +322,10 @@ def all_gather_into_tensor_nccl_p2p(output_tensor: Tensor, input_tensor: Tensor,
     local_buf_size = buf_size // world_size
     target_tensor_split = output_tensor.view(world_size, -1)
 
+    batch_p2p = os.environ.get("DISABLE_BATCH_P2P", "0") != "1"
     handles = []
     rank = torch.distributed.get_rank(pg)
+    ops = []
     for start in range(0, input_tensor.numel(), local_buf_size):
         size = min(local_buf_size, input_tensor.numel() - start)
         sub_input_tensor = input_tensor.view(-1)[start:start+size]
@@ -335,18 +337,29 @@ def all_gather_into_tensor_nccl_p2p(output_tensor: Tensor, input_tensor: Tensor,
                 continue
             def send():
                 with torch.cuda.nvtx.range(f"send_{rank}->{peer}"):
-                    torch.distributed.isend(sub_input_tensor, peer, group=pg)
+                    if batch_p2p:
+                        ops.append(dist.P2POp(dist.isend, sub_input_tensor, peer, group=pg))
+                    else:
+                        torch.distributed.isend(sub_input_tensor, peer, group=pg)
             def recv():
                 with torch.cuda.nvtx.range(f"recv_{peer}->{rank}"):
-                    handles.append(torch.distributed.irecv(buf, peer, group=pg))
+                    if batch_p2p:
+                        ops.append(dist.P2POp(dist.irecv, buf, peer, group=pg))
+                    else:
+                        handles.append(torch.distributed.irecv(buf, peer, group=pg))
             if rank < peer:
                 send()
                 recv()
             else:
                 recv()
                 send()
-    for handle in handles:
-        handle.wait()
+    if batch_p2p:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+    else:
+        for handle in handles:
+            handle.wait()
 
 
   # for chunk in range(total_chunks):
