@@ -10,6 +10,8 @@ import os
 import numpy as np
 from pathlib import Path
 import re
+import csv
+import pandas as pd
 
 def parse_input_size(dir_name):
     """Parse payload size from directory name (e.g., '16mb' -> 16*1000*1000)"""
@@ -274,26 +276,6 @@ def plot_results(results, operation_type="reduce_scatter"):
     return fig
 
 
-def main(data_dir, operation_type="reduce_scatter"):
-    """Main function to run the analysis"""
-    print("Loading profile data...")
-    data = load_profile_data(data_dir, operation_type)
-    
-    if not data:
-        print("No profile data found. Please run the tests first using:")
-        print("  bash launch_profile.sh")
-        return
-    
-    print(f"Loaded data for {len(data)} payload sizes")
-    
-    print("Analyzing data...")
-    results = analyze_data(data)
-    
-    print("Creating plots...")
-    fig = plot_results(results, operation_type)
-    
-    print("\nAnalysis complete!")
-
 def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
     """Plot the field from multiple data directories, one chart per directory"""
     if not data_dirs:
@@ -399,20 +381,135 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
     
     return fig
 
+def export_multi_bandwidth_to_csv(data_dirs, field, operation_type="reduce_scatter", filename=None):
+    """Export multi-directory bandwidth comparison data to CSV"""
+    if not data_dirs:
+        print("No data directories provided")
+        return
+    
+    # Load and analyze data for each directory
+    all_results = {}
+    for data_dir in data_dirs:
+        print(f"Loading data from {data_dir}...")
+        data = load_profile_data(data_dir, operation_type)
+        if data:
+            results = analyze_data(data)
+            all_results[data_dir] = results
+            print(f"Loaded data for {len(data)} payload sizes from {data_dir}")
+        else:
+            print(f"No data found in {data_dir}")
+    
+    if not all_results:
+        print("No data found in any directory")
+        return
+    
+    # Set default filename if not provided
+    if filename is None:
+        operation_label = "reduce_scatter" if operation_type == "reduce_scatter" else "all_gather"
+        filename = f"{operation_label}_multi_bandwidth_comparison.csv"
+    
+    # Set implementation names and labels based on operation type
+    if operation_type == "reduce_scatter":
+        impl_names = ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl']
+        impl_labels = {'reduce_scatter_accumulation': 'ODC', 'reduce_scatter_accumulation_nccl': 'NCCL'}
+    else:  # all_gather
+        impl_names = ['all_gather_into_tensor', 'all_gather_into_tensor_nccl']
+        impl_labels = {'all_gather_into_tensor': 'ODC', 'all_gather_into_tensor_nccl': 'NCCL'}
+    
+    # Prepare data for CSV export
+    csv_data = []
+    
+    for data_dir, results in all_results.items():
+        # Group results by (num_nodes, num_ranks)
+        grouped_results = {}
+        for (num_nodes, num_ranks, payload_size), impl_data in results.items():
+            key = (num_nodes, num_ranks)
+            if key not in grouped_results:
+                grouped_results[key] = {}
+            grouped_results[key][payload_size] = impl_data
+        
+        # Sort groups by (num_nodes, num_ranks) for consistent ordering
+        sorted_groups = sorted(grouped_results.items(), key=lambda x: (x[0][0], x[0][1]))
+        
+        for (num_nodes, num_ranks), group_data in sorted_groups:
+            # Sort payload sizes for proper ordering
+            payload_sizes = sorted(group_data.keys())
+            
+            for payload_size in payload_sizes:
+                
+                for impl_name in impl_names:
+                    if impl_name in group_data[payload_size]:
+                        # Convert from MB/s to GB/s for bandwidth field
+                        bandwidth_value = group_data[payload_size][impl_name][field] / 1000
+                        
+                        row = {
+                            'operation_type': operation_type,
+                            'implementation': impl_labels[impl_name],
+                            'num_nodes': num_nodes,
+                            'num_ranks': num_ranks,
+                            'payload_size_bytes': payload_size,
+                            'bandwidth_gbps': bandwidth_value,
+                        }
+                        csv_data.append(row)
+                    else:
+                        # Add row with zeros for missing implementation
+                        row = {
+                            'operation_type': operation_type,
+                            'implementation': impl_labels[impl_name],
+                            'num_nodes': num_nodes,
+                            'num_ranks': num_ranks,
+                            'payload_size_bytes': payload_size,
+                            'bandwidth_gbps': 0,
+                        }
+                        csv_data.append(row)
+    
+    # Write to CSV
+    if csv_data:
+        df = pd.DataFrame(csv_data)
+        df.to_csv(filename, index=False)
+        print(f"Multi-directory bandwidth comparison exported to {filename}")
+        print(f"Exported {len(csv_data)} rows of data")
+    else:
+        print("No data to export")
+
+def main(data_dir, operation_type="reduce_scatter", export_csv=False, csv_filename=None):
+    """Main function to run the analysis"""
+    print("Loading profile data...")
+    data = load_profile_data(data_dir, operation_type)
+    
+    if not data:
+        print("No profile data found. Please run the tests first using:")
+        print("  bash launch_profile.sh")
+        return
+    
+    print(f"Loaded data for {len(data)} payload sizes")
+    
+    print("Analyzing data...")
+    results = analyze_data(data)
+    
+    print("Creating plots...")
+    fig = plot_results(results, operation_type)
+    print("\nAnalysis complete!")
+
 
 if __name__ == "__main__":
     # Example usage for all_gather data
     
-    # For all_gather analysis
-    # main(data_dir, operation_type="all_gather")
+    # For all_gather analysis with CSV export
+    # main(data_dir, operation_type="all_gather", export_csv=True)
     
-    # For reduce_scatter analysis (original functionality)
-    # main(data_dir, operation_type="reduce_scatter")
+    # For reduce_scatter analysis (original functionality) with CSV export
+    # main(data_dir, operation_type="reduce_scatter", export_csv=True)
     
-    # For multi-directory bandwidth comparison
-    data_dirs = [
-        "rs-profile",
-        # "ag-profile",
-    ]
-    # plot_multi_bandwidth(data_dirs, "avg_bandwidth", operation_type="all_gather")
-    plot_multi_bandwidth(data_dirs, "avg_bandwidth", operation_type="reduce_scatter")
+    # For multi-directory bandwidth comparison with CSV export
+    # data_dirs = [
+    #     # "rs-profile",
+    #     "ag-profile",
+    # ]
+    
+    # Plot and export multi-directory bandwidth comparison
+    # plot_multi_bandwidth(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
+    # export_multi_bandwidth_to_csv(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
+    
+    plot_multi_bandwidth(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
+    # export_multi_bandwidth_to_csv(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
