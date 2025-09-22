@@ -148,7 +148,8 @@ if __name__ == "__main__":
 
       sync_inputs = torch.zeros(world_size, dtype=torch.long, device="cuda")
 
-      src_tensors = [torch.empty(size, dtype=torch.bfloat16, device="cuda") for _ in range(cnt)]
+      all_gather_dtype = torch.bfloat16
+      src_tensors = [torch.empty(size, dtype=all_gather_dtype, device="cuda") for _ in range(cnt)]
       for i in range(cnt):
         src_tensors[i].fill_(i + rank*100)
         src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
@@ -158,15 +159,27 @@ if __name__ == "__main__":
       for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           for i in range(cnt):
-            dst = torch.empty(size * group_size, dtype=torch.bfloat16, device="cuda")
+            dst = torch.empty(size * group_size, dtype=all_gather_dtype, device="cuda")
             all_gather_func(dst, src_tensors[i], group)
             for r in range(group_size):
               expected = group_ranks[r] * 100 + i
               assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
-          end = torch.cuda.Event(enable_timing=True)
-          end.record()
           dist.barrier()
           torch.cuda.synchronize()
+
+    #   rs_src = torch.empty(size * group_size, dtype=torch.float32, device="cuda")
+    #   rs_dst = torch.empty(size, dtype=torch.float32, device="cuda")
+    #   print(f"Rank {rank} run nccl reduce scatter and all reduce")
+    #   with torch.cuda.nvtx.range("nccl_reduce_scatter"):
+    #     for i in range(cnt * 2):
+    #       torch.distributed.reduce_scatter_tensor(rs_dst, rs_src, group=group)
+    #   with torch.cuda.nvtx.range("nccl_all_reduce"):
+    #     for i in range(cnt * 2):
+    #       torch.distributed.all_reduce(rs_src, group=group)
+    #   with torch.cuda.nvtx.range("nccl_all_gather"):
+    #     for i in range(cnt * 2):
+    #       torch.distributed.all_gather_into_tensor(rs_src, rs_dst, group=group)
+    #   torch.cuda.synchronize()
 
     #   for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl]:
       for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
@@ -182,7 +195,7 @@ if __name__ == "__main__":
                 torch.distributed.all_reduce(sync_inputs, group=group)
             # if i == 1:
             #   start.record()
-            dst = torch.empty(size * group_size, dtype=torch.bfloat16, device="cuda")
+            dst = torch.empty(size * group_size, dtype=all_gather_dtype, device="cuda")
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
             #   for r in range(world_size)
@@ -202,7 +215,7 @@ if __name__ == "__main__":
           dist.barrier()
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
-          all_gather_payload = size * (group_size - 1)* torch.bfloat16.itemsize
+          all_gather_payload = size * (group_size - 1)* all_gather_dtype.itemsize
           print(f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 0) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")

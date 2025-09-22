@@ -150,7 +150,7 @@ node_rank=${RANK:=0}
 
 master_addr=${MASTER_ADDR:="127.0.0.1"}
 if [ -z ${MASTER_PORT} ]; then
-  master_port="23457"
+  master_port="25299"
 else
   master_port=$(echo "$MASTER_PORT" | cut -d "," -f 1)
 fi

@@ -447,7 +447,7 @@ def export_multi_bandwidth_to_csv(data_dirs, field, operation_type="reduce_scatt
                             'implementation': impl_labels[impl_name],
                             'num_nodes': num_nodes,
                             'num_ranks': num_ranks,
-                            'payload_size_bytes': payload_size,
+                            'payload_size': payload_size,
                             'bandwidth_gbps': bandwidth_value,
                         }
                         csv_data.append(row)
@@ -458,7 +458,7 @@ def export_multi_bandwidth_to_csv(data_dirs, field, operation_type="reduce_scatt
                             'implementation': impl_labels[impl_name],
                             'num_nodes': num_nodes,
                             'num_ranks': num_ranks,
-                            'payload_size_bytes': payload_size,
+                            'payload_size': payload_size,
                             'bandwidth_gbps': 0,
                         }
                         csv_data.append(row)
@@ -508,8 +508,8 @@ if __name__ == "__main__":
     # ]
     
     # Plot and export multi-directory bandwidth comparison
-    # plot_multi_bandwidth(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
+    plot_multi_bandwidth(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
     # export_multi_bandwidth_to_csv(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
     
-    plot_multi_bandwidth(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
+    # plot_multi_bandwidth(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
     # export_multi_bandwidth_to_csv(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
