@@ -6,7 +6,7 @@
 # Set default values if not already set
 START_GPU=${START_GPU:-0}
 NUM_GPUS=${NUM_GPUS:-4}
-export ODC_SINGLE_BUFFER=1
+export ODC_SINGLE_BUFFER=0
 export ODC_NUM_BUFFERS=${NUM_GPUS}
 # export ODC_MAX_BUFFER_SIZE=128000000
 

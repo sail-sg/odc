@@ -636,6 +636,8 @@ if __name__ == "__main__":
         #   dist.barrier()
           start.record()
           for i in range(cnt * times):
+            if add_sync:
+                torch.distributed.all_reduce(sync_inputs, group=group)
             dst_idx = i % cnt
             # if i == cnt:
             #   start.record()
@@ -649,8 +651,6 @@ if __name__ == "__main__":
             reduce_scatter_func(data[i], dst_idx, group)
             torch.cuda.current_stream().wait_stream(comp_stream)
             comm_events[i].record()
-            if add_sync:
-                torch.distributed.all_reduce(sync_inputs, group=group)
             with torch.cuda.stream(comp_stream):
                 some_compute(compute_buffer[0])
             # compute_buffer[dst_idx] @ compute_param

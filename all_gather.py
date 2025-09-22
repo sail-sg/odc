@@ -178,6 +178,8 @@ if __name__ == "__main__":
           
           start.record()
           for i in range(cnt):
+            if add_sync:
+                torch.distributed.all_reduce(sync_inputs, group=group)
             # if i == 1:
             #   start.record()
             dst = torch.empty(size * group_size, dtype=torch.bfloat16, device="cuda")
@@ -188,8 +190,6 @@ if __name__ == "__main__":
             start_events[i].record()
             all_gather_func(dst, src_tensors[i], group)
             comm_events[i].record()
-            if add_sync:
-                torch.distributed.all_reduce(sync_inputs, group=group)
             # compute_buffer[i] @ compute_param
             compute_events[i].record()
             
