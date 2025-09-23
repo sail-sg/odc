@@ -180,9 +180,15 @@ if __name__ == "__main__":
     #     for i in range(cnt * 2):
     #       torch.distributed.all_gather_into_tensor(rs_src, rs_dst, group=group)
     #   torch.cuda.synchronize()
+      def wait_kernel_launch():
+        with torch.cuda.nvtx.range("wait-kernel-launch"):
+          for _ in range(4):
+            with torch.no_grad():
+                compute_buffer[0] @ compute_param
 
     #   for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl]:
       for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl]:
+        wait_kernel_launch()
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
@@ -191,11 +197,11 @@ if __name__ == "__main__":
           
           start.record()
           for i in range(cnt):
+            dst = torch.empty(size * group_size, dtype=all_gather_dtype, device="cuda")
             if add_sync:
                 torch.distributed.all_reduce(sync_inputs, group=group)
             # if i == 1:
             #   start.record()
-            dst = torch.empty(size * group_size, dtype=all_gather_dtype, device="cuda")
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
             #   for r in range(world_size)

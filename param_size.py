@@ -58,8 +58,7 @@ def qwen2_param_size_per_layer(conf: Qwen2ModelConfig) -> int:
     down_proj = reduced_size * conf.hidden_size
     # print(f"FFN: {up_proj + gate_proj + down_proj}")
     # assert up_proj + down_proj == conf.intermediate_size * conf.hidden_size * 2, f"{up_proj + down_proj} != {conf.intermediate_size * conf.hidden_size * 2}"
-    rms_norm = conf.hidden_size
-    return q_proj + k_proj + v_proj + q_proj_bias + k_proj_bias + v_proj_bias + o_proj + up_proj + gate_proj + down_proj + rms_norm + input_layernorm + post_attention_layernorm
+    return q_proj + k_proj + v_proj + q_proj_bias + k_proj_bias + v_proj_bias + o_proj + up_proj + gate_proj + down_proj + input_layernorm + post_attention_layernorm
 
 
 qwen25_math_1_5B_config = Qwen2ModelConfig(

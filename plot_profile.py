@@ -381,6 +381,166 @@ def plot_multi_bandwidth(data_dirs, field, operation_type="reduce_scatter"):
     
     return fig
 
+def plot_combined_operations(data_dirs, field, operation_types=["all_gather", "reduce_scatter"]):
+    """Plot multiple operation types in the same graph for comparison"""
+    if not data_dirs:
+        print("No data directories provided")
+        return
+    
+    # Load and analyze data for each operation type
+    all_results = {}
+    for operation_type in operation_types:
+        print(f"Loading {operation_type} data...")
+        operation_results = {}
+        
+        for data_dir in data_dirs:
+            print(f"  Loading data from {data_dir}...")
+            data = load_profile_data(data_dir, operation_type)
+            if data:
+                results = analyze_data(data)
+                operation_results[data_dir] = results
+                print(f"  Load data for {len(data)} payload sizes from {data_dir}")
+            else:
+                print(f"  No data found in {data_dir}")
+        
+        if operation_results:
+            all_results[operation_type] = operation_results
+            print(f"Loaded {operation_type} data from {len(operation_results)} directories")
+        else:
+            print(f"No {operation_type} data found in any directory")
+    
+    if not all_results:
+        print("No data found for any operation type")
+        return
+    
+    # Group results by (num_nodes, num_ranks) for each operation type and directory
+    grouped_all_results = {}
+    for operation_type, operation_results in all_results.items():
+        grouped_all_results[operation_type] = {}
+        for data_dir, results in operation_results.items():
+            grouped_results = {}
+            for (num_nodes, num_ranks, payload_size), impl_data in results.items():
+                key = (num_nodes, num_ranks)
+                if key not in grouped_results:
+                    grouped_results[key] = {}
+                grouped_results[key][payload_size] = impl_data
+            grouped_all_results[operation_type][data_dir] = grouped_results
+    
+    # Create subplots - one for each data directory and (num_nodes, num_ranks) combination
+    num_dirs = len(data_dirs)
+    max_groups = 0
+    for operation_type in operation_types:
+        if operation_type in grouped_all_results:
+            for data_dir in data_dirs:
+                if data_dir in grouped_all_results[operation_type]:
+                    max_groups = max(max_groups, len(grouped_all_results[operation_type][data_dir]))
+    
+    if max_groups == 0:
+        print("No groups found to plot")
+        return
+    
+    fig, axes = plt.subplots(num_dirs, max_groups, figsize=(6*max_groups, 5*num_dirs))
+    if num_dirs == 1 and max_groups == 1:
+        axes = [[axes]]
+    elif num_dirs == 1:
+        axes = [axes]
+    elif max_groups == 1:
+        axes = [[ax] for ax in axes]
+    
+    # Set title
+    fig.suptitle(f'Combined Operations Bus Bandwidth Comparison', fontsize=16)
+    
+    # Define operation-specific implementation names and labels
+    operation_configs = {
+        "reduce_scatter": {
+            'impl_names': ['reduce_scatter_accumulation', 'reduce_scatter_accumulation_nccl'],
+            'base_labels': {'reduce_scatter_accumulation': 'RS-ODC', 'reduce_scatter_accumulation_nccl': 'RS-NCCL'},
+            'colors': {'reduce_scatter_accumulation': 'blue', 'reduce_scatter_accumulation_nccl': 'red'},
+            'markers': {'reduce_scatter_accumulation': 'o', 'reduce_scatter_accumulation_nccl': 's'}
+        },
+        "all_gather": {
+            'impl_names': ['all_gather_into_tensor', 'all_gather_into_tensor_nccl'],
+            'base_labels': {'all_gather_into_tensor': 'AG-ODC', 'all_gather_into_tensor_nccl': 'AG-NCCL'},
+            'colors': {'all_gather_into_tensor': 'green', 'all_gather_into_tensor_nccl': 'orange'},
+            'markers': {'all_gather_into_tensor': '^', 'all_gather_into_tensor_nccl': 'D'}
+        }
+    }
+    
+    for dir_idx, data_dir in enumerate(data_dirs):
+        # Collect all available groups for this directory across all operation types
+        all_groups = set()
+        for operation_type in operation_types:
+            if (operation_type in grouped_all_results and 
+                data_dir in grouped_all_results[operation_type]):
+                all_groups.update(grouped_all_results[operation_type][data_dir].keys())
+        
+        # Sort groups by number of ranks (and then by number of nodes for consistency)
+        sorted_groups = sorted(all_groups, key=lambda x: (x[1], x[0]))  # (num_nodes, num_ranks)
+        
+        for group_idx, group_key in enumerate(sorted_groups):
+            if group_idx >= max_groups:
+                break
+                
+            ax = axes[dir_idx][group_idx] if num_dirs > 1 else axes[group_idx]
+            
+            num_nodes, num_ranks = group_key
+            ax.set_title(f'{data_dir} (n{num_nodes}-r{num_ranks})')
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Total Bandwidth (GB/s)')
+            
+            # Collect all payload sizes from all operation types for this group
+            all_payload_sizes = set()
+            for operation_type in operation_types:
+                if (operation_type in grouped_all_results and 
+                    data_dir in grouped_all_results[operation_type] and
+                    group_key in grouped_all_results[operation_type][data_dir]):
+                    all_payload_sizes.update(grouped_all_results[operation_type][data_dir][group_key].keys())
+            
+            payload_sizes = sorted(all_payload_sizes)
+            payload_labels = [f"{size/(1000*1000):.0f}MB" for size in payload_sizes]
+            
+            ax.set_xticks(range(len(payload_sizes)))
+            ax.set_xticklabels(payload_labels)
+            
+            # Plot data for each operation type
+            for operation_type in operation_types:
+                if (operation_type not in grouped_all_results or 
+                    data_dir not in grouped_all_results[operation_type] or
+                    group_key not in grouped_all_results[operation_type][data_dir]):
+                    continue
+                
+                config = operation_configs[operation_type]
+                group_data = grouped_all_results[operation_type][data_dir][group_key]
+                
+                # Create labels with node and rank info
+                labels = {}
+                for impl_name in config['impl_names']:
+                    base_label = config['base_labels'][impl_name]
+                    labels[impl_name] = f"{base_label}-n{num_nodes}-r{num_ranks}"
+                
+                # Plot field for each implementation
+                for impl_name in config['impl_names']:
+                    bandwidths = []
+                    for payload_size in payload_sizes:
+                        if impl_name in group_data[payload_size]:
+                            # Convert from MB/s to GB/s
+                            bandwidths.append(group_data[payload_size][impl_name][field] / 1000)
+                        else:
+                            bandwidths.append(0)
+                    
+                    ax.errorbar(range(len(payload_sizes)), bandwidths,
+                               marker=config['markers'][impl_name], 
+                               color=config['colors'][impl_name], 
+                               label=labels[impl_name], capsize=5)
+            
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
 def export_multi_bandwidth_to_csv(data_dirs, field, operation_type="reduce_scatter", filename=None):
     """Export multi-directory bandwidth comparison data to CSV"""
     if not data_dirs:
@@ -507,9 +667,11 @@ if __name__ == "__main__":
     #     "ag-profile",
     # ]
     
-    # Plot and export multi-directory bandwidth comparison
-    plot_multi_bandwidth(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
-    # export_multi_bandwidth_to_csv(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
+    # Plot both operation types in the same graph
+    plot_combined_operations(["ag-profile", "rs-profile"], "avg_bandwidth", operation_types=["all_gather", "reduce_scatter"])
     
+    # Original separate plots (commented out)
+    # plot_multi_bandwidth(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
     # plot_multi_bandwidth(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
+    # export_multi_bandwidth_to_csv(["ag-profile"], "avg_bandwidth", operation_type="all_gather")
     # export_multi_bandwidth_to_csv(["rs-profile"], "avg_bandwidth", operation_type="reduce_scatter")
