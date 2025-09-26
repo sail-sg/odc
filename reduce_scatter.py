@@ -49,6 +49,9 @@ def nvshmem_request_wait_kernel(
 @triton.jit(do_not_specialize=["next_request_id", "accumulation_command", "need_accumulation"])
 def nvshmem_reduce_scatter_kernel(
     input_tensor_ptr,
+    rank_input_size,
+    input_segment_start,
+    chunk_buffer,
     output_tensor_ptr,
     request_buffer_ptr,
     response_buffer_ptr,
@@ -56,7 +59,7 @@ def nvshmem_reduce_scatter_kernel(
     size_per_elem,
     rank,
     world_size,
-    chunk_size,
+    chunk_size: tl.constexpr,
     next_request_id,
     accumulation_command,
     signal_ptr,
@@ -68,6 +71,8 @@ def nvshmem_reduce_scatter_kernel(
     num_nodes = world_size // np
     expected = 0
 
+    chunk_buffer_seg = chunk_buffer + pid * chunk_size
+
     for i in range(num_nodes):
       peer_node = (i + rank // np) % num_nodes
       peer = (pid + peer_node * np) % world_size
@@ -78,9 +83,15 @@ def nvshmem_reduce_scatter_kernel(
           this_chunk_size = chunk_size
           if chunk == num_chunks - 1:
               this_chunk_size = elem_per_rank - chunk * chunk_size
+          chunk_offsets = tl.arange(0, chunk_size)
+          input_start = peer * rank_input_size + input_segment_start + (chunk * chunk_size)
+          mask = chunk_offsets < this_chunk_size
+          input_chunk_data = tl.load(input_tensor_ptr + input_start + chunk_offsets, mask=mask)
+          tl.store(chunk_buffer_seg + chunk_offsets, input_chunk_data, mask=mask)
           libshmem_device.putmem_nbi_block(
               output_tensor_ptr + (chunk * chunk_size),
-              input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
+              chunk_buffer_seg,
+            #   input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
               this_chunk_size * size_per_elem,
               peer,
           )
@@ -485,6 +496,10 @@ class ReductionService:
         self.rank_streams = defaultdict(lambda: torch.cuda.Stream())
         self.buffer_shape_cache = {}
         self.buffer_splitter = BufferSplitter()
+        self.chunk_size_bytes = 2**20
+
+    def get_chunk_size(self, buffer_dtype):
+        return (self.chunk_size_bytes // buffer_dtype.itemsize)
 
     def register(self, key, output_tensor_shape, grad_dtype,reduction_dtype):
         if self.reduction_watcher is None:
@@ -567,8 +582,9 @@ class ReductionService:
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
         assert local_buf_size <= output_size
 
-        input_buf_size = local_buf_size * world_size
-        input_tensor_symm_shape = (input_buf_size,)
+        chunk_size = self.get_chunk_size(input_tensor.dtype)
+        grid_size = 8 if world_size == 32 else world_size
+        input_tensor_symm_shape = (chunk_size * grid_size,)
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)] = SymmBufferRegistry.get_instance().allocate_symm_buffer(
                 f'rs_buffer_{input_tensor_symm_shape}_{input_tensor.dtype}', input_tensor_symm_shape, input_tensor.dtype)
@@ -581,7 +597,6 @@ class ReductionService:
 
         accumulation_command = (buffer_id << 16) | accumulation_id
         assert (buffer.numel() * buffer.element_size()) % (2**6) == 0, 'better align to 64 for efficiency'
-        chunk_size = (2**20 // buffer.element_size())
         # chunk_size = buffer.numel()
         # assert buffer.shape[0] % chunk_size == 0
 
@@ -589,28 +604,23 @@ class ReductionService:
 
         split_trans_buffer = buffer.numel() < output_size
         with torch.cuda.stream(get_comm_stream()):
-            input_tensor_split = input_tensor.view(-1).view(world_size, -1)
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
             for start in range(0, output_size, local_buf_size):
                 size = min(local_buf_size, output_size - start)
-                input_size = size * world_size
-                input_tensor_symm_split = input_tensor_symm[:input_size].view(world_size, -1)
                 assert local_buf_size <= buffer.numel()
-                if local_buf_size < output_size:
-                    for r in range(world_size):
-                        input_tensor_symm_split[r, :].copy_(input_tensor_split[r, start:start+size])
-                else:
-                    input_tensor_symm.copy_(input_tensor.view(-1))
                 if split_trans_buffer:
                     buf = buffer[:size]
                 else:
                     buf = buffer[start:start+size]
                 signal_ptr.fill_(0)
                 need_accumulation = split_trans_buffer or start + size == output_size
-                assert world_size % 8 == 0
-                grid_size = 8 if world_size == 32 else world_size
+                assert world_size % 8 == 0 or world_size < 8
+                _, rank_input_size = input_tensor.view(-1).view(world_size, -1).shape
                 nvshmem_reduce_scatter_kernel[(grid_size, )](
-                    input_tensor_ptr = input_tensor_symm_split.view(-1),
+                    input_tensor_ptr = input_tensor,
+                    rank_input_size = rank_input_size,
+                    input_segment_start = start,
+                    chunk_buffer = input_tensor_symm,
                     output_tensor_ptr = buf,
                     request_buffer_ptr = self.lock.request_buffer,
                     response_buffer_ptr = self.lock.response_buffer,
