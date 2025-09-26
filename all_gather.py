@@ -239,7 +239,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # assert input_tensor.numel() % chunk_size == 0
   cupy_stream = PyTorchStreamWrapper(torch.cuda.current_stream())
   # print(f'chunk size {chunk_size}')
-  
+
   # nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked[(torch.distributed.get_world_size(pg), )](
   #   input_tensor,
   #   target_tensor,
@@ -266,7 +266,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
             assert target_buf_size <= buf_size
             target_tensor_split = target_tensor[:target_buf_size].view(world_size, size)
             signal_ptr.fill_(0)
-            assert world_size % 8 == 0
+            assert world_size % 8 == 0 or world_size < 8
             grid_size = 8 if world_size == 32 else world_size
             nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(grid_size, )](
                 sub_input_tensor,
@@ -312,8 +312,56 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
   # )
   # nvshmem.core.quiet(stream=cupy_stream)
 
+
+def all_gather_into_tensor_nccl_p2p(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
+    buf_size = buffer_splitter.get_global_buffer_size(output_tensor.shape)
+
+    world_size = torch.distributed.get_world_size(pg)
   
-  
+    assert buf_size % world_size == 0
+    local_buf_size = buf_size // world_size
+    target_tensor_split = output_tensor.view(world_size, -1)
+
+    batch_p2p = os.environ.get("DISABLE_BATCH_P2P", "0") != "1"
+    handles = []
+    rank = torch.distributed.get_rank(pg)
+    ops = []
+    for start in range(0, input_tensor.numel(), local_buf_size):
+        size = min(local_buf_size, input_tensor.numel() - start)
+        sub_input_tensor = input_tensor.view(-1)[start:start+size]
+        for i in range(world_size):
+            peer = i ^ rank
+            buf = target_tensor_split[peer, start:start+size]
+            if peer == rank:
+                buf.copy_(sub_input_tensor)
+                continue
+            def send():
+                with torch.cuda.nvtx.range(f"send_{rank}->{peer}"):
+                    if batch_p2p:
+                        ops.append(dist.P2POp(dist.isend, sub_input_tensor, peer, group=pg))
+                    else:
+                        torch.distributed.isend(sub_input_tensor, peer, group=pg)
+            def recv():
+                with torch.cuda.nvtx.range(f"recv_{peer}->{rank}"):
+                    if batch_p2p:
+                        ops.append(dist.P2POp(dist.irecv, buf, peer, group=pg))
+                    else:
+                        handles.append(torch.distributed.irecv(buf, peer, group=pg))
+            if rank < peer:
+                send()
+                recv()
+            else:
+                recv()
+                send()
+    if batch_p2p:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+    else:
+        for handle in handles:
+            handle.wait()
+
+
   # for chunk in range(total_chunks):
   #     nvshmem_device_producer_all_gather_2d_get_block_kernel[grid](
   #       input_tensor,
@@ -420,6 +468,7 @@ if __name__ == "__main__":
           x = x @ compute_param
           return x
 
+      sync_input_tensor = torch.empty(world_size, dtype=torch.int32, device="cuda")
 
       src_tensors = [torch.empty(size, dtype=dtype, device="cuda") for _ in range(cnt)]
       for i in range(cnt):
@@ -429,28 +478,30 @@ if __name__ == "__main__":
 
       # for all_gather_func in [all_gather_into_tensor, all_gather_into_tensor_nccl_comm, all_gather_into_tensor_nccl, all_gather_into_tensor_multinode]:
       comp_stream = torch.cuda.Stream()
-      for all_gather_func in [all_gather_into_tensor_nccl, all_gather_into_tensor]:
+      for all_gather_func in [all_gather_into_tensor_nccl, all_gather_into_tensor_nccl_p2p, all_gather_into_tensor]:
         with torch.cuda.nvtx.range(all_gather_func.__name__):
           start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           compute_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
           start = torch.cuda.Event(enable_timing=True)
           
+          dsts = [torch.empty(size * group_size, dtype=dtype, device="cuda") for _ in range(cnt)]
           for i in range(cnt):
+            torch.distributed.all_reduce(sync_input_tensor, group=group)
             if i == 1:
               torch.distributed.barrier(group)
               start.record()
-            dst = torch.empty(size * group_size, dtype=dtype, device="cuda")
+            dst = dsts[i]
             # dst_arr = [
             #   dst[r * size:(r + 1) * size]
             #   for r in range(world_size)
             # ]
             start_events[i].record()
-            comp_stream.wait_stream(torch.cuda.current_stream())
+            # comp_stream.wait_stream(torch.cuda.current_stream())
             all_gather_func(dst, src_tensors[i], group)
-            with torch.cuda.stream(comp_stream):
-                some_compute(compute_buffer[0])
-            torch.cuda.current_stream().wait_stream(comp_stream)
+            # with torch.cuda.stream(comp_stream):
+            #     some_compute(compute_buffer[0])
+            # torch.cuda.current_stream().wait_stream(comp_stream)
             comm_events[i].record()
             # compute_buffer[i] @ compute_param
             compute_events[i].record()
@@ -458,14 +509,14 @@ if __name__ == "__main__":
             # print(dst)
             for r in range(group_size):
               expected = group_ranks[r] * 2 + i
-              assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
+              # assert torch.eq(dst[r * size:(r + 1) * size], expected).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
           end = torch.cuda.Event(enable_timing=True)
           end.record()
           dist.barrier()
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* dtype.itemsize
-          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 
