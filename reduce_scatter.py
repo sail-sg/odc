@@ -9,14 +9,16 @@ from cuda import cuda
 
 import triton
 import triton.language as tl
-from triton_dist.language.extra import libshmem_device
-from triton.language.extra.cuda.language_extra import __syncthreads, tid
-from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, nvshmem_barrier_all_on_stream,
-                               NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
+# from triton_dist.language.extra import libshmem_device
+# from triton.language.extra.cuda.language_extra import __syncthreads, tid
+# from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, nvshmem_barrier_all_on_stream,
+#                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
+import nvshmem_triton
+from nvshmem_triton import tid, __syncthreads, NVSHMEM_EXTERN_LIBS
 from typing import List
 import time
 from dataclasses import dataclass
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream, BufferSplitter
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream, BufferSplitter, nvshmem_create_tensor
 import torch.distributed as dist
 from collections import defaultdict
 
@@ -35,14 +37,14 @@ def nvshmem_request_wait_kernel(
   pid = tl.program_id(axis=0)
   tidx = tid(axis=0)
   # if pid == 0 and tidx == 0:
-  #   libshmem_device.int_p(request_buffer_ptr + client_rank, command, server_rank)
-  # libshmem_device.quiet()
+  #   nvshmem_triton.int_p(request_buffer_ptr + client_rank, command, server_rank)
+  # nvshmem_triton.quiet()
   # __syncthreads()
   if pid == 0 and tidx == 0:
     r=request_id-1
     while r != request_id:
-      libshmem_device.quiet()
-      r=libshmem_device.int_g(response_buffer_ptr + client_rank, server_rank)
+      nvshmem_triton.quiet()
+      r=nvshmem_triton.int_g(response_buffer_ptr + client_rank, server_rank)
   __syncthreads()
 
 
@@ -78,7 +80,7 @@ def nvshmem_reduce_scatter_kernel(
           this_chunk_size = chunk_size
           if chunk == num_chunks - 1:
               this_chunk_size = elem_per_rank - chunk * chunk_size
-          libshmem_device.putmem_nbi_block(
+          nvshmem_triton.putmem_nbi_block(
               output_tensor_ptr + (chunk * chunk_size),
               input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
               this_chunk_size * size_per_elem,
@@ -96,7 +98,7 @@ def nvshmem_reduce_scatter_kernel(
               signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
               r = tl.max(signals)
           if tidx == 0 and pid == 0:
-              libshmem_device.quiet()
+              nvshmem_triton.quiet()
           __syncthreads()
 
           if tidx == 0:
@@ -123,13 +125,13 @@ def nvshmem_reduce_scatter_kernel(
 
     if pid == 0 and need_accumulation:
         if tidx == 0:
-          libshmem_device.quiet()
+          nvshmem_triton.quiet()
         __syncthreads()
 
 
         if tidx == 0:
             for peer in range(world_size):
-              libshmem_device.int_p(request_buffer_ptr + rank, accumulation_command, peer)
+              nvshmem_triton.int_p(request_buffer_ptr + rank, accumulation_command, peer)
         __syncthreads()
 
         
@@ -138,8 +140,8 @@ def nvshmem_reduce_scatter_kernel(
           for peer in range(world_size):
               r=next_request_id-1
               while r != next_request_id:
-                libshmem_device.quiet()
-                r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
+                nvshmem_triton.quiet()
+                r=nvshmem_triton.int_g(response_buffer_ptr + rank, peer)
         __syncthreads()
 
 @triton.jit(do_not_specialize=["next_request_id", "accumulation_command"])
@@ -163,15 +165,15 @@ def pre(
     num_chunks = elem_per_rank // chunk_size
 
     if tidx == 0:
-      libshmem_device.int_p(request_buffer_ptr + rank, -1, peer)
-    libshmem_device.quiet()
+      nvshmem_triton.int_p(request_buffer_ptr + rank, -1, peer)
+    nvshmem_triton.quiet()
     __syncthreads()
 
     if tidx == 0:
       r=next_request_id-1
       while r != next_request_id:
-        libshmem_device.quiet()
-        r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
+        nvshmem_triton.quiet()
+        r=nvshmem_triton.int_g(response_buffer_ptr + rank, peer)
     __syncthreads()
     
 @triton.jit(do_not_specialize=["next_request_id", "accumulation_command"])
@@ -193,20 +195,20 @@ def push(
     peer = (pid + rank + 1) % world_size
     num_chunks = elem_per_rank // chunk_size
     for chunk in range(num_chunks):
-        libshmem_device.putmem_block(
+        nvshmem_triton.putmem_block(
             output_tensor_ptr + (chunk * chunk_size),
             input_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
             chunk_size * size_per_elem,
             peer,
         )
-    # libshmem_device.quiet()
-    # libshmem_device.putmem_nbi_block(
+    # nvshmem_triton.quiet()
+    # nvshmem_triton.putmem_nbi_block(
     #     input_tensor_ptr + peer * elem_per_rank,
     #     output_tensor_ptr,
     #     elem_per_rank * size_per_elem,
     #     peer,
     # )
-    # libshmem_device.quiet()
+    # nvshmem_triton.quiet()
 
 @triton.jit(do_not_specialize=["next_request_id", "accumulation_command"])
 def post(
@@ -228,8 +230,8 @@ def post(
     # chunk_size = elem_per_rank // num_chunks
     num_chunks = elem_per_rank // chunk_size
     if tidx == 0:
-      libshmem_device.int_p(request_buffer_ptr + rank, accumulation_command, peer)
-    libshmem_device.quiet()
+      nvshmem_triton.int_p(request_buffer_ptr + rank, accumulation_command, peer)
+    nvshmem_triton.quiet()
     __syncthreads()
 
     next_request_id += 1
@@ -237,8 +239,8 @@ def post(
     if tidx == 0:
       r=next_request_id-1
       while r != next_request_id:
-        libshmem_device.quiet()
-        r=libshmem_device.int_g(response_buffer_ptr + rank, peer)
+        nvshmem_triton.quiet()
+        r=nvshmem_triton.int_g(response_buffer_ptr + rank, peer)
     __syncthreads()
 
 
@@ -607,7 +609,7 @@ class ReductionService:
                     buf = buffer[start:start+size]
                 signal_ptr.fill_(0)
                 need_accumulation = split_trans_buffer or start + size == output_size
-                assert world_size % 8 == 0
+                assert world_size % 8 == 0 or world_size < 8
                 grid_size = 8 if world_size == 32 else world_size
                 nvshmem_reduce_scatter_kernel[(grid_size, )](
                     input_tensor_ptr = input_tensor_symm_split.view(-1),
@@ -624,6 +626,7 @@ class ReductionService:
                     signal_ptr = signal_ptr,
                     need_accumulation = need_accumulation,
                     num_warps=32,
+                    extern_libs=NVSHMEM_EXTERN_LIBS,
                 )
                 if need_accumulation:
                     self.lock.client_context.next_request_id += 1
@@ -699,8 +702,10 @@ if __name__ == "__main__":
     import os
     torch.cuda.cudart().cudaProfilerStart()
     try:
+      device_id = int(os.environ['RANK']) % torch.cuda.device_count()
+      device = torch.device(f"cuda:{device_id}")
       torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
-      torch.distributed.init_process_group("nccl")
+      torch.distributed.init_process_group("nccl", device_id=device)
       # torch.distributed.barrier()
       init_nvshmem()
       # test_request_response()
@@ -720,8 +725,6 @@ if __name__ == "__main__":
       # comp_sizes = torch.rand(cnt).tolist()
       comp_sizes = [2]
 
-      
-      
       
       
       
@@ -846,7 +849,7 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt * times)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt * times)]}")
           reduce_scatter_payload = size // group_size* (group_size - 1)* data[0].dtype.itemsize
-          print(f"Rank {rank} reduce_scatter bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 1)) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {reduce_scatter_func.__name__} bw: {reduce_scatter_payload / 1024 ** 2 * (cnt * (times - 1)) / start.elapsed_time(end)}")
           print(f"Rank {rank} Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
         # torch.cuda.current_stream().wait_stream(comp_stream)

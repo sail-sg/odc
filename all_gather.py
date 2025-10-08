@@ -16,8 +16,10 @@ import nvshmem.core
 import os
 from typing import List
 from torch import Tensor
-from triton_dist.language.extra import libshmem_device
-from triton.language.extra.cuda.language_extra import __syncthreads, tid
+# from triton_dist.language.extra import libshmem_device
+# from triton.language.extra.cuda.language_extra import __syncthreads, tid
+import nvshmem_triton
+from nvshmem_triton import tid, __syncthreads, NVSHMEM_EXTERN_LIBS
 from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, get_comm_stream, BufferSplitter
 ###
 #  Helper code from https://github.com/NVIDIA/cuda-python/blob/main/cuda_core/examples/pytorch_example.py
@@ -41,13 +43,13 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel(
         np = tl.num_programs(axis=0)
         peer = (pid  + rank + 1) % world_size
         for c in range(total_chunks):
-            libshmem_device.getmem_nbi_block(
+            nvshmem_triton.getmem_nbi_block(
                 target_tensor_ptr + peer * elem_per_rank + (c * elem_per_rank // total_chunks),
                 remote_tensor_ptr + (c * elem_per_rank // total_chunks),
                 elem_per_rank * size_per_elem // total_chunks,
                 peer,
             )
-        libshmem_device.quiet()
+        nvshmem_triton.quiet()
 
 @triton.jit
 def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked(
@@ -68,7 +70,7 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked(
         this_chunk_size = chunk_size
         if chunk == num_chunks - 1:
             this_chunk_size = elem_per_rank - chunk * chunk_size
-        libshmem_device.getmem_block(
+        nvshmem_triton.getmem_block(
             target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
             remote_tensor_ptr + (chunk * chunk_size),
             this_chunk_size * size_per_elem,
@@ -102,7 +104,7 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
           this_chunk_size = chunk_size
           if chunk == num_chunks - 1:
               this_chunk_size = elem_per_rank - chunk * chunk_size
-          libshmem_device.getmem_nbi_block(
+          nvshmem_triton.getmem_nbi_block(
               target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
               remote_tensor_ptr + (chunk * chunk_size),
               this_chunk_size * size_per_elem,
@@ -119,7 +121,7 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
               signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
               r = tl.max(signals)
           if tidx == 0 and pid == 0:
-              libshmem_device.quiet()
+              nvshmem_triton.quiet()
           __syncthreads()
 
           if tidx == 0:
@@ -155,7 +157,7 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_one_chunk(
     this_chunk_size = chunk_size
     if chunk == num_chunks - 1:
         this_chunk_size = elem_per_rank - chunk * chunk_size
-    libshmem_device.getmem_nbi_block(
+    nvshmem_triton.getmem_nbi_block(
         target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
         remote_tensor_ptr + (chunk * chunk_size),
         this_chunk_size * size_per_elem,
@@ -177,7 +179,7 @@ def nvshmem_device_producer_all_gather_2d_put_block_kernel(
         np = tl.num_programs(axis=0)
         peer = (pid  + rank + 1) % world_size #% 8 + 8 * (1 - rank // 8)
 
-        libshmem_device.putmem_nbi_block(
+        nvshmem_triton.putmem_nbi_block(
             target_tensor_ptr + rank * elem_per_rank,
             remote_tensor_ptr,
             elem_per_rank * size_per_elem,
@@ -266,7 +268,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
             assert target_buf_size <= buf_size
             target_tensor_split = target_tensor[:target_buf_size].view(world_size, size)
             signal_ptr.fill_(0)
-            assert world_size % 8 == 0
+            assert world_size % 8 == 0 or world_size < 8
             grid_size = 8 if world_size == 32 else world_size
             nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(grid_size, )](
                 sub_input_tensor,
@@ -278,6 +280,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
                 chunk_size,
                 signal_ptr,
                 num_warps=32,
+                extern_libs=NVSHMEM_EXTERN_LIBS,
             )
             if buf_size == output_size:
                 output_tensor.copy_(target_tensor)
@@ -465,7 +468,7 @@ if __name__ == "__main__":
           torch.cuda.synchronize()
           # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
           all_gather_payload = size * (group_size - 1)* dtype.itemsize
-          print(f"Rank {rank} all_gather bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
+          print(f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}")
           print(f"Total time: {start.elapsed_time(end)}")
           # print(f"Rank {rank} dst: {dst}")
 

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensor_ipc"
+version = "0.1.0"
+description = "PyTorch CUDA extension for tensor IPC (Inter-Process Communication)"
+requires-python = ">=3.8"
+dependencies = [
+]
+
+[project.optional-dependencies]
+dev = []
