@@ -8,14 +8,15 @@ from cuda import cuda
 
 import triton
 import triton.language as tl
-from triton_dist.language.extra import libshmem_device
-from triton.language.extra.cuda.language_extra import __syncthreads, tid
-from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, nvshmem_barrier_all_on_stream,
-                               NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
+# from triton_dist.language.extra import libshmem_device
+# from triton.language.extra.cuda.language_extra import __syncthreads, tid
+# from triton_dist.utils import (CUDA_CHECK, dist_print, initialize_distributed, nvshmem_barrier_all_on_stream,
+#                                NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensors, nvshmem_create_tensor, nvshmem_free_tensor_sync)
+from nvshmem_triton import NVSHMEM_EXTERN_LIBS, int_atomic_swap, int_atomic_compare_swap, tid, __syncthreads
 from typing import List
 from collections import defaultdict
 import time
-from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg
+from odc.utils import SymmBufferRegistry, init_nvshmem, get_same_local_rank_pg, get_local_world_size, get_local_world_pg, nvshmem_create_tensor, nvshmem_free_tensor_sync
 import torch.distributed as dist
 
 ### NVSHMEM kernels are used by clients to communicate with reduction servers
@@ -30,7 +31,8 @@ def nvshmem_poll_lock_kernel(
     if pid == 0 and tidx == 0:
         r = 1
         while r != 0:
-            r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, -1, target_rank)
+            # r = libshmem_device.atomic_compare_swap(lock_buffer_ptr + lock_id, 0, -1, target_rank)
+            r = int_atomic_compare_swap(lock_buffer_ptr + lock_id, 0, -1, target_rank)
     __syncthreads()
 
 
@@ -44,7 +46,8 @@ def nvshmem_set_kernel(
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     if pid == 0 and tidx == 0:
-        libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
+        # libshmem_device.atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
+        int_atomic_swap(lock_buffer_ptr + lock_id, value, target_rank)
     __syncthreads()
 
 
@@ -91,7 +94,7 @@ class DistLock:
         assert buffer_id < self.num_locks
         # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
         # nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank, buffer_id)
-        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id)
+        nvshmem_poll_lock_kernel[(1, )](self.lock_buffers, target_rank % get_local_world_size(), buffer_id, extern_libs=NVSHMEM_EXTERN_LIBS)
     
     def notify_data(self, target_rank, buffer_id, accumulation_id):
         assert buffer_id < self.num_locks
