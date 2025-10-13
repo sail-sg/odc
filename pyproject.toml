@@ -1,0 +1,82 @@
+[build-system]
+requires = [
+    "setuptools>=62",
+    "setuptools_scm",
+    "wheel",
+    "cmake>=3.18",
+    "scikit-build-core>=0.3.3",
+    # "torch>=2.8.0",
+    "nvidia-nvshmem-cu12",
+    "nvshmem4py-cu12",
+    "triton>=3.4.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "odc"
+dynamic = ["version"]
+description = "Optimized Distributed Computing - Collection of distributed computing tools and bindings"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "triton>=3.4.0",
+    "nvidia-nvshmem-cu12",
+    "nvshmem4py-cu12",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/sail-sg/odc"
+Repository = "https://github.com/sail-sg/odc"
+Issues = "https://github.com/sail-sg/odc/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "black",
+    "isort",
+]
+
+[tool.scikit-build]
+# Protect the configuration against future changes in scikit-build-core
+minimum-version = "0.4"
+
+# Setuptools-style build caching in a local directory
+build-dir = "build/{wheel_tag}"
+
+# Build stable ABI wheels for CPython 3.12+
+wheel.py-api = "cp312"
+
+# Install the CMake artifacts into the wheel
+install.components = ["Runtime"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_BUILD_TYPE = "Release"
+
+[tool.setuptools_scm]
+write_to = "odc/_version.py"
+fallback_version = "0.1.0"
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 100
