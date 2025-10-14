@@ -16,8 +16,10 @@ find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 # Find PyTorch
 find_package(Torch REQUIRED)
 
-# Create the tensor_ipc shared library
-add_library(tensor_ipc SHARED
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+
+# Add the Python module
+pybind11_add_module(tensor_ipc
     binding.cpp
     tensor_ipc.cu
 )
@@ -28,10 +30,18 @@ set_target_properties(tensor_ipc PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
+message(STATUS "TORCH_DIR: ${TORCH_DIR}")
+find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_DIR}/lib")
+message(STATUS "TORCH_PYTHON_LIBRARY: ${TORCH_PYTHON_LIBRARY}")
+message(STATUS "TORCH_LIBRARIES: ${TORCH_LIBRARIES}")
+message(STATUS "CUDA_LIBRARIES: ${CUDA_LIBRARIES}")
+
 # Link libraries
-target_link_libraries(tensor_ipc 
+target_link_libraries(tensor_ipc PRIVATE
     ${TORCH_LIBRARIES}
+    ${TORCH_PYTHON_LIBRARY}
     ${CUDA_LIBRARIES}
+    cuda
 )
 
 # Include directories

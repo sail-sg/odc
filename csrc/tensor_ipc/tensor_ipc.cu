@@ -21,39 +21,8 @@
   }                                                   \
 } while(0)
 
-
-// __global__ void persistent_kernel(int *stop_flag) {
-//     while (true) {
-//         // Check stop flag in global memory
-//         if (atomicAdd(stop_flag, 0) != 0) {
-//             break;
-//         }
-
-//         // Do some fake work (or real work here)
-//         __nanosleep(1000000); // ~1ms sleep to yield SM
-
-//         // Note: Without nanosleep, this loop would hog the SM fully
-//     }
-// }
-
-// void launch_persistent_kernel(at::Tensor stop_flag) {
-//     persistent_kernel<<<1, 1>>>(stop_flag.data_ptr<int>());
-// }
-
 py::bytes get_ipc_handle(at::Tensor tensor) {
     void *ptr = (void*)tensor.data_ptr();
-
-    // std::vector<float> data(tensor.numel());
-    // CUDA_CHECK(cudaMemcpy(data.data(), ptr, tensor.numel() * sizeof(float), cudaMemcpyDeviceToHost));
-    // printf("original: ");
-    // for (int i = 0; i < tensor.numel(); i++) {
-    //     printf("%f ", data[i]);
-    // }
-    // printf("\n");
-    // // printf("ptr: %p\n", ptr);
-
-    // cudaPointerAttributes attr;
-    // CUDA_CHECK(cudaPointerGetAttributes(&attr, ptr));
 
     CUdeviceptr base;
     size_t size;
@@ -62,7 +31,6 @@ py::bytes get_ipc_handle(at::Tensor tensor) {
 
     size_t pointer_offset = (size_t)ptr - (size_t)base;
     
-
     cudaIpcMemHandle_t mem_handle;
     CUDA_CHECK(cudaIpcGetMemHandle(&mem_handle, (void*)base));
     std::string s;
@@ -81,14 +49,6 @@ at::Tensor reconstruct_tensor(py::bytes handle, std::vector<int64_t> shape, torc
   uint8_t *ptr = nullptr;
   CUDA_CHECK(cudaIpcOpenMemHandle((void**)&ptr, mem_handle, cudaIpcMemLazyEnablePeerAccess));
   ptr += pointer_offset;
-
-  // std::vector<float> data(shape[0]);
-  // CUDA_CHECK(cudaMemcpy(data.data(), ptr, shape[0] * sizeof(float), cudaMemcpyDeviceToHost));
-  // printf("reconstructed: ");
-  // for (int i = 0; i < shape[0]; i++) {
-  //   printf("%f ", data[i]);
-  // }
-  // printf("\n");
 
   return at::from_blob(ptr, shape, at::TensorOptions().dtype(dtype).device(at::kCUDA));
 }

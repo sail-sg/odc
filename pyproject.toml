@@ -7,7 +7,6 @@ requires = [
     "scikit-build-core>=0.3.3",
     # "torch>=2.8.0",
     "nvidia-nvshmem-cu12",
-    "nvshmem4py-cu12",
     "triton>=3.4.0",
 ]
 build-backend = "scikit_build_core.build"
@@ -25,7 +24,6 @@ dependencies = [
     "torch",
     "triton>=3.4.0",
     "nvidia-nvshmem-cu12",
-    "nvshmem4py-cu12",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

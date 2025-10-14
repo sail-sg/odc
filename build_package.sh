@@ -28,6 +28,9 @@ mkdir -p build
 echo "Building package..."
 python -m pip install build
 python -m pip install setuptools_scm
+python -m pip install -U pip setuptools wheel
+python -m pip install cmake>=3.18 scikit-build-core>=0.3.3
+python -m pip install nvidia-nvshmem-cu12
 python -m build --no-isolation --verbose
 
 echo "Build completed successfully!"
