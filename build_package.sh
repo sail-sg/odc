@@ -18,8 +18,8 @@ fi
 echo "Building odc package..."
 
 # Clean previous builds
-echo "Cleaning previous builds..."
-rm -rf build/ dist/ *.egg-info/
+# echo "Cleaning previous builds..."
+# rm -rf build/ dist/ *.egg-info/
 
 # Create build directory
 mkdir -p build
@@ -27,6 +27,7 @@ mkdir -p build
 # Build the package
 echo "Building package..."
 python -m pip install build
+python -m pip install setuptools_scm
 python -m build --no-isolation --verbose
 
 echo "Build completed successfully!"

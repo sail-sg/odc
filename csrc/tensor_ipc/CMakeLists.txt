@@ -12,6 +12,7 @@ if(NOT CUDA_FOUND)
     find_package(CUDA REQUIRED)
 endif()
 
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 # Find PyTorch
 find_package(Torch REQUIRED)
 
@@ -37,6 +38,7 @@ target_link_libraries(tensor_ipc
 target_include_directories(tensor_ipc PRIVATE
     ${TORCH_INCLUDE_DIRS}
     ${CUDA_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
 )
 
 # Compile definitions

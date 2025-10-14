@@ -78,8 +78,8 @@ at::Tensor reconstruct_tensor(py::bytes handle, std::vector<int64_t> shape, torc
   size_t pointer_offset;
   memcpy(&mem_handle, s.data(), sizeof(mem_handle));
   memcpy(&pointer_offset, s.data() + sizeof(mem_handle), sizeof(pointer_offset));
-  void *ptr;
-  CUDA_CHECK(cudaIpcOpenMemHandle(&ptr, mem_handle, cudaIpcMemLazyEnablePeerAccess));
+  uint8_t *ptr = nullptr;
+  CUDA_CHECK(cudaIpcOpenMemHandle((void**)&ptr, mem_handle, cudaIpcMemLazyEnablePeerAccess));
   ptr += pointer_offset;
 
   // std::vector<float> data(shape[0]);
