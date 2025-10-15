@@ -37,5 +37,5 @@ echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
 
 # Run pytest with any additional arguments passed to this script
 echo "Running pytest..."
-pytest "$@"
+pytest --ignore=3rdparty "$@"
 

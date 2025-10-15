@@ -91,7 +91,6 @@ NVSHMEM_EXTERN_LIBS = {
     LIB_NAME: BC_PATH,
 }
 
-
 @builtin
 def extern_elementwise(
     lib_name: str,
@@ -100,7 +99,22 @@ def extern_elementwise(
     arg_type_symbol_dict: dict,
     is_pure: bool,
     _semantic=None,
-    _builder=None,
+):
+    curr_version = version.parse(triton.__version__)
+    if curr_version >= version.parse("3.5.0"):
+        return extern_elementwise_v35(lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _semantic=_semantic)
+    else:
+        return extern_elementwise_v34(lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _semantic=_semantic)
+
+
+@builtin
+def extern_elementwise_v34(
+    lib_name: str,
+    lib_path: str,
+    args: list,
+    arg_type_symbol_dict: dict,
+    is_pure: bool,
+    _semantic=None,
 ):
     """
     NOTE: This function is modified from triton.language.core.extern_elementwise
@@ -113,11 +127,6 @@ def extern_elementwise(
         :param is_pure: whether the function is pure
         :return: the return value of the function
     """
-    if _builder is not None:
-        # Old triton versions
-        return extern_elementwise_with_builder(
-            lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _builder
-        )
     dispatch_args = args.copy()
     all_scalar = True
     ret_shape = None
@@ -133,39 +142,32 @@ def extern_elementwise(
     )
 
 
-# @builtin
-def extern_elementwise_with_builder(
-    lib_name: str,
-    lib_path: str,
-    args: list,
-    arg_type_symbol_dict: dict,
-    is_pure: bool,
-    _builder=None,
-):
-    """
-    NOTE: This function is modified from triton.language.core.extern_elementwise
+@builtin
+def extern_elementwise_v35(lib_name: str, lib_path: str, args: list, arg_type_symbol_dict: dict, is_pure: bool,
+                       _semantic=None):
+    '''
         Dispatch an elementwise function to a library
         :param lib_name: the name of the library
         :param lib_path: the path of the library
         :param args: the arguments of the function
         :param arg_type_symbol_dict: the type of the arguments
         :param is_pure: whether the function is pure
-        :param _builder: the builder
         :return: the return value of the function
-    """
+    '''
     dispatch_args = args.copy()
     all_scalar = True
-    ret_shape = None
     arg_types = []
     for i in builtins.range(len(dispatch_args)):
-        dispatch_args[i] = semantic.to_tensor(dispatch_args[i], _builder)
+        dispatch_args[i] = _semantic.to_tensor(dispatch_args[i])
         arg_types.append(dispatch_args[i].dtype)
         if dispatch_args[i].type.is_block():
             all_scalar = False
-    func = _builder.create_extern_elementwise
-    return dispatch(
-        func, lib_name, lib_path, dispatch_args, arg_type_symbol_dict, ret_shape, is_pure, _builder
-    )
+
+    arg_types = tuple(arg_types)
+    ret_type = arg_type_symbol_dict[arg_types][1]
+
+    func = _semantic.builder.create_extern_elementwise
+    return dispatch(func, lib_name, lib_path, dispatch_args, arg_type_symbol_dict, ret_type, is_pure, _semantic)
 
 
 @core.extern
@@ -198,15 +200,7 @@ def tid(axis: core.constexpr, _semantic=None):
 
 
 @core.extern
-def int_atomic_compare_swap(arg0, arg1, arg2, arg3, _semantic=None, _builder=None):
-    assert (_semantic is None) != (
-        _builder is None
-    ), "Exactly one of _semantic or _builder must be provided for different triton versions"
-    kwargs = {}
-    if _semantic is not None:
-        kwargs["_semantic"] = _semantic
-    if _builder is not None:
-        kwargs["_builder"] = _builder
+def int_atomic_compare_swap(arg0, arg1, arg2, arg3, _semantic=None):
     arg0.dtype = hashable_pointer_type.from_pointer_type(arg0.dtype)
     # arg0 = tl.cast(arg0, hashable_pointer_type(tl.int32), **kwargs)
 
@@ -221,7 +215,7 @@ def int_atomic_compare_swap(arg0, arg1, arg2, arg3, _semantic=None, _builder=Non
             ),
         },
         is_pure=False,
-        **kwargs,
+        _semantic=_semantic,
     )
 
 

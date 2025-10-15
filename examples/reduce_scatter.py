@@ -24,10 +24,10 @@ def main():
         reduction_service = ReductionService(accumulation_dtype=accum_dtype)
         cnt = 1
         times = 10
-        # size = 128 * (1024**2) + 1024
+        size = 128 * (1024**2) + 1024
         # cnt = 1
         # times = 2
-        size = 16 * (1000**0)
+        # size = 16 * (1000**0)
         # comp_sizes = torch.rand(cnt).tolist()
         comp_sizes = [2]
         group_count = 1
