@@ -4,6 +4,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import reduce
+from threading import Thread
 from typing import List, Mapping, Tuple
 
 import torch
@@ -31,6 +32,20 @@ from odc.primitives.utils import (
 )
 
 MAX_REQUEST_COUNT = 2 * 100000
+
+
+@triton.jit
+def sync_cta(signal_ptr, expected):
+    tidx = tid(axis=0)
+    if tidx == 0:
+        tl.atomic_add(signal_ptr, 1)
+    __syncthreads()
+    offsets = tl.arange(0, 1)
+    mask = offsets == 0
+    r = 0
+    while r < expected:
+        signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+        r = tl.max(signals)
 
 
 @triton.jit(do_not_specialize=["next_request_id", "accumulation_command", "need_accumulation"])
@@ -72,41 +87,17 @@ def nvshmem_reduce_scatter_kernel(
                 peer,
             )
 
-            if tidx == 0:
-                tl.atomic_add(signal_ptr, 1)
-            __syncthreads()
             expected += np
-            offsets = tl.arange(0, 1)
-            mask = offsets == 0
-            r = 0
-            while r < expected:
-                signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-                r = tl.max(signals)
+            sync_cta(signal_ptr, expected)
             if tidx == 0 and pid == 0:
                 quiet()
             __syncthreads()
 
-            if tidx == 0:
-                tl.atomic_add(signal_ptr, 1)
-            __syncthreads()
             expected += np
-            offsets = tl.arange(0, 1)
-            mask = offsets == 0
-            r = 0
-            while r < expected:
-                signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-                r = tl.max(signals)
+            sync_cta(signal_ptr, expected)
 
-    if tidx == 0:
-        tl.atomic_add(signal_ptr, 1)
-    __syncthreads()
     expected += np
-    offsets = tl.arange(0, 1)
-    mask = offsets == 0
-    r = 0
-    while r < expected:
-        signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-        r = tl.max(signals)
+    sync_cta(signal_ptr, expected)
 
     if pid == 0 and need_accumulation:
         if tidx == 0:
@@ -207,11 +198,9 @@ class ReductionWatcher:
     def wait_and_reset_task_count(self, expected):
         while self.task_count < expected:
             time.sleep(0)
-            # print(f"Rank {torch.cuda.current_device()} waiting for task count {self.task_count} < {expected}")
         self.task_count = 0
 
     def add_buffer(self, buffers):
-        # print(f"Rank {dist.get_rank()} adding buffer {accumulation} {buffer}")
         self.buffers.append([tensor_from_handle(*buffer) for buffer in buffers])
 
     def add_accumulation(self, accumulations):
@@ -269,7 +258,6 @@ def reduction_watcher_function(
     response_queue,
 ):
     torch.cuda.set_device(device_id)
-    import sys
 
     # torch.cuda.cudart().cudaProfilerStart()
     buffers = [tensor_from_handle(*buffer) for buffer in buffers]
@@ -278,8 +266,6 @@ def reduction_watcher_function(
     response_buffer = tensor_from_handle(*response_buffer)
 
     watcher = ReductionWatcher(world_size, accumulations, buffers, request_buffer, response_buffer)
-
-    from threading import Thread
 
     def cmd_thread():
         torch.cuda.set_device(device_id)

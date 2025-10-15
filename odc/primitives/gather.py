@@ -6,18 +6,11 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+from loguru import logger
 from torch import Tensor
 
-from odc.primitives import __syncthreads, getmem_nbi_block, quiet, tid, NVSHMEM_EXTERN_LIBS
-from odc.primitives.utils import (
-    BufferSplitter,
-    SymmBufferRegistry,
-    get_comm_stream,
-    get_local_world_pg,
-    get_local_world_size,
-    get_same_local_rank_pg,
-    init_nvshmem,
-)
+from odc.primitives import NVSHMEM_EXTERN_LIBS, __syncthreads, getmem_nbi_block, quiet, tid
+from odc.primitives.utils import BufferSplitter, SymmBufferRegistry, get_comm_stream
 
 
 @triton.jit
@@ -89,7 +82,7 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
     assert output_size >= buf_size, f"output_size: {output_size} < buf_size: {buf_size}"
 
     if (buffer_shape, output_tensor.dtype) not in shaped_buffer:
-        print(
+        logger.info(
             f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buf_size)} buf_size: {buf_size}"
         )
         shaped_buffer[
@@ -101,7 +94,6 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
 
     # peers = SymmBufferRegistry.get_instance().get_peer_tensors(input_tensor)
     grid = (torch.distributed.get_world_size(pg),)
-    # print(f"Rank {torch.distributed.get_rank(pg)} grid: {grid}")
     assert (input_tensor.numel() * input_tensor.element_size()) % (
         2**6
     ) == 0, "better align to 64 for efficiency"

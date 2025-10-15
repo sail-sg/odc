@@ -5,6 +5,7 @@ from typing import List
 import nvshmem.core
 import torch
 from cuda.core.experimental import Device
+from loguru import logger
 
 
 # From triton_dist.utils
@@ -15,7 +16,7 @@ def init_nvshmem():
         current_lib_paths.insert(0, os.environ["NVSHMEM_HOME"] + "/lib")
     os.environ["LD_LIBRARY_PATH"] = ":".join(current_lib_paths)
 
-    # print(f"init_nvshmem: {os.environ}")
+    logger.trace(f"init_nvshmem: {os.environ}")
     assert torch.distributed.is_initialized()
     # Extract rank, nranks from process group
     num_ranks = torch.distributed.get_world_size()
@@ -114,7 +115,6 @@ class SymmBufferRegistry:
 
     # we'll mark all symm buffer as dirty, and next update_symm_buffer will copy the data to the symm buffer
     def flush(self):
-
         self.updated.clear()
 
     def update_symm_buffer(self, buffer_key, values):
@@ -148,7 +148,7 @@ class SymmBufferRegistry:
         self.local_tensor[key] = tensors[local_rank]
 
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
-        print(
+        logger.info(
             f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}"
         )
         return self.local_tensor[key]

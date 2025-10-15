@@ -8,7 +8,7 @@ import triton
 import triton.compiler.compiler as compiler_module
 import triton.language as tl
 from packaging import version
-from triton.language import core, semantic
+from triton.language import core
 from triton.language.core import builtin, dispatch
 
 # Monkey patch the CompiledKernel._init_handles or it will crash on:
@@ -91,6 +91,7 @@ NVSHMEM_EXTERN_LIBS = {
     LIB_NAME: BC_PATH,
 }
 
+
 @builtin
 def extern_elementwise(
     lib_name: str,
@@ -102,9 +103,13 @@ def extern_elementwise(
 ):
     curr_version = version.parse(triton.__version__)
     if curr_version >= version.parse("3.5.0"):
-        return extern_elementwise_v35(lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _semantic=_semantic)
+        return extern_elementwise_v35(
+            lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _semantic=_semantic
+        )
     else:
-        return extern_elementwise_v34(lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _semantic=_semantic)
+        return extern_elementwise_v34(
+            lib_name, lib_path, args, arg_type_symbol_dict, is_pure, _semantic=_semantic
+        )
 
 
 @builtin
@@ -143,17 +148,23 @@ def extern_elementwise_v34(
 
 
 @builtin
-def extern_elementwise_v35(lib_name: str, lib_path: str, args: list, arg_type_symbol_dict: dict, is_pure: bool,
-                       _semantic=None):
-    '''
-        Dispatch an elementwise function to a library
-        :param lib_name: the name of the library
-        :param lib_path: the path of the library
-        :param args: the arguments of the function
-        :param arg_type_symbol_dict: the type of the arguments
-        :param is_pure: whether the function is pure
-        :return: the return value of the function
-    '''
+def extern_elementwise_v35(
+    lib_name: str,
+    lib_path: str,
+    args: list,
+    arg_type_symbol_dict: dict,
+    is_pure: bool,
+    _semantic=None,
+):
+    """
+    Dispatch an elementwise function to a library
+    :param lib_name: the name of the library
+    :param lib_path: the path of the library
+    :param args: the arguments of the function
+    :param arg_type_symbol_dict: the type of the arguments
+    :param is_pure: whether the function is pure
+    :return: the return value of the function
+    """
     dispatch_args = args.copy()
     all_scalar = True
     arg_types = []
@@ -167,7 +178,9 @@ def extern_elementwise_v35(lib_name: str, lib_path: str, args: list, arg_type_sy
     ret_type = arg_type_symbol_dict[arg_types][1]
 
     func = _semantic.builder.create_extern_elementwise
-    return dispatch(func, lib_name, lib_path, dispatch_args, arg_type_symbol_dict, ret_type, is_pure, _semantic)
+    return dispatch(
+        func, lib_name, lib_path, dispatch_args, arg_type_symbol_dict, ret_type, is_pure, _semantic
+    )
 
 
 @core.extern
