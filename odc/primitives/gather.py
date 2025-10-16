@@ -1,3 +1,4 @@
+import logging
 import math
 from collections import defaultdict
 from typing import List
@@ -6,11 +7,12 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
-from loguru import logger
 from torch import Tensor
 
 from odc.primitives import NVSHMEM_EXTERN_LIBS, __syncthreads, getmem_nbi_block, quiet, tid
 from odc.primitives.utils import BufferSplitter, SymmBufferRegistry, get_comm_stream
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit

@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import time
@@ -12,7 +13,6 @@ import torch.distributed as dist
 import torch.multiprocessing
 import triton
 import triton.language as tl
-from loguru import logger
 
 from odc.primitives import (
     NVSHMEM_EXTERN_LIBS,
@@ -31,6 +31,9 @@ from odc.primitives.utils import (
     get_comm_stream,
     get_local_world_size,
 )
+
+logger = logging.getLogger(__name__)
+
 
 MAX_REQUEST_COUNT = 2 * 100000
 
@@ -331,9 +334,8 @@ def call_watcher(watcher_handle, cmd, *args):
 
 
 def get_nvshmem_handle(tensor):
-
     logger.info(
-        f"Rank {torch.distributed.get_rank()} get_nvshmem_handle {tensor.data_ptr()} with shape {tensor.shape} and dtype {tensor.dtype}"
+        f"Rank {torch.distributed.get_rank()} get_nvshmem_handle {tensor.data_ptr()} with shape {tensor.shape} and dtype {tensor.dtype}",
     )
     handle = get_ipc_handle(tensor)
     return handle, tensor.numel(), tensor.dtype
@@ -358,7 +360,7 @@ class ReductionService:
         self.chunk_size_bytes = 2**20
 
     def get_chunk_size(self, buffer_dtype):
-        return (self.chunk_size_bytes // buffer_dtype.itemsize)
+        return self.chunk_size_bytes // buffer_dtype.itemsize
 
     def register(self, key, output_tensor_shape, grad_dtype, reduction_dtype):
         if self.reduction_watcher is None:
@@ -415,7 +417,7 @@ class ReductionService:
             output_size = reduce(lambda x, y: x * y, output_tensor_shape)
             buffer_size = reduce(lambda x, y: x * y, buffer_shape)
             logger.info(
-                f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buffer_size)} buffer_size: {buffer_size}"
+                f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buffer_size)} buffer_size: {buffer_size}",
             )
             cnt = len(self.shared_buffer)
             buffers = create_and_register_buffer(
@@ -492,10 +494,10 @@ class ReductionService:
                 assert world_size % grid_size == 0
                 _, rank_input_size = input_tensor.view(-1).view(world_size, -1).shape
                 nvshmem_reduce_scatter_kernel[(grid_size,)](
-                    input_tensor_ptr = input_tensor,
-                    rank_input_size = rank_input_size,
-                    input_segment_start = start,
-                    chunk_buffer = input_tensor_symm,
+                    input_tensor_ptr=input_tensor,
+                    rank_input_size=rank_input_size,
+                    input_segment_start=start,
+                    chunk_buffer=input_tensor_symm,
                     output_tensor_ptr=buf,
                     request_buffer_ptr=self.lock.request_buffer,
                     response_buffer_ptr=self.lock.response_buffer,

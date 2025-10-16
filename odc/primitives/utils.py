@@ -1,3 +1,4 @@
+import logging
 import os
 from functools import reduce
 from typing import List
@@ -5,7 +6,8 @@ from typing import List
 import nvshmem.core
 import torch
 from cuda.core.experimental import Device
-from loguru import logger
+
+logger = logging.getLogger(__name__)
 
 
 # From triton_dist.utils
@@ -16,7 +18,7 @@ def init_nvshmem():
         current_lib_paths.insert(0, os.environ["NVSHMEM_HOME"] + "/lib")
     os.environ["LD_LIBRARY_PATH"] = ":".join(current_lib_paths)
 
-    logger.trace(f"init_nvshmem: {os.environ}")
+    logger.debug(f"init_nvshmem: {os.environ}")
     assert torch.distributed.is_initialized()
     # Extract rank, nranks from process group
     num_ranks = torch.distributed.get_world_size()

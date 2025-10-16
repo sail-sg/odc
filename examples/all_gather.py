@@ -1,11 +1,40 @@
+import logging
 import os
+import sys
 
 import torch
 import torch.distributed as dist
+from loguru import logger
 from torch import Tensor
 
 from odc.primitives.gather import all_gather_into_tensor
 from odc.primitives.utils import SymmBufferRegistry, init_nvshmem
+
+
+class InterceptHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+
+logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+LOG_ERR_LEVELS = ["ERROR", "CRITICAL"]
+
+logger.add(
+    sys.stdout,
+    level="INFO",
+    filter=lambda record: record["level"].name not in LOG_ERR_LEVELS,
+)
+
+logger.add(
+    sys.stderr,
+    level="ERROR",
+    filter=lambda record: record["level"].name in LOG_ERR_LEVELS,
+)
 
 
 def all_gather_into_tensor_nccl(output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup):
