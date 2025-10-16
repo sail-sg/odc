@@ -19,6 +19,7 @@ class InterceptHandler(logging.Handler):
         logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
 
 
+logger.remove()
 logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
 LOG_ERR_LEVELS = ["ERROR", "CRITICAL"]
@@ -56,7 +57,7 @@ def main():
         size = 128 * (1024**2) + 1024
         # cnt = 1
         # times = 2
-        # size = 16 * (1000**0)
+        # size = 16
         # comp_sizes = torch.rand(cnt).tolist()
         comp_sizes = [2]
         group_count = 1
@@ -161,7 +162,6 @@ def main():
                 ):
                     reduction_service.sync(group)
                     for i in range(cnt):
-                        pass
                         # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.accumulations[i]}")
                         torch.testing.assert_close(
                             nccl_accumulations[i],
