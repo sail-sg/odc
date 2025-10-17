@@ -51,7 +51,7 @@ try:
     get_ipc_handle = tensor_ipc.get_ipc_handle
     reconstruct_tensor = tensor_ipc.reconstruct_tensor
 except ImportError as e:
-    raise ImportError(f"Failed to import {_lib_path}: {e}")
+    raise ImportError(f"Failed to import {_lib_path}: {e}") from e
 
 __all__ = [
     # nvshmem_triton

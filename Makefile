@@ -2,6 +2,8 @@
 lint:
 	black .
 	isort .
+	pylint odc
+	pylint tests
 
 .PHONY: test
 test:

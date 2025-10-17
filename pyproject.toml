@@ -50,6 +50,7 @@ dev = [
     "pytest>=8.0",
     "black",
     "isort",
+    "pylint>=4.0.0",
 ]
 
 [tool.scikit-build]

@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
-from torch.multiprocessing import Process
 
 from odc.primitives import (
     NVSHMEM_EXTERN_LIBS,
@@ -126,8 +125,6 @@ class ReductionWatcher:
 
     def run(self):
         while self.running:
-            block_size = triton.next_power_of_2(self.num_locks)
-
             self.cpu_lock_buffers.fill_(0)
             time.sleep(1 / 10000)
             # reduction_watcher_kernel[(1, )](self.lock_buffers, self.num_locks, BLOCK_SIZE=block_size)
@@ -159,7 +156,6 @@ def reduction_watcher_function(
     device_id, accumulations, buffers, lock_buffers, cmd_queue, response_queue
 ):
     torch.cuda.set_device(device_id)
-    import sys
 
     # torch.cuda.cudart().cudaProfilerStart()
     buffers = [tensor_from_handle(*buffer) for buffer in buffers]
@@ -230,7 +226,7 @@ class ReductionIntraNodeService:
         self.fixed_buffers = {}
         self.dispatched_tasks = 0
         self.accumulation_dtype = accumulation_dtype
-        self.rank_streams = defaultdict(lambda: torch.cuda.Stream())
+        self.rank_streams = defaultdict(torch.cuda.Stream)
 
     def pre_register(self, key, input_tensor, pg: dist.ProcessGroup):
         assert key not in self.accumulation_indices
@@ -405,7 +401,6 @@ class ReductionIntraNodeService:
 
         group_size = dist.get_world_size(pg)
         group_ranks = dist.get_process_group_ranks(pg)
-        group_idx = dist.get_rank(pg)
         accumulation_id = self.accumulation_indices[key] + 1
 
         size = buffer.numel()
@@ -436,7 +431,7 @@ class ReductionIntraNodeService:
             with torch.cuda.stream(stream):
                 self.lock.lock(target_rank=matching_rank_in_local_world, buffer_id=buffer_id)
 
-                for dst_group_idx, dst_rank, dst_local_rank in dst_rank_infos:
+                for dst_group_idx, _dst_rank, dst_local_rank in dst_rank_infos:
                     dst_buffer = peer_buffers[dst_group_idx]
                     dst_buffer.copy_(
                         input_tensor[dst_group_idx * size : (dst_group_idx + 1) * size],
@@ -491,7 +486,6 @@ class ReductionIntraNodeService:
             return
 
         same_local_rank_pg = get_same_local_rank_pg(pg)
-        same_local_rank_pg_ranks = dist.get_process_group_ranks(group=same_local_rank_pg)
 
         registry = SymmBufferRegistry.get_instance()
         local_peer_tensors = registry.get_local_peer_tensors(accumulation)

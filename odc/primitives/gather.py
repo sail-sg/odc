@@ -1,7 +1,5 @@
 import logging
 import math
-from collections import defaultdict
-from typing import List
 
 import torch
 import torch.distributed as dist
@@ -95,7 +93,6 @@ def all_gather_into_tensor(output_tensor: Tensor, input_tensor: Tensor, pg: dist
     target_tensor = shaped_buffer[(buffer_shape, output_tensor.dtype)]
 
     # peers = SymmBufferRegistry.get_instance().get_peer_tensors(input_tensor)
-    grid = (torch.distributed.get_world_size(pg),)
     assert (input_tensor.numel() * input_tensor.element_size()) % (
         2**6
     ) == 0, "better align to 64 for efficiency"

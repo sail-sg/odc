@@ -46,14 +46,14 @@ def test_atomic_compare_swap():
     nvshmem.core.init(device=dev, uid=uid, rank=0, nranks=1, initializer_method="uid")
 
     my_pe = nvshmem.core.my_pe()
-    n_pes = nvshmem.core.n_pes()
 
     # Create shared tensors
     target = nvshmem.core.tensor((1,), dtype=torch.int32)
     results = nvshmem.core.tensor((10,), dtype=torch.int32)  # Store results from 10 threads
 
     # Initialize values
-    target[0] = 5  # Start with value 5
+    init_value = 5
+    target[0] = init_value  # Start with value 5
     results[:] = -1  # Initialize results with invalid values
 
     print(f"[PE {my_pe}] Initial target value: {target[0].item()}")
@@ -83,14 +83,14 @@ def test_atomic_compare_swap():
 
     # Analyze the results
     print(f"\n[PE {my_pe}] Analysis:")
-    print(f"  Initial value: 5")
+    print(f"  Initial value: {init_value}")
     print(f"  Final value: {target[0].item()}")
-    print(f"  Expected final value: {5 + num_threads} (5 + number of threads)")
+    print(f"  Expected final value: {5 + num_threads} ({init_value} + number of threads)")
 
     # Check if exactly one thread succeeded (got the original value 5)
     successful_threads = sum(1 for val in results_cpu if val == 5)
     print(f"  Number of threads that got original value (5): {successful_threads}")
-    print(f"  Expected: 1 (only one thread should succeed)")
+    print("  Expected: 1 (only one thread should succeed)")
     assert successful_threads == 1, "Only one thread should succeed"
 
     # Cleanup
@@ -136,14 +136,14 @@ def test_atomic_swap():
     nvshmem.core.init(device=dev, uid=uid, rank=0, nranks=1, initializer_method="uid")
 
     my_pe = nvshmem.core.my_pe()
-    n_pes = nvshmem.core.n_pes()
 
     # Create shared tensors
     target = nvshmem.core.tensor((1,), dtype=torch.int32)
     results = nvshmem.core.tensor((10,), dtype=torch.int32)  # Store results from 10 threads
 
     # Initialize values
-    target[0] = 5  # Start with value 5
+    init_value = 5
+    target[0] = init_value  # Start with value 5
     results[:] = -1  # Initialize results with invalid values
 
     print(f"[PE {my_pe}] Initial target value: {target[0].item()}")
@@ -173,7 +173,7 @@ def test_atomic_swap():
 
     # Analyze the results
     print(f"\n[PE {my_pe}] Analysis:")
-    print(f"  Initial value: 5")
+    print(f"  Initial value: {init_value}")
     print(f"  Final value: {target[0].item()}")
     print(f"  Expected final value: {100} (last thread's new value)")
 

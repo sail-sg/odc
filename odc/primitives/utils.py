@@ -23,8 +23,6 @@ def init_nvshmem():
     # Extract rank, nranks from process group
     num_ranks = torch.distributed.get_world_size()
     rank_id = torch.distributed.get_rank()
-    local_world_size = get_local_world_size()
-    local_rank = rank_id % get_local_world_size()
 
     pg = torch.distributed.group.WORLD
 
@@ -134,7 +132,6 @@ class SymmBufferRegistry:
     def allocate_symm_buffer(self, key, shape, dtype):
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
         local_world_size = get_local_world_size()
         local_rank = rank % local_world_size
         # peer_tensors = []

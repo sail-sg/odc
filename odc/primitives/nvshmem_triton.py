@@ -25,7 +25,6 @@ def patched_init_handles(self):
     enable_nvshmem = any(lib_name in (LIB_NAME, LIB_NVSHMEM_NAME) for lib_name, _ in extern_libs)
     # print(f"extern_libs: {extern_libs} enable_nvshmem: {enable_nvshmem}")
     # Check if kernel uses NVSHMEM
-    global nvshmem_init_kernels
     key = (self.name, self.module)
     if enable_nvshmem and key not in nvshmem_init_kernels:
         assert self.module is not None, "Module is None"
@@ -139,14 +138,11 @@ def extern_elementwise_v34(
         :return: the return value of the function
     """
     dispatch_args = args.copy()
-    all_scalar = True
     ret_shape = None
     arg_types = []
     for i in builtins.range(len(dispatch_args)):
         dispatch_args[i] = _semantic.to_tensor(dispatch_args[i])
         arg_types.append(dispatch_args[i].dtype)
-        if dispatch_args[i].type.is_block():
-            all_scalar = False
     func = _semantic.builder.create_extern_elementwise
     return dispatch(
         func, lib_name, lib_path, dispatch_args, arg_type_symbol_dict, ret_shape, is_pure, _semantic
@@ -172,13 +168,10 @@ def extern_elementwise_v35(
     :return: the return value of the function
     """
     dispatch_args = args.copy()
-    all_scalar = True
     arg_types = []
     for i in builtins.range(len(dispatch_args)):
         dispatch_args[i] = _semantic.to_tensor(dispatch_args[i])
         arg_types.append(dispatch_args[i].dtype)
-        if dispatch_args[i].type.is_block():
-            all_scalar = False
 
     arg_types = tuple(arg_types)
     ret_type = arg_type_symbol_dict[arg_types][1]
@@ -206,6 +199,7 @@ def _tid_wrapper(axis: core.constexpr, _semantic=None):
     )
 
 
+# pylint: disable=inconsistent-return-statements
 @core.extern
 def tid(axis: core.constexpr, _semantic=None):
     if axis == 0:
