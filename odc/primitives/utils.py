@@ -107,7 +107,6 @@ class SymmBufferRegistry:
         self.local_tensor_to_keys = {}
         self.updated = set()
         self.peer_tensors = {}
-        self.peer_tensors_same_node = {}
         self.allocations = []
 
     @classmethod
@@ -149,17 +148,13 @@ class SymmBufferRegistry:
         tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
         self.allocations.append(tensors[local_rank])
         self.local_tensor[key] = tensors[local_rank]
-        self.peer_tensors_same_node[key] = tensors
+        self.peer_tensors[key] = tensors
 
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
         logger.info(
             f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}"
         )
         return self.local_tensor[key]
-
-    def get_peer_tensors_same_node(self, local_tensor):
-        buffer_key = self.local_tensor_to_keys[local_tensor.data_ptr()]
-        return self.peer_tensors_same_node[buffer_key]
 
     def get_local_peer_tensors(self, local_tensor):
         peer_tensors = self.get_peer_tensors(local_tensor)
@@ -182,7 +177,6 @@ class SymmBufferRegistry:
         self.local_tensor_to_keys.clear()
         self.updated.clear()
         self.peer_tensors.clear()
-        self.peer_tensors_same_node.clear()
 
 
 same_local_rank_pg = None

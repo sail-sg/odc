@@ -7,6 +7,7 @@ import torch.distributed as dist
 from loguru import logger
 
 from odc.primitives.scatter_accumulate import ReductionService
+from odc.primitives.scatter_accumulate_intra_node import ReductionIntraNodeService
 from odc.primitives.utils import SymmBufferRegistry, init_nvshmem
 
 
@@ -42,9 +43,7 @@ def main():
     try:
         torch.cuda.set_device(f"cuda:{int(os.environ['RANK']) % torch.cuda.device_count()}")
         torch.distributed.init_process_group("nccl")
-        # torch.distributed.barrier()
         init_nvshmem()
-        # test_request_response()
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
 
@@ -52,6 +51,7 @@ def main():
         grad_dtype = torch.float32
 
         reduction_service = ReductionService(accumulation_dtype=accum_dtype)
+        # reduction_service = ReductionIntraNodeService(accumulation_dtype=accum_dtype)
         cnt = 1
         times = 10
         size = 128 * (1024**2) + 1024
@@ -112,13 +112,22 @@ def main():
         def reduce_scatter_accumulation(src_tensor, dest_idx, pg: dist.ProcessGroup):
             reduction_service.reduce_scatter_accumulation(dest_idx, src_tensor, pg)
 
-        def reduce_scatter_accumulation_nccl_comm(src_tensor, dest_idx, pg: dist.ProcessGroup):
-            reduction_service.reduce_scatter_accumulation_nccl_comm(dest_idx, src_tensor, pg)
-
         dist.barrier()
         torch.cuda.synchronize()
         comp_stream = torch.cuda.Stream()
-        #   for reduce_scatter_func in [reduce_scatter_accumulation_nccl, reduce_scatter_accumulation, reduce_scatter_accumulation_nccl_p2p]:
+
+        sync_inputs = torch.zeros(world_size, dtype=torch.int32, device="cuda")
+
+        reduction_service.clear_accumulations()
+        with torch.cuda.nvtx.range("reduce_scatter_accumulation"):
+            for i in range(cnt * times):
+                dst_idx = i % cnt
+                torch.distributed.all_reduce(sync_inputs, group=group)
+                reduce_scatter_accumulation(data[i], dst_idx, group)
+            reduction_service.sync(group)
+            dist.barrier()
+            torch.cuda.synchronize()
+
         for reduce_scatter_func in [
             reduce_scatter_accumulation_nccl,
             reduce_scatter_accumulation,
@@ -133,7 +142,7 @@ def main():
 
                 for i in range(cnt * times):
                     dst_idx = i % cnt
-                    torch.distributed.barrier(group)
+                    torch.distributed.all_reduce(sync_inputs, group=group)
 
                     if i == cnt:
                         start.record()
@@ -156,10 +165,7 @@ def main():
                 end = torch.cuda.Event(enable_timing=True)
                 end.record()
 
-                if (
-                    reduce_scatter_func == reduce_scatter_accumulation
-                    or reduce_scatter_func == reduce_scatter_accumulation_nccl_comm
-                ):
+                if reduce_scatter_func == reduce_scatter_accumulation:
                     reduction_service.sync(group)
                     for i in range(cnt):
                         # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.accumulations[i]}")

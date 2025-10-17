@@ -16,15 +16,21 @@ from triton.language.core import builtin, dispatch
 original_init_handles = compiler_module.CompiledKernel._init_handles
 
 
+nvshmem_init_kernels = set()
+
+
 def patched_init_handles(self):
     original_init_handles(self)
     extern_libs = self.metadata.extern_libs
     enable_nvshmem = any(lib_name in (LIB_NAME, LIB_NVSHMEM_NAME) for lib_name, _ in extern_libs)
     # print(f"extern_libs: {extern_libs} enable_nvshmem: {enable_nvshmem}")
     # Check if kernel uses NVSHMEM
-    if enable_nvshmem:
+    global nvshmem_init_kernels
+    key = (self.name, self.module)
+    if enable_nvshmem and key not in nvshmem_init_kernels:
         assert self.module is not None, "Module is None"
         nvshmem.bindings.nvshmem.cumodule_init(self.module)
+        nvshmem_init_kernels.add(key)
 
 
 compiler_module.CompiledKernel._init_handles = patched_init_handles
