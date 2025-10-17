@@ -116,10 +116,53 @@ def nvshmem_reduce_scatter_kernel(
         __syncthreads()
 
 
-@triton.jit(do_not_specialize=["rank", "world_size", "accumulation_command"])
-def nvshmem_request_accumulation_kernel(
+@triton.jit(do_not_specialize=["rank", "peer", "accumulation_command"])
+def nvshmem_request_accumulation_same_node_kernel(
     request_buffer_ptr,
     rank,
+    peer,
+    accumulation_command,
+):
+    pid = tl.program_id(axis=0)
+    tidx = tid(axis=0)
+    if pid == 0:
+        if tidx == 0:
+            int_p(request_buffer_ptr + rank, accumulation_command, peer)
+        __syncthreads()
+
+
+@triton.jit(do_not_specialize=["rank", "peer", "next_request_id"])
+def nvshmem_wait_accumulation_same_node_kernel(
+    response_buffer_ptr,
+    rank,
+    peer,
+    next_request_id,
+):
+    pid = tl.program_id(axis=0)
+    tidx = tid(axis=0)
+    if pid == 0:
+        if tidx == 0:
+            r = next_request_id - 1
+            while r != next_request_id:
+                quiet()
+                r = int_g(response_buffer_ptr + rank, peer)
+        __syncthreads()
+
+
+@triton.jit(
+    do_not_specialize=[
+        "rank",
+        "rank_start_same_node",
+        "rank_end_same_node",
+        "world_size",
+        "accumulation_command",
+    ]
+)
+def nvshmem_request_accumulation_remote_node_kernel(
+    request_buffer_ptr,
+    rank,
+    rank_start_same_node,
+    rank_end_same_node,
     world_size,
     accumulation_command,
 ):
@@ -128,14 +171,25 @@ def nvshmem_request_accumulation_kernel(
     if pid == 0:
         if tidx == 0:
             for peer in range(world_size):
-                int_p(request_buffer_ptr + rank, accumulation_command, peer)
+                if peer < rank_start_same_node or peer >= rank_end_same_node:
+                    int_p(request_buffer_ptr + rank, accumulation_command, peer)
         __syncthreads()
 
 
-@triton.jit(do_not_specialize=["rank", "world_size", "next_request_id"])
-def nvshmem_wait_accumulation_kernel(
+@triton.jit(
+    do_not_specialize=[
+        "rank",
+        "rank_start_same_node",
+        "rank_end_same_node",
+        "world_size",
+        "next_request_id",
+    ]
+)
+def nvshmem_wait_accumulation_remote_node_kernel(
     response_buffer_ptr,
     rank,
+    rank_start_same_node,
+    rank_end_same_node,
     world_size,
     next_request_id,
 ):
@@ -144,10 +198,11 @@ def nvshmem_wait_accumulation_kernel(
     if pid == 0:
         if tidx == 0:
             for peer in range(world_size):
-                r = next_request_id - 1
-                while r != next_request_id:
-                    quiet()
-                    r = int_g(response_buffer_ptr + rank, peer)
+                if peer < rank_start_same_node or peer >= rank_end_same_node:
+                    r = next_request_id - 1
+                    while r != next_request_id:
+                        quiet()
+                        r = int_g(response_buffer_ptr + rank, peer)
         __syncthreads()
 
 
@@ -373,11 +428,8 @@ class ReductionService:
         self.input_buffer = {}
         self.dispatched_tasks = 0
         self.accumulation_dtype = accumulation_dtype
-        self.send_streams = defaultdict(lambda: torch.cuda.Stream())
-        self.recv_streams = defaultdict(lambda: torch.cuda.Stream())
-        self.buffer_shape_cache = {}
         self.buffer_splitter = BufferSplitter()
-        self.copy_stream = torch.cuda.Stream()
+        self.rank_streams = defaultdict(lambda: torch.cuda.Stream())
         self.chunk_size_bytes = 2**20
 
     def get_chunk_size(self, buffer_dtype):
@@ -428,6 +480,10 @@ class ReductionService:
         if os.getenv("ODC_RS_DISABLE_SPLIT_TRANS_BUFFER", "0") != "1":
             buffer_size = self.buffer_splitter.get_local_buffer_size(
                 output_tensor_shape, world_size
+            )
+            output_size = reduce(lambda x, y: x * y, output_tensor_shape)
+            logger.warning(
+                f"buffer_size: {buffer_size} output_size: {output_size} num_split: {math.ceil(output_size / buffer_size)}"
             )
             buffer_shape = (buffer_size,)
         else:
@@ -500,8 +556,12 @@ class ReductionService:
         ) == 0, "better align to 64 for efficiency"
 
         get_comm_stream().wait_stream(torch.cuda.current_stream())
+        rank_start_same_node = rank - rank % get_local_world_size()
+        rank_end_same_node = rank_start_same_node + get_local_world_size()
+        for local_peer in range(rank_start_same_node, rank_end_same_node):
+            self.rank_streams[local_peer].wait_stream(torch.cuda.current_stream())
 
-        # Is split_trans_buffer is False,
+        # If split_trans_buffer is False,
         # we can avoid multiple requests to server
         # but need to use more memory for the trans buffer.
         split_trans_buffer = buffer.numel() < output_size
@@ -521,10 +581,7 @@ class ReductionService:
                 _, rank_input_size = input_tensor.view(-1).view(world_size, -1).shape
 
                 # Use another kernel for the ranks in the same node.
-                rank_start_same_node = rank - rank % get_local_world_size()
-                local_peer_buffers = SymmBufferRegistry.get_instance().get_peer_tensors(
-                    buffer
-                )
+                local_peer_buffers = SymmBufferRegistry.get_instance().get_peer_tensors(buffer)
                 for i in range(get_local_world_size()):
                     peer_idx = (rank % get_local_world_size() + i) % get_local_world_size()
                     local_peer = rank_start_same_node + peer_idx
@@ -534,10 +591,12 @@ class ReductionService:
                         peer_buf = local_peer_buffer[:size]
                     else:
                         peer_buf = local_peer_buffer[start : start + size]
-                    # with torch.cuda.stream(self.copy_stream):
-                    peer_buf.copy_(
-                        input_tensor[rank_input_start : rank_input_start + size], non_blocking=True
-                    )
+                    stream = self.rank_streams[local_peer]
+                    with torch.cuda.stream(stream):
+                        peer_buf.copy_(
+                            input_tensor[rank_input_start : rank_input_start + size],
+                            non_blocking=True,
+                        )
 
                 nvshmem_reduce_scatter_kernel[(grid_size,)](
                     input_tensor_ptr=input_tensor,
@@ -556,17 +615,39 @@ class ReductionService:
                     extern_libs=NVSHMEM_EXTERN_LIBS,
                 )
                 if need_accumulation:
-                    nvshmem_request_accumulation_kernel[(1,)](
+                    for local_peer in range(rank_start_same_node, rank_end_same_node):
+                        with torch.cuda.stream(self.rank_streams[local_peer]):
+                            nvshmem_request_accumulation_same_node_kernel[(1,)](
+                                request_buffer_ptr=self.lock.request_buffer,
+                                rank=rank,
+                                peer=local_peer,
+                                accumulation_command=accumulation_command,
+                                num_warps=1,
+                                extern_libs=NVSHMEM_EXTERN_LIBS,
+                            )
+                            nvshmem_wait_accumulation_same_node_kernel[(1,)](
+                                response_buffer_ptr=self.lock.response_buffer,
+                                rank=rank,
+                                peer=local_peer,
+                                next_request_id=self.lock.client_context.next_request_id,
+                                num_warps=1,
+                                extern_libs=NVSHMEM_EXTERN_LIBS,
+                            )
+                    nvshmem_request_accumulation_remote_node_kernel[(1,)](
                         request_buffer_ptr=self.lock.request_buffer,
                         rank=rank,
+                        rank_start_same_node=rank_start_same_node,
+                        rank_end_same_node=rank_end_same_node,
                         world_size=world_size,
                         accumulation_command=accumulation_command,
                         num_warps=1,
                         extern_libs=NVSHMEM_EXTERN_LIBS,
                     )
-                    nvshmem_wait_accumulation_kernel[(1,)](
+                    nvshmem_wait_accumulation_remote_node_kernel[(1,)](
                         response_buffer_ptr=self.lock.response_buffer,
                         rank=rank,
+                        rank_start_same_node=rank_start_same_node,
+                        rank_end_same_node=rank_end_same_node,
                         world_size=world_size,
                         next_request_id=self.lock.client_context.next_request_id,
                         num_warps=1,
@@ -576,6 +657,8 @@ class ReductionService:
                     if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
                         self.lock.client_context.next_request_id = 1
                     self.dispatched_tasks += 1
+        for local_peer in range(rank_start_same_node, rank_end_same_node):
+            torch.cuda.current_stream().wait_stream(self.rank_streams[local_peer])
         torch.cuda.current_stream().wait_stream(get_comm_stream())
         # nvshmem.core.quiet(stream=torch.cuda.current_stream())
 
