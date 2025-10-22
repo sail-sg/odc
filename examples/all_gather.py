@@ -7,7 +7,7 @@ import torch.distributed as dist
 from loguru import logger
 from torch import Tensor
 
-from odc.primitives.gather import all_gather_into_tensor
+from odc.primitives.gather import GatherService
 from odc.primitives.utils import SymmBufferRegistry, init_nvshmem
 
 
@@ -88,8 +88,10 @@ if __name__ == "__main__":
             src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
             # all_gather_sync_cache(src_tensors[i], group)
 
+        gather_service = GatherService()
+
         comp_stream = torch.cuda.Stream()
-        for all_gather_func in [all_gather_into_tensor_nccl, all_gather_into_tensor]:
+        for all_gather_func in [all_gather_into_tensor_nccl, gather_service.all_gather_into_tensor]:
             with torch.cuda.nvtx.range(all_gather_func.__name__):
                 start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
                 comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]

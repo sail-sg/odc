@@ -26,30 +26,18 @@ from odc.primitives import (
     tid,
 )
 from odc.primitives.utils import (
+    PROCESS_GROUP_RANKS_TENSORS,
     BufferSplitter,
     SymmBufferRegistry,
     get_comm_stream,
     get_local_world_size,
+    sync_cta,
 )
 
 logger = logging.getLogger(__name__)
 
 
 MAX_REQUEST_COUNT = 2 * 100000
-
-
-@triton.jit
-def sync_cta(signal_ptr, expected):
-    tidx = tid(axis=0)
-    if tidx == 0:
-        tl.atomic_add(signal_ptr, 1)
-    __syncthreads()
-    offsets = tl.arange(0, 1)
-    mask = offsets == 0
-    r = 0
-    while r < expected:
-        signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
-        r = tl.max(signals)
 
 
 @triton.jit(do_not_specialize=[])
@@ -438,14 +426,6 @@ class ReductionService:
         self.buffer_splitter = BufferSplitter()
         self.rank_streams = defaultdict(torch.cuda.Stream)
         self.chunk_size_bytes = 2**20
-        self.pg_ranks_cache = {}
-
-    def get_pg_ranks_tensor(self, pg: dist.ProcessGroup):
-        if pg not in self.pg_ranks_cache:
-            pg_ranks = dist.get_process_group_ranks(group=pg)
-            pg_ranks_tensor = torch.tensor(pg_ranks, dtype=torch.int32, device="cuda")
-            self.pg_ranks_cache[pg] = pg_ranks_tensor
-        return self.pg_ranks_cache[pg]
 
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
@@ -575,7 +555,7 @@ class ReductionService:
         for local_peer in range(rank_start_same_node, rank_end_same_node):
             self.rank_streams[local_peer].wait_stream(torch.cuda.current_stream())
 
-        pg_ranks_tensor = self.get_pg_ranks_tensor(pg)
+        pg_ranks_tensor = PROCESS_GROUP_RANKS_TENSORS.get_pg_ranks_tensor(pg)
 
         # If split_trans_buffer is False,
         # we can avoid multiple requests to server

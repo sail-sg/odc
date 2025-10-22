@@ -5,7 +5,11 @@ from typing import List
 
 import nvshmem.core
 import torch
+import triton
+import triton.language as tl
 from cuda.core.experimental import Device
+
+from odc.primitives import __syncthreads, tid
 
 logger = logging.getLogger(__name__)
 
@@ -246,3 +250,32 @@ class BufferSplitter:
         local_max_buffer_size = max_buffer_size // world_size
         buf_size = min(local_max_buffer_size, original_size)
         return buf_size
+
+
+@triton.jit
+def sync_cta(signal_ptr, expected):
+    tidx = tid(axis=0)
+    if tidx == 0:
+        tl.atomic_add(signal_ptr, 1)
+    __syncthreads()
+    offsets = tl.arange(0, 1)
+    mask = offsets == 0
+    r = 0
+    while r < expected:
+        signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
+        r = tl.max(signals)
+
+
+class ProcessGroupRanksTensors:
+    def __init__(self):
+        self.pg_ranks_cache = {}
+
+    def get_pg_ranks_tensor(self, pg: torch.distributed.ProcessGroup):
+        if pg not in self.pg_ranks_cache:
+            pg_ranks = torch.distributed.get_process_group_ranks(group=pg)
+            pg_ranks_tensor = torch.tensor(pg_ranks, dtype=torch.int32, device="cuda")
+            self.pg_ranks_cache[pg] = pg_ranks_tensor
+        return self.pg_ranks_cache[pg]
+
+
+PROCESS_GROUP_RANKS_TENSORS = ProcessGroupRanksTensors()
