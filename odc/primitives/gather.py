@@ -37,7 +37,7 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
 
     tidx = tid(axis=0)
     expected = 0
-    for i in range(num_nodes):
+    for i in range(1, num_nodes):
         peer_node = (i + global_rank // np) % num_nodes
         peer = (pid + peer_node * np) % world_size
         # chunk_size = elem_per_rank // num_chunks
@@ -94,11 +94,30 @@ class GatherService:
         # assert input_tensor.numel() % chunk_size == 0
 
         pg_ranks_tensor = PROCESS_GROUP_RANKS_TENSORS.get_pg_ranks_tensor(pg)
+        registry = SymmBufferRegistry.get_instance()
+        peer_tensors = registry.get_peer_tensors(input_tensor)
+        group_rank = torch.distributed.get_rank(group=pg)
 
         world_size = torch.distributed.get_world_size(pg)
         get_comm_stream().wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(get_comm_stream()):
             output_tensor_split = output_tensor.view(world_size, -1)
+            # TODO: support ODC_HYBRID_WORLD_SIZE > 1
+            # In this case, we need to avoid copying tensors using getmem_nbi_block
+            # between nodes within the same odc hybrid group.
+            # The copy has been done below via mem-copy.
+            # local_group_size can be
+            # 1. #gpus on single node for multi-node settings.
+            # 2. #gpus on single node for single node settings.
+            # 3. #gpus on multi-nodes within a hybrid group. There can be multiple hybrid groups.
+            local_group_size = len(peer_tensors)
+            local_group_rank = group_rank % local_group_size
+            rank_on_same_node_start = group_rank - local_group_rank
+            rank_on_same_node_end = rank_on_same_node_start + local_group_size
+            for r_offset in range(local_group_size):
+                src_group_rank = (local_group_rank + r_offset) % local_group_size
+                output_tensor_split[src_group_rank].copy_(peer_tensors[src_group_rank])
+
             assert buf_size % world_size == 0
             local_buf_size = buf_size // world_size
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
@@ -128,9 +147,17 @@ class GatherService:
                     extern_libs=NVSHMEM_EXTERN_LIBS,
                 )
                 if buf_size == output_size:
-                    output_tensor.copy_(target_tensor)
+                    local_group_data_size = size * local_group_size
+                    local_group_idx = group_rank // local_group_size
+                    data_start_idx = local_group_data_size * local_group_idx
+                    data_end_idx = data_start_idx + local_group_data_size
+                    output_tensor[:data_start_idx].copy_(target_tensor[:data_start_idx])
+                    output_tensor[data_end_idx:].copy_(target_tensor[data_end_idx:])
+                    # output_tensor.copy_(target_tensor)
                 else:
                     for r in range(world_size):
+                        if rank_on_same_node_start <= r < rank_on_same_node_end:
+                            continue
                         output_tensor_split[r, start : start + size].copy_(
                             target_tensor_split[r, :]
                         )
