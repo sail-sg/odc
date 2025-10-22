@@ -12,6 +12,12 @@ logger = logging.getLogger(__name__)
 
 # From triton_dist.utils
 def init_nvshmem():
+    """
+    Initialize NVSHMEM on the global process group.
+    The symmetric tensors are initialized on the global process group.
+    When using other process groups,
+    we need to convert the group rank to the global rank to use nvshmem functions.
+    """
     assert "NVSHMEM_HOME" in os.environ
     current_lib_paths = os.environ.get("LD_LIBRARY_PATH", "").split(":")
     if os.environ["NVSHMEM_HOME"] not in current_lib_paths:
@@ -27,8 +33,6 @@ def init_nvshmem():
     pg = torch.distributed.group.WORLD
 
     # Create an empty uniqueid for all ranks
-
-    # if num_ranks > torch.cuda.device_count():
     broadcast_objects = [nvshmem.core.get_unique_id(empty=rank_id != 0)]
     torch.distributed.broadcast_object_list(broadcast_objects, src=0, group=pg)
     torch.distributed.barrier(group=pg)
@@ -39,22 +43,6 @@ def init_nvshmem():
         nranks=num_ranks,
         initializer_method="uid",
     )
-    # else:
-    #     # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
-    #     all_gather_objects = [nvshmem.core.get_unique_id(empty=local_rank != 0)]
-    #     res = [None for _ in range(num_ranks)]
-    #     torch.distributed.all_gather_object(
-    #         res, all_gather_objects, group=pg
-    #     )
-    #     torch.distributed.barrier(group=pg)
-    #     uid = res[rank_id // local_world_size * local_world_size]
-    #     nvshmem.core.init(
-    #         device=Device(torch.cuda.current_device()),
-    #         uid=uid[0],
-    #         rank=local_rank,
-    #         nranks=local_world_size,
-    #         initializer_method="uid",
-    #     )
 
     # nvshmem.core.utils._configure_logging("DEBUG")
 
@@ -66,25 +54,19 @@ def nvshmem_create_tensor(shape, dtype) -> torch.Tensor:
     return tensor
 
 
-def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Tensor]:
-
-    def get_peer_tensor(t, peer) -> torch.Tensor:
+def get_same_node_tensors(tensor, rank, local_world_size) -> List[torch.Tensor]:
+    def get_same_node_peer_tensor(t, peer) -> torch.Tensor:
         # avoid create tensor on the same buf again. nvshmem4py can't handle multiple reference with grace. so we handle it here.
         # https://forums.developer.nvidia.com/t/nvshmem4py-nvshmem-core-finalize-does-not-handle-everything/337979
         if peer == rank:
             return t
         return nvshmem.core.get_peer_tensor(t, peer)
-        # TODO: This is a hack as currently nvshmem doesn't work cross node. So we init nvshmem only within node.
-        # return nvshmem.core.get_peer_tensor(t, peer % local_world_size)
 
     local_rank = rank % local_world_size
     rank_on_same_node_start = rank - local_rank
     rank_on_same_node_end = rank_on_same_node_start + local_world_size
-    torch.cuda.synchronize()
-    tensor = nvshmem_create_tensor(shape, dtype=dtype)
-    torch.cuda.synchronize()
     return [
-        get_peer_tensor(tensor, peer)
+        get_same_node_peer_tensor(tensor, peer)
         for peer in range(rank_on_same_node_start, rank_on_same_node_end)
     ]
 
@@ -133,19 +115,17 @@ class SymmBufferRegistry:
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
         local_world_size = get_local_world_size()
-        local_rank = rank % local_world_size
-        # peer_tensors = []
-        # for node_rank in range(world_size // local_world_size):
-        #     tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
-        #     self.allocations.append(tensors[local_rank])
-        #     peer_tensors.extend(tensors)
-        # assert len(peer_tensors) == world_size
-        # self.peer_tensors[key] = peer_tensors
-        # self.local_tensor[key] = self.peer_tensors[key][rank]
-        tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
-        self.allocations.append(tensors[local_rank])
-        self.local_tensor[key] = tensors[local_rank]
-        self.peer_tensors[key] = tensors
+        odc_hybrid_world_size = os.environ.get("ODC_HYBRID_WORLD_SIZE", local_world_size)
+        peer_tensors = []
+        for _node_rank in range(odc_hybrid_world_size // local_world_size):
+            tensor = nvshmem_create_tensor(shape, dtype)
+            same_node_tensors = get_same_node_tensors(tensor, rank, local_world_size)
+            self.allocations.append(tensor)
+            peer_tensors.extend(same_node_tensors)
+        assert len(peer_tensors) == odc_hybrid_world_size
+        # tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
+        self.local_tensor[key] = peer_tensors[rank]
+        self.peer_tensors[key] = peer_tensors
 
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
         logger.info(
@@ -164,6 +144,7 @@ class SymmBufferRegistry:
         return key in self.local_tensor
 
     def get_peer_tensors(self, local_tensor):
+        # Returns tensors in the same node.
         buffer_key = self.local_tensor_to_keys[local_tensor.data_ptr()]
         return self.peer_tensors[buffer_key]
 

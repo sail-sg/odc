@@ -271,12 +271,6 @@ class ReductionIntraNodeService:
         self.accumulation_indices[key] = len(self.accumulations)
         self.accumulations.append(acc)
 
-        # local_acc_handles = []
-        # for local_acc in registry.get_local_peer_tensors(acc):
-        #     local_acc.fill_(0)
-        #     local_acc_handles.append(get_nvshmem_handle(local_acc))
-        # call_watcher(self.reduction_watcher, 'add_accumulation', local_acc_handles)
-
         if (
             os.environ.get("ODC_SINGLE_BUFFER", "0") != "1"
             and os.environ.get("ODC_NUM_BUFFERS", "0") == "0"

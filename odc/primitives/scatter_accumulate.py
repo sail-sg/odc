@@ -61,9 +61,10 @@ def nvshmem_reduce_scatter_kernel(
     output_tensor_ptr,
     elem_per_rank,
     size_per_elem,
-    rank,
+    group_rank,
     num_ranks_per_node,
-    world_size,
+    group_world_size: tl.constexpr,
+    pg_ranks_ptr,
     chunk_size: tl.constexpr,
     signal_ptr,
 ):
@@ -72,14 +73,15 @@ def nvshmem_reduce_scatter_kernel(
     # np = tl.num_programs(axis=0)
     assert num_ranks_per_node == tl.num_programs(axis=0)
     np = num_ranks_per_node
-    num_nodes = world_size // np
+    assert group_world_size % np == 0
+    num_nodes = group_world_size // np
     expected = 0
     chunk_buffer_seg = chunk_buffer + pid * chunk_size
 
     # Use different kernel for the ranks in the same node.
     for i in range(1, num_nodes):
-        peer_node = (i + rank // np) % num_nodes
-        peer = (pid + peer_node * np) % world_size
+        peer_node = (i + group_rank // np) % num_nodes
+        peer = (pid + peer_node * np) % group_world_size
 
         num_chunks = tl.cdiv(elem_per_rank, chunk_size)
         for chunk in range(num_chunks):
@@ -91,11 +93,14 @@ def nvshmem_reduce_scatter_kernel(
             mask = chunk_offsets < this_chunk_size
             input_chunk_data = tl.load(input_tensor_ptr + input_start + chunk_offsets, mask=mask)
             tl.store(chunk_buffer_seg + chunk_offsets, input_chunk_data, mask=mask)
+            # As we initialize NVSHMEM on global process group,
+            # we need to use the global rank to access the peer tensor.
+            global_peer = tl.load(pg_ranks_ptr + peer)
             putmem_nbi_block(
                 output_tensor_ptr + (chunk * chunk_size),
                 chunk_buffer_seg,
                 this_chunk_size * size_per_elem,
-                peer,
+                global_peer,
             )
 
             expected += np
@@ -433,6 +438,14 @@ class ReductionService:
         self.buffer_splitter = BufferSplitter()
         self.rank_streams = defaultdict(torch.cuda.Stream)
         self.chunk_size_bytes = 2**20
+        self.pg_ranks_cache = {}
+
+    def get_pg_ranks_tensor(self, pg: dist.ProcessGroup):
+        if pg not in self.pg_ranks_cache:
+            pg_ranks = dist.get_process_group_ranks(group=pg)
+            pg_ranks_tensor = torch.tensor(pg_ranks, dtype=torch.int32, device="cuda")
+            self.pg_ranks_cache[pg] = pg_ranks_tensor
+        return self.pg_ranks_cache[pg]
 
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
@@ -562,6 +575,8 @@ class ReductionService:
         for local_peer in range(rank_start_same_node, rank_end_same_node):
             self.rank_streams[local_peer].wait_stream(torch.cuda.current_stream())
 
+        pg_ranks_tensor = self.get_pg_ranks_tensor(pg)
+
         # If split_trans_buffer is False,
         # we can avoid multiple requests to server
         # but need to use more memory for the trans buffer.
@@ -608,9 +623,10 @@ class ReductionService:
                     output_tensor_ptr=buf,
                     elem_per_rank=size,
                     size_per_elem=buf.element_size(),
-                    rank=rank,
+                    group_rank=rank,
                     num_ranks_per_node=grid_size,
-                    world_size=world_size,
+                    group_world_size=world_size,
+                    pg_ranks_ptr=pg_ranks_tensor,
                     chunk_size=chunk_size,
                     signal_ptr=signal_ptr,
                     num_warps=32,
