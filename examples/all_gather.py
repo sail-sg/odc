@@ -59,7 +59,7 @@ if __name__ == "__main__":
         group_count = 1
 
         for i in range(group_count):
-            group_ranks_ = range(i, world_size, group_count)
+            group_ranks_ = list(range(i, world_size, group_count))
             group_ = torch.distributed.new_group(ranks=group_ranks_, backend="nccl")
             if rank in group_ranks_:
                 group_ranks = group_ranks_
@@ -122,7 +122,7 @@ if __name__ == "__main__":
                         expected = group_ranks[r] * 2 + i
                         assert torch.eq(
                             dst[r * size : (r + 1) * size], expected
-                        ).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected}"
+                        ).all(), f"Rank {rank} cnt {i} r {r} dst: {dst[r * size:(r + 1) * size]}, expected: {expected} group_ranks: {group_ranks}"
                 end = torch.cuda.Event(enable_timing=True)
                 end.record()
                 dist.barrier()

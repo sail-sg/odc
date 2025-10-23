@@ -85,6 +85,18 @@ def finalize_distributed():
     nvshmem.core.finalize()
 
 
+def get_odc_hybrid_group_size():
+    return int(os.environ.get("ODC_HYBRID_GROUP_SIZE", get_local_world_size()))
+
+
+def check_odc_hybrid_group_ranks(ranks: List[int]):
+    odc_hybrid_group_size = get_odc_hybrid_group_size()
+    assert len(ranks) == odc_hybrid_group_size
+    min_rank = min(ranks)
+    for i in range(odc_hybrid_group_size):
+        assert ranks[i] == min_rank + i
+
+
 class SymmBufferRegistry:
     def __init__(self):
         self.local_tensor = {}
@@ -119,16 +131,21 @@ class SymmBufferRegistry:
         assert key not in self.local_tensor
         rank = torch.distributed.get_rank()
         local_world_size = get_local_world_size()
-        odc_hybrid_world_size = os.environ.get("ODC_HYBRID_WORLD_SIZE", local_world_size)
+        odc_hybrid_group_size = get_odc_hybrid_group_size()
         peer_tensors = []
-        for _node_rank in range(odc_hybrid_world_size // local_world_size):
+        for _node_rank in range(odc_hybrid_group_size // local_world_size):
             tensor = nvshmem_create_tensor(shape, dtype)
             same_node_tensors = get_same_node_tensors(tensor, rank, local_world_size)
             self.allocations.append(tensor)
             peer_tensors.extend(same_node_tensors)
-        assert len(peer_tensors) == odc_hybrid_world_size
+        assert len(peer_tensors) == odc_hybrid_group_size
+        local_group_size = len(peer_tensors)
+        # ranks inside hybrid group must be contiguous
+        # TODO: maybe we should accept the process group as parameter in this method
+        # to tell the ranks inside the hybrid group.
+        local_group_rank = rank % local_group_size
         # tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
-        self.local_tensor[key] = peer_tensors[rank]
+        self.local_tensor[key] = peer_tensors[local_group_rank]
         self.peer_tensors[key] = peer_tensors
 
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key

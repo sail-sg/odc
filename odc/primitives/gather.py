@@ -13,6 +13,8 @@ from odc.primitives.utils import (
     BufferSplitter,
     SymmBufferRegistry,
     get_comm_stream,
+    get_local_world_size,
+    get_odc_hybrid_group_size,
     sync_cta,
 )
 
@@ -25,21 +27,24 @@ def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
     target_tensor_ptr,
     elem_per_rank,
     size_per_elem,
-    global_rank,
-    world_size,
+    group_rank,
+    num_ranks_per_node,
+    group_world_size,
     pg_ranks_ptr,
     chunk_size,
     signal_ptr,
 ):
     pid = tl.program_id(axis=0)
-    np = tl.num_programs(axis=0)
-    num_nodes = world_size // np
+    # np = tl.num_programs(axis=0)
+    assert num_ranks_per_node == tl.num_programs(axis=0)
+    np = num_ranks_per_node
+    num_nodes = group_world_size // np
 
     tidx = tid(axis=0)
     expected = 0
     for i in range(1, num_nodes):
-        peer_node = (i + global_rank // np) % num_nodes
-        peer = (pid + peer_node * np) % world_size
+        peer_node = (i + group_rank // np) % num_nodes
+        peer = (pid + peer_node * np) % group_world_size
         # chunk_size = elem_per_rank // num_chunks
         num_chunks = tl.cdiv(elem_per_rank, chunk_size)
         for chunk in range(num_chunks):
@@ -89,7 +94,7 @@ class GatherService:
 
         assert (input_tensor.numel() * input_tensor.element_size()) % (
             2**6
-        ) == 0, "better align to 64 for efficiency"
+        ) == 0 or input_tensor.numel() < 2**6, "better align to 64 for efficiency"
         chunk_size = 2**20 // input_tensor.element_size()
         # assert input_tensor.numel() % chunk_size == 0
 
@@ -98,10 +103,10 @@ class GatherService:
         peer_tensors = registry.get_peer_tensors(input_tensor)
         group_rank = torch.distributed.get_rank(group=pg)
 
-        world_size = torch.distributed.get_world_size(pg)
+        group_world_size = torch.distributed.get_world_size(pg)
         get_comm_stream().wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(get_comm_stream()):
-            output_tensor_split = output_tensor.view(world_size, -1)
+            output_tensor_split = output_tensor.view(group_world_size, -1)
             # TODO: support ODC_HYBRID_WORLD_SIZE > 1
             # In this case, we need to avoid copying tensors using getmem_nbi_block
             # between nodes within the same odc hybrid group.
@@ -111,35 +116,41 @@ class GatherService:
             # 2. #gpus on single node for single node settings.
             # 3. #gpus on multi-nodes within a hybrid group. There can be multiple hybrid groups.
             local_group_size = len(peer_tensors)
+            odc_hybrid_group_size = get_odc_hybrid_group_size()
+            assert local_group_size == odc_hybrid_group_size
             local_group_rank = group_rank % local_group_size
-            rank_on_same_node_start = group_rank - local_group_rank
-            rank_on_same_node_end = rank_on_same_node_start + local_group_size
+            rank_local_group_start = group_rank - local_group_rank
+            rank_local_group_end = rank_local_group_start + local_group_size
             for r_offset in range(local_group_size):
-                src_group_rank = (local_group_rank + r_offset) % local_group_size
-                output_tensor_split[src_group_rank].copy_(peer_tensors[src_group_rank])
+                src_local_group_rank = (local_group_rank + r_offset) % local_group_size
+                src_group_rank = rank_local_group_start + src_local_group_rank
+                output_tensor_split[src_group_rank].copy_(peer_tensors[src_local_group_rank])
 
-            assert buf_size % world_size == 0
-            local_buf_size = buf_size // world_size
+            assert buf_size % group_world_size == 0
+            local_buf_size = buf_size // group_world_size
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
             for start in range(0, input_tensor.numel(), local_buf_size):
                 size = min(local_buf_size, input_tensor.numel() - start)
                 sub_input_tensor = input_tensor.view(-1)[start : start + size]
                 assert (sub_input_tensor.numel() * sub_input_tensor.element_size()) % (
                     2**6
-                ) == 0, "better align to 64 for efficiency"
-                target_buf_size = size * world_size
+                ) == 0 or sub_input_tensor.numel() < 2**6, "better align to 64 for efficiency"
+                target_buf_size = size * group_world_size
                 assert target_buf_size <= buf_size
-                target_tensor_split = target_tensor[:target_buf_size].view(world_size, size)
+                target_tensor_split = target_tensor[:target_buf_size].view(group_world_size, size)
                 signal_ptr.fill_(0)
-                assert world_size % 8 == 0 or world_size < 8
-                grid_size = 8 if world_size == 32 else world_size
+                assert group_world_size % 8 == 0 or group_world_size < 8
+                # grid_size = 8 if world_size == 32 else world_size
+                grid_size = get_local_world_size()
+                # logger.warning(f"Rank {torch.distributed.get_rank()} group_rank: {group_rank} group_size: {group_world_size} grid_size: {grid_size}")
                 nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(grid_size,)](
                     remote_tensor_ptr=sub_input_tensor,
                     target_tensor_ptr=target_tensor_split.view(-1),
                     elem_per_rank=sub_input_tensor.numel(),
                     size_per_elem=sub_input_tensor.element_size(),
-                    global_rank=torch.distributed.get_rank(pg),
-                    world_size=torch.distributed.get_world_size(pg),
+                    group_rank=group_rank,
+                    num_ranks_per_node=get_local_world_size(),
+                    group_world_size=group_world_size,
                     pg_ranks_ptr=pg_ranks_tensor,
                     chunk_size=chunk_size,
                     signal_ptr=signal_ptr,
@@ -155,8 +166,8 @@ class GatherService:
                     output_tensor[data_end_idx:].copy_(target_tensor[data_end_idx:])
                     # output_tensor.copy_(target_tensor)
                 else:
-                    for r in range(world_size):
-                        if rank_on_same_node_start <= r < rank_on_same_node_end:
+                    for r in range(group_world_size):
+                        if rank_local_group_start <= r < rank_local_group_end:
                             continue
                         output_tensor_split[r, start : start + size].copy_(
                             target_tensor_split[r, :]
