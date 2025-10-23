@@ -234,10 +234,12 @@ class ReductionIntraNodeService:
             self.accumulation_dtype if self.accumulation_dtype is not None else input_tensor.dtype
         )
         self.register(
-            key, self.infer_output_shape(input_tensor, pg), input_tensor.dtype, accum_dtype
+            key, self.infer_output_shape(input_tensor, pg), input_tensor.dtype, accum_dtype, pg
         )
 
-    def register(self, key, output_tensor_shape, grad_dtype, reduction_dtype):
+    def register(
+        self, key, output_tensor_shape, grad_dtype, reduction_dtype, pg: dist.ProcessGroup
+    ):
         if self.reduction_watcher is None:
             self.lock = DistLock(128)
             lock_buffers_handle = get_nvshmem_handle(self.lock.lock_buffers)
@@ -256,7 +258,7 @@ class ReductionIntraNodeService:
         # assert self.reduction_watcher is None, "Reduction watcher is already running"
 
         def create_and_register(key, shape, dtype, add_func):
-            buffer = registry.allocate_symm_buffer(key, shape, dtype)
+            buffer = registry.allocate_symm_buffer(key, shape, dtype, pg)
             local_handles = []
             for local_tensor in registry.get_local_peer_tensors(buffer):
                 local_tensor.fill_(0)
@@ -336,7 +338,7 @@ class ReductionIntraNodeService:
                 if self.accumulation_dtype is not None
                 else input_tensor.dtype
             )
-            self.register(key, output_shape, input_tensor.dtype, accum_dtype)
+            self.register(key, output_shape, input_tensor.dtype, accum_dtype, pg)
 
         acc = self.accumulations[self.accumulation_indices[key]]
         # buffer = self.buffers[self.buffer_indices[key]]
@@ -373,7 +375,7 @@ class ReductionIntraNodeService:
                 else input_tensor.dtype
             )
             self.register(
-                key, self.infer_output_shape(input_tensor, pg), input_tensor.dtype, accum_dtype
+                key, self.infer_output_shape(input_tensor, pg), input_tensor.dtype, accum_dtype, pg
             )
 
         # acc = self.accumulations[self.accumulation_indices[key]]

@@ -245,13 +245,13 @@ def server_loop(server_context, dispatch_func, exit_predicate, client_mask=None)
 
 
 class DistLock:
-    def __init__(self, world_size):
-        self.world_size = world_size
+    def __init__(self, pg: dist.ProcessGroup):
+        self.world_size = torch.distributed.get_world_size(pg)
         self.request_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-            "request_buffer", (self.world_size,), torch.int32
+            "request_buffer", (self.world_size,), torch.int32, pg
         )
         self.response_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-            "response_buffer", (self.world_size,), torch.int32
+            "response_buffer", (self.world_size,), torch.int32, pg
         )
         self.request_buffer.fill_(0)
         self.response_buffer.fill_(0)
@@ -430,9 +430,11 @@ class ReductionService:
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
 
-    def register(self, key, output_tensor_shape, grad_dtype, reduction_dtype):
+    def register(
+        self, key, output_tensor_shape, grad_dtype, reduction_dtype, pg: dist.ProcessGroup
+    ):
         if self.reduction_watcher is None:
-            self.lock = DistLock(torch.distributed.get_world_size())
+            self.lock = DistLock(pg)
             request_buffer_handle = get_nvshmem_handle(self.lock.request_buffer)
             response_buffer_handle = get_nvshmem_handle(self.lock.response_buffer)
 
@@ -451,14 +453,14 @@ class ReductionService:
         # assert self.reduction_watcher is None, "Reduction watcher is already running"
 
         def create_and_register_accumulation(key, shape, dtype, add_func):
-            buffer = registry.allocate_symm_buffer(key, shape, dtype)
+            buffer = registry.allocate_symm_buffer(key, shape, dtype, pg)
             call_watcher(self.reduction_watcher, add_func, [get_nvshmem_handle(buffer)])
             return buffer
 
         def create_and_register_buffer(key, shape, dtype, add_func):
             buffers = []
             for rank in range(torch.distributed.get_world_size()):
-                buffer = registry.allocate_symm_buffer(f"{key}_rank_{rank}", shape, dtype)
+                buffer = registry.allocate_symm_buffer(f"{key}_rank_{rank}", shape, dtype, pg)
                 buffers.append(buffer)
             call_watcher(self.reduction_watcher, add_func, [get_nvshmem_handle(b) for b in buffers])
             return buffers
@@ -518,7 +520,7 @@ class ReductionService:
             self.accumulation_dtype if self.accumulation_dtype is not None else input_tensor.dtype
         )
         if key not in self.accumulation_indices:
-            self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype)
+            self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype, pg)
 
         world_size = torch.distributed.get_world_size(pg)
         local_buf_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
@@ -536,6 +538,7 @@ class ReductionService:
                 f"rs_buffer_{input_tensor_symm_shape}_{input_tensor.dtype}",
                 input_tensor_symm_shape,
                 input_tensor.dtype,
+                pg,
             )
         input_tensor_symm = self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)]
 

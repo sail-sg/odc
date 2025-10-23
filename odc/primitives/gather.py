@@ -88,7 +88,10 @@ class GatherService:
             self.shaped_buffer[
                 (buffer_shape, output_tensor.dtype)
             ] = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-                f"ag_buffer_{buffer_shape}_{output_tensor.dtype}", buffer_shape, output_tensor.dtype
+                f"ag_buffer_{buffer_shape}_{output_tensor.dtype}",
+                buffer_shape,
+                output_tensor.dtype,
+                pg,
             )
         target_tensor = self.shaped_buffer[(buffer_shape, output_tensor.dtype)]
 

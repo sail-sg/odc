@@ -115,10 +115,10 @@ class SymmBufferRegistry:
     def flush(self):
         self.updated.clear()
 
-    def update_symm_buffer(self, buffer_key, values):
+    def update_symm_buffer(self, buffer_key, values, pg: torch.distributed.ProcessGroup):
         values = values.contiguous()
         if buffer_key not in self.local_tensor:
-            self.allocate_symm_buffer(buffer_key, values.shape, values.dtype)
+            self.allocate_symm_buffer(buffer_key, values.shape, values.dtype, pg)
 
         if buffer_key not in self.updated:
             self.updated.add(buffer_key)
@@ -127,15 +127,15 @@ class SymmBufferRegistry:
             torch.distributed.barrier()
         return self.local_tensor[buffer_key]
 
-    def allocate_symm_buffer(self, key, shape, dtype):
+    def allocate_symm_buffer(self, key, shape, dtype, pg: torch.distributed.ProcessGroup):
         assert key not in self.local_tensor
-        rank = torch.distributed.get_rank()
+        group_rank = torch.distributed.get_rank(pg)
         local_world_size = get_local_world_size()
         odc_hybrid_group_size = get_odc_hybrid_group_size()
         peer_tensors = []
         for _node_rank in range(odc_hybrid_group_size // local_world_size):
             tensor = nvshmem_create_tensor(shape, dtype)
-            same_node_tensors = get_same_node_tensors(tensor, rank, local_world_size)
+            same_node_tensors = get_same_node_tensors(tensor, group_rank, local_world_size)
             self.allocations.append(tensor)
             peer_tensors.extend(same_node_tensors)
         assert len(peer_tensors) == odc_hybrid_group_size
@@ -143,7 +143,7 @@ class SymmBufferRegistry:
         # ranks inside hybrid group must be contiguous
         # TODO: maybe we should accept the process group as parameter in this method
         # to tell the ranks inside the hybrid group.
-        local_group_rank = rank % local_group_size
+        local_group_rank = group_rank % local_group_size
         # tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
         self.local_tensor[key] = peer_tensors[local_group_rank]
         self.peer_tensors[key] = peer_tensors
