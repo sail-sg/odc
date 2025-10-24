@@ -1,0 +1,550 @@
+"""
+FSDP Hybrid Sharding Training Example with Hugging Face Qwen 2.5 0.5B
+
+This example demonstrates how to use PyTorch's Fully Sharded Data Parallel (FSDP)
+with HYBRID_SHARD strategy: 8 GPUs configured as 2 replicas * 4 FSDP groups.
+Includes gradient accumulation and deterministic training for reproducible results.
+
+Key Features:
+- Uses real HuggingFace Qwen 2.5 0.5B model (not from config)
+- Loads SQuAD dataset for meaningful text training
+- Deterministic training with fixed seeds for reproducible results
+- Fast convergence settings to see loss decrease quickly
+- Comprehensive logging to track training progress
+
+Deterministic Training:
+- All random seeds are fixed (Python, NumPy, PyTorch)
+- CUDNN deterministic algorithms enabled
+- Data loading is deterministic (no shuffle, no workers)
+- Results should be identical across runs with same configuration
+
+Usage:
+    torchrun --nproc_per_node=8 --nnodes=1 torch_fsdp.py
+"""
+
+import functools
+import os
+import random
+import time
+
+import numpy as np
+import packing
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import wandb
+from args import get_args
+from datasets import load_dataset, load_from_disk
+from lm_head import FusedLinearForPPOFunction
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn import CrossEntropyLoss
+from torch.optim import AdamW
+from torch.profiler import ProfilerActivity, profile, record_function
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data.dataset import TensorDataset
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+)
+
+import odc
+from data import BatchedDataset
+from odc.fsdp.patch_fsdp1 import patch_fsdp1, pre_minibatch_start, pre_optimizer_step, stop
+
+enable_decouple = os.environ.get("ODC", "0") == "1"
+enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
+
+
+param_dtype = torch.bfloat16
+reduce_dtype = torch.float32
+buffer_dtype = torch.float32
+
+if enable_decouple:
+    patch_fsdp1(reduce_dtype=reduce_dtype)
+
+
+args = get_args()
+
+
+def forward_with_fused_linear(
+    self,
+    input_ids,
+    attention_mask=None,
+    position_ids=None,
+    logits_to_keep=0,
+    temperature=None,
+    **loss_kwargs,
+):
+    base_outputs = self.model(input_ids=input_ids, attention_mask=None, position_ids=position_ids)
+    hidden_states = base_outputs.last_hidden_state
+    labels = torch.roll(input_ids, shifts=-1, dims=-1)
+    vocab_weights = self.lm_head.weight
+    logps, _ = FusedLinearForPPOFunction.apply(hidden_states, vocab_weights, labels, 1.0)
+    return logps
+
+
+def create_qwen_model():
+    """Create Qwen 2.5 0.5B model with random initialization"""
+    # Use the smallest Qwen 2.5 model (0.5B parameters)
+    model_name = args.model_name
+
+    # Load the exact configuration from HuggingFace
+    config = Qwen2Config.from_pretrained(
+        model_name, trust_remote_code=True, attn_implementation="flash_attention_2"
+    )
+
+    # Modify config for training
+    config.use_cache = False  # Disable cache for training
+    config.torch_dtype = torch.bfloat16
+
+    # Create model from config (this will use random initialization)
+
+    # model = Qwen2ForCausalLM(config)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
+        # use_cache=False,
+    )
+    model.__class__.forward = forward_with_fused_linear
+
+    model.gradient_checkpointing_enable()
+    model = model.to(config.torch_dtype)
+    print(model)
+    packing.get_seq_costs_flops = functools.partial(packing._get_seq_costs_flops, model)
+
+    # Load tokenizer (we still need the tokenizer from pretrained)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True, padding_side="right"
+    )
+
+    # Add pad token if it doesn't exist
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+def set_deterministic_training(seed=42):
+    """Set all random seeds and configurations for deterministic training"""
+    # Set Python random seed
+    random.seed(seed)
+
+    # Set NumPy random seed
+    np.random.seed(seed)
+
+    # Set PyTorch random seeds
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Ensure deterministic operations
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Set environment variable for deterministic algorithms
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # Enable deterministic algorithms in PyTorch (may affect performance)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    if dist.get_rank() == 0:
+        print(f"Deterministic training enabled with seed: {seed}")
+
+
+def setup_distributed():
+    """Initialize distributed training"""
+    # Initialize process group
+    dist.init_process_group(backend="nccl")
+
+    # Set device
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    if enable_decouple:
+        odc.init_nvshmem()
+
+
+def setup_hybrid_sharding():
+    """Setup hybrid sharding process groups for HYBRID_SHARD strategy"""
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    assert world_size == 8, f"This example requires exactly 8 GPUs, got {world_size}"
+
+    # For HYBRID_SHARD, we need to set up process groups
+    # HYBRID_SHARD uses 2 replicas * 4 FSDP groups
+    # Replicas: [0,1,2,3] and [4,5,6,7]
+    # Each replica uses FSDP internally
+
+    replica_group_size = 4  # 4 GPUs per replica
+    num_replicas = world_size // replica_group_size  # 2 replicas
+
+    # Create sharding groups (FSDP groups within each replica)
+    sharding_groups = []
+    for i in range(num_replicas):
+        start_rank = i * replica_group_size
+        end_rank = start_rank + replica_group_size
+        group_ranks = list(range(start_rank, end_rank))
+        sharding_groups.append(dist.new_group(group_ranks))
+
+    # Create replication groups (data parallel across replicas)
+    replication_groups = []
+    for i in range(replica_group_size):
+        group_ranks = [i + j * replica_group_size for j in range(num_replicas)]
+        replication_groups.append(dist.new_group(group_ranks))
+
+    # Determine which groups this rank belongs to
+    replica_id = rank // replica_group_size
+    local_rank_in_replica = rank % replica_group_size
+
+    sharding_group = sharding_groups[replica_id]
+    replication_group = replication_groups[local_rank_in_replica]
+
+    print(f"Rank {rank}: Replica {replica_id}, Local rank {local_rank_in_replica}")
+    print(
+        f"Rank {rank}: Sharding group size {dist.get_world_size(sharding_group)}, "
+        f"Replication group size {dist.get_world_size(replication_group)}"
+    )
+
+    return sharding_group, replication_group
+
+
+def create_fsdp_model(model, sharding_group, replication_group):
+    """Wrap model with FSDP using HYBRID_SHARD strategy"""
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+
+    if args.model_name.startswith("deepseek-ai/DeepSeek-R1-Distill-Qwen"):
+        layer_cls = Qwen2DecoderLayer
+    else:
+        raise NotImplementedError(f"Model {args.model_name} not supported")
+
+    # Auto wrap policy for Qwen2 transformer layers
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy, transformer_layer_cls={layer_cls}
+    )
+
+    # FSDP configuration with HYBRID_SHARD
+    fsdp_model = FSDP(
+        model,
+        # sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+        auto_wrap_policy=auto_wrap_policy,
+        # process_group=(sharding_group, replication_group),  # Tuple for hybrid sharding
+        device_id=torch.cuda.current_device(),
+        sync_module_states=True,
+        param_init_fn=None,
+        cpu_offload=None,
+        mixed_precision=MixedPrecision(
+            param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype
+        ),
+        use_orig_params=False,
+    )
+    if enable_decouple:
+        pre_minibatch_start(fsdp_model)
+
+    return fsdp_model
+
+
+def setup_wandb(rank, world_size, config):
+    """Initialize wandb for experiment tracking (only on rank 0)"""
+    if rank == 0:
+        # Initialize wandb
+        wandb.init(
+            project=args.project_name,
+            name=args.run_name,
+            config=config,
+            tags=["fsdp", "hybrid-sharding", "qwen2.5", "distributed-training"],
+        )
+        print("Wandb initialized successfully!")
+    return
+
+
+def create_profiler(rank):
+    """Create torch profiler for the first 4 training steps"""
+    if not enable_profiler:
+        return None
+
+    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+
+    profiler = profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True,
+        with_modules=True,
+        # Profile first 4 steps: warmup + 3 active steps
+        schedule=torch.profiler.schedule(
+            wait=0,  # No initial wait
+            warmup=1,  # 1 warmup step
+            active=1,  # Profile 3 active steps (steps 1-3)
+            repeat=1,  # Only run once
+        ),
+        on_trace_ready=lambda prof: prof.export_chrome_trace(f"fsdp_profile_rank_{rank}.json"),
+    )
+
+    return profiler
+
+
+class Timer:
+    def __init__(self, name):
+        self.name = name
+
+    def start(self):
+        torch.cuda.synchronize()
+        self.start_time = time.time()
+
+    def stop(self):
+        torch.cuda.synchronize()
+        self.end_time = time.time()
+        return self.end_time - self.start_time
+
+
+def train_step(model, batch):
+    """Single training step with gradient accumulation"""
+    with torch.cuda.nvtx.range("data_transfer"):
+        input_ids, position_ids, attention_mask, loss_scale, num_seqs = (
+            batch["input_ids"],
+            batch["position_ids"],
+            batch["attention_mask"],
+            batch["loss_scale"],
+            batch["num_seqs"],
+        )
+        # print(input_ids)
+        # print(labels)
+        input_ids = input_ids.cuda(non_blocking=True)
+        position_ids = position_ids.cuda(non_blocking=True)
+        attention_mask = attention_mask.cuda(non_blocking=True)
+        loss_scale = loss_scale.cuda(non_blocking=True)
+
+    # Forward pass
+    with torch.cuda.nvtx.range("forward_pass"):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logps = model(input_ids=input_ids, attention_mask=None, position_ids=position_ids)
+            # NOTE: this is borrowed from verl to avoid allocating full logits on HBM.
+            loss = (-logps.squeeze(0) * loss_scale.squeeze(0)).sum()
+
+    # Backward pass
+    if not args.forward_only:
+        with torch.cuda.nvtx.range("backward_pass"):
+            loss.backward()
+
+    return loss.item()
+
+
+def main():
+    setup_distributed()
+    if args.forward_only:
+        import odc.fsdp.patch_fsdp1
+
+        src_tensor = torch.randn(1024, dtype=torch.bfloat16, device="cuda")
+        odc.fsdp.patch_fsdp1.reduction_service.reduce_scatter_accumulation(
+            0, src_tensor, dist.group.WORLD
+        )
+    """Main training function"""
+    # Set deterministic training first
+    set_deterministic_training(seed=42)
+
+    # Setup distributed training
+
+    # Setup hybrid sharding
+    # sharding_group, replication_group = setup_hybrid_sharding()
+
+    # Create Qwen 2.5 0.5B model
+    model, tokenizer = create_qwen_model()
+    # print('original model dtype', model.dtype)
+
+    # Wrap with FSDP using HYBRID_SHARD
+    model = create_fsdp_model(model, None, None)
+    # print(model.dtype)
+
+    # Optimizer with higher learning rate for faster convergence
+    optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
+
+    # Create dataset and dataloader
+    dataset = BatchedDataset(
+        load_from_disk(args.dataset),
+        batch_size=args.minibatch_size,
+        rank=dist.get_rank(),
+        world_size=dist.get_world_size(),
+        packing_method=args.packing_method,
+    )
+
+    # Worker init function for deterministic data loading
+    def worker_init_fn(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    # Training parameters
+    num_epochs = 1  # More epochs to see loss decrease
+    log_interval = 1
+    max_steps = 2000  # Limit steps for demo purposes
+    max_steps = 2
+
+    # Setup wandb configuration
+    wandb_config = {
+        "model": args.model_name,
+        "dataset": args.dataset,
+        "world_size": dist.get_world_size(),
+        "sharding_strategy": "HYBRID_SHARD",
+        "minibatch_size": args.minibatch_size,
+        "micro_batch_size": args.micro_batch_size,
+        "packing_method": args.packing_method,
+        "learning_rate": 5e-4,
+        "weight_decay": 0.01,
+        "max_length": 16384,
+        "num_epochs": num_epochs,
+        "max_steps": max_steps,
+        "precision": "bfloat16",
+        "grad_clip_norm": 1.0,
+        "seed": 42,
+    }
+
+    # Initialize wandb (only on rank 0)
+    setup_wandb(dist.get_rank(), dist.get_world_size(), wandb_config)
+
+    print(f"Rank {dist.get_rank()}: Starting deterministic training...")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    print(f"Dataset size: {len(dataset)} samples")
+    print(f"Batch size: {args.minibatch_size}, Max steps: {max_steps}")
+    if dist.get_rank() == 0:
+        print(f"Profiler: {'ENABLED' if enable_profiler else 'DISABLED'}")
+
+    # Create profiler for this rank
+    prof = create_profiler(dist.get_rank())
+
+    # Training loop
+    model.train()
+
+    # Use context manager only if profiler is enabled
+    from contextlib import nullcontext
+
+    profiler_context = prof if prof is not None else nullcontext()
+    global_step = 0
+
+    with profiler_context:
+        for epoch in range(num_epochs):
+            epoch_start_time = time.time()
+
+            for minibatch in dataset:
+                accumulation_steps = len(minibatch)
+                minibatch_loss = torch.tensor(0.0).to("cuda")
+                minibatch_seq_length = 0
+                global_step += 1
+                print(f"rank {dist.get_rank()}: accumulation_steps: {accumulation_steps}")
+                if epoch == 0 and global_step == 2:
+                    torch.cuda.cudart().cudaProfilerStart()
+
+                minibatch_start_time = time.time()
+                for idx, micro_batch in enumerate(minibatch):
+                    # Training step with profiling
+
+                    # torch.cuda.synchronize()
+                    # start_time = time.time()
+
+                    with torch.cuda.nvtx.range(f"train_step_{global_step}_{idx}"):
+                        loss = train_step(
+                            model,
+                            micro_batch,
+                        )
+                        # TODO: the gradient scaling should be dynamic.
+
+                    # torch.cuda.current_stream().synchronize()
+                    # end_time = time.time()
+                    # # rank 4 total time: 6.0466, batch shape: torch.Size([1, 40843])
+                    # print(f"rank {dist.get_rank()} total time: {end_time - start_time:.4f}, batch shape: {micro_batch['input_ids'].shape}")
+
+                    minibatch_loss += loss
+                    minibatch_seq_length += micro_batch["input_ids"].shape[1]
+
+                    # Step the profiler after each training step (only if enabled)
+                    if prof is not None:
+                        prof.step()
+                sync_time = 0.0
+                optimizer_step_start_time = time.time()
+                grad_norm = torch.tensor(0.0).to("cuda")
+                if not args.forward_only:
+                    if enable_decouple:
+                        timer = Timer("pre_optimizer_step")
+                        timer.start()
+                        pre_optimizer_step(model)
+                        sync_time = timer.stop()
+                        sync_time = torch.tensor(sync_time).to("cuda")
+                        torch.distributed.all_reduce(sync_time, op=torch.distributed.ReduceOp.SUM)
+                        sync_time = sync_time.item() / dist.get_world_size()
+                    with torch.cuda.nvtx.range("optimizer_step"):
+                        # Calculate and print gradient norm before clipping
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=float("inf")
+                        )
+                        # Gradient clipping for stability
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        # Optimizer step
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    if enable_decouple:
+                        pre_minibatch_start(model)
+
+                dist.barrier()
+                torch.cuda.synchronize()
+                minibatch_end_time = time.time()
+                print(
+                    f"Minibatch time: {minibatch_end_time - minibatch_start_time:.4f}s, Sync time: {sync_time:.4f}s\n"
+                )
+                torch.distributed.all_reduce(minibatch_loss, op=torch.distributed.ReduceOp.SUM)
+                minibatch_log = {
+                    "loss": minibatch_loss.item() / torch.distributed.get_world_size(),
+                    "minibatch_time": minibatch_end_time - minibatch_start_time,
+                    "sync_time": sync_time,
+                    "optimizer_step_time": minibatch_end_time - optimizer_step_start_time,
+                    "seq_length": minibatch_seq_length,
+                    "grad_norm": grad_norm.item(),
+                    "peak_memory": torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024,
+                    "epoch_idx": epoch,
+                }
+                if dist.get_rank() == 0:
+                    wandb.log(minibatch_log, step=global_step)
+                if epoch == 0 and global_step == 2:
+                    torch.cuda.cudart().cudaProfilerStop()
+                if global_step >= max_steps:
+                    break
+
+            if dist.get_rank() == 0:
+                epoch_end_time = time.time()
+                epoch_total_time = epoch_end_time - epoch_start_time
+                epoch_log = {
+                    "epoch/epoch_time": epoch_total_time,
+                }
+                wandb.log(epoch_log, step=epoch)
+                print(f"Epoch {epoch} completed. Total time: {epoch_total_time:.2f}s")
+
+    if dist.get_rank() == 0:
+        print(f"Deterministic training completed successfully!")
+        # Finish wandb run
+        wandb.finish()
+        print("Wandb run finished!")
+
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+    print(f"Rank {dist.get_rank()}: Training completed!")
+
+    # Cleanup
+    if enable_decouple:
+        stop()
+    dist.destroy_process_group()
+    import os
+
+    completion_file = f"logs/{args.project_name}/{args.run_name}.done"
+    os.makedirs(os.path.dirname(completion_file), exist_ok=True)
+    with open(completion_file, "w") as f:
+        f.write("done")
+
+
+if __name__ == "__main__":
+    main()

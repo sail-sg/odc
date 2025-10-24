@@ -115,10 +115,10 @@ class SymmBufferRegistry:
     def flush(self):
         self.updated.clear()
 
-    def update_symm_buffer(self, buffer_key, values, pg: torch.distributed.ProcessGroup):
+    def update_symm_buffer(self, buffer_key, values, group_rank: int):
         values = values.contiguous()
         if buffer_key not in self.local_tensor:
-            self.allocate_symm_buffer(buffer_key, values.shape, values.dtype, pg)
+            self.allocate_symm_buffer(buffer_key, values.shape, values.dtype, group_rank)
 
         if buffer_key not in self.updated:
             self.updated.add(buffer_key)
@@ -127,9 +127,8 @@ class SymmBufferRegistry:
             torch.distributed.barrier()
         return self.local_tensor[buffer_key]
 
-    def allocate_symm_buffer(self, key, shape, dtype, pg: torch.distributed.ProcessGroup):
+    def allocate_symm_buffer(self, key, shape, dtype, group_rank: int):
         assert key not in self.local_tensor
-        group_rank = torch.distributed.get_rank(pg)
         local_world_size = get_local_world_size()
         odc_hybrid_group_size = get_odc_hybrid_group_size()
         peer_tensors = []

@@ -246,12 +246,13 @@ def server_loop(server_context, dispatch_func, exit_predicate, client_mask=None)
 
 class DistLock:
     def __init__(self, pg: dist.ProcessGroup):
+        group_rank = torch.distributed.get_rank(group=pg)
         self.world_size = torch.distributed.get_world_size(pg)
         self.request_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-            "request_buffer", (self.world_size,), torch.int32, pg
+            "request_buffer", (self.world_size,), torch.int32, group_rank
         )
         self.response_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-            "response_buffer", (self.world_size,), torch.int32, pg
+            "response_buffer", (self.world_size,), torch.int32, group_rank
         )
         self.request_buffer.fill_(0)
         self.response_buffer.fill_(0)
@@ -452,15 +453,19 @@ class ReductionService:
         assert not registry.has_key(accumulation_key)
         # assert self.reduction_watcher is None, "Reduction watcher is already running"
 
+        group_rank = torch.distributed.get_rank(group=pg)
+
         def create_and_register_accumulation(key, shape, dtype, add_func):
-            buffer = registry.allocate_symm_buffer(key, shape, dtype, pg)
+            buffer = registry.allocate_symm_buffer(key, shape, dtype, group_rank)
             call_watcher(self.reduction_watcher, add_func, [get_nvshmem_handle(buffer)])
             return buffer
 
         def create_and_register_buffer(key, shape, dtype, add_func):
             buffers = []
             for rank in range(torch.distributed.get_world_size()):
-                buffer = registry.allocate_symm_buffer(f"{key}_rank_{rank}", shape, dtype, pg)
+                buffer = registry.allocate_symm_buffer(
+                    f"{key}_rank_{rank}", shape, dtype, group_rank
+                )
                 buffers.append(buffer)
             call_watcher(self.reduction_watcher, add_func, [get_nvshmem_handle(b) for b in buffers])
             return buffers
@@ -531,6 +536,7 @@ class ReductionService:
         # grid_size = 8 if world_size == 32 else world_size
         grid_size = get_local_world_size()
         input_tensor_symm_shape = (chunk_size * grid_size,)
+        rank = torch.distributed.get_rank(pg)
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[
                 (input_tensor_symm_shape, input_tensor.dtype)
@@ -538,11 +544,10 @@ class ReductionService:
                 f"rs_buffer_{input_tensor_symm_shape}_{input_tensor.dtype}",
                 input_tensor_symm_shape,
                 input_tensor.dtype,
-                pg,
+                rank,
             )
         input_tensor_symm = self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)]
 
-        rank = torch.distributed.get_rank(pg)
         buffer_id = self.buffer_indices[key]
         buffer = self.buffers[buffer_id][rank]
         accumulation_id = self.accumulation_indices[key] + 1

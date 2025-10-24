@@ -15,6 +15,7 @@ from odc.primitives.utils import (
     get_comm_stream,
     get_local_world_size,
     get_odc_hybrid_group_size,
+    get_same_local_rank_pg,
     sync_cta,
 )
 
@@ -81,6 +82,7 @@ class GatherService:
         output_size = output_tensor.numel()
         assert output_size >= buf_size, f"output_size: {output_size} < buf_size: {buf_size}"
 
+        group_rank = torch.distributed.get_rank(group=pg)
         if (buffer_shape, output_tensor.dtype) not in self.shaped_buffer:
             logger.info(
                 f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buf_size)} buf_size: {buf_size}"
@@ -91,7 +93,7 @@ class GatherService:
                 f"ag_buffer_{buffer_shape}_{output_tensor.dtype}",
                 buffer_shape,
                 output_tensor.dtype,
-                pg,
+                group_rank,
             )
         target_tensor = self.shaped_buffer[(buffer_shape, output_tensor.dtype)]
 
@@ -104,7 +106,6 @@ class GatherService:
         pg_ranks_tensor = PROCESS_GROUP_RANKS_TENSORS.get_pg_ranks_tensor(pg)
         registry = SymmBufferRegistry.get_instance()
         peer_tensors = registry.get_peer_tensors(input_tensor)
-        group_rank = torch.distributed.get_rank(group=pg)
 
         group_world_size = torch.distributed.get_world_size(pg)
         get_comm_stream().wait_stream(torch.cuda.current_stream())
@@ -176,3 +177,17 @@ class GatherService:
                             target_tensor_split[r, :]
                         )
         torch.cuda.current_stream().wait_stream(get_comm_stream())
+
+    def all_gather_sync_cache(self, input_tensor: Tensor, pg: dist.ProcessGroup):
+        local_world_size = get_local_world_size()
+        if local_world_size == torch.distributed.get_world_size():
+            return []
+
+        same_local_rank_pg = get_same_local_rank_pg(pg)
+        same_local_rank_pg_ranks = dist.get_process_group_ranks(group=same_local_rank_pg)
+
+        registry = SymmBufferRegistry.get_instance()
+        # print(registry.get_peer_tensors(input_tensor))
+        tensors = [registry.get_peer_tensors(input_tensor)[r] for r in same_local_rank_pg_ranks]
+        torch.distributed.all_gather(tensors, input_tensor, group=same_local_rank_pg)
+        return tensors

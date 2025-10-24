@@ -83,9 +83,10 @@ if __name__ == "__main__":
             return x
 
         src_tensors = [torch.empty(size, dtype=dtype, device="cuda") for _ in range(cnt)]
+        group_rank = torch.distributed.get_rank(group=group)
         for i in range(cnt):
             src_tensors[i].fill_(i + rank * 2)
-            src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i], group)
+            src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i], group_rank)
             # all_gather_sync_cache(src_tensors[i], group)
 
         gather_service = GatherService()
