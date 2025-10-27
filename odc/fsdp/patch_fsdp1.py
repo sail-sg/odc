@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -46,7 +48,6 @@ def _reduce_grad(state, handle) -> None:
         #     group=pg,
         # )
         # print(f"Rank {dist.get_rank()}: reduce_scatter_accumulation")
-        import os
 
         if os.environ.get("ODC_NCCL_COMM", "0") == "1":
             rs_func = reduction_service.reduce_scatter_accumulation_nccl_comm
@@ -57,6 +58,7 @@ def _reduce_grad(state, handle) -> None:
             id(handle.flat_param)
         )
 
+        assert not uses_hybrid_sharded_strategy, "ODC does not support hybrid sharded strategy"
         # if uses_hybrid_sharded_strategy:
         #     # Don't wait during trace
         #     if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
@@ -77,7 +79,12 @@ def _reduce_grad(state, handle) -> None:
     else:
         state._comm_hook(state._comm_hook_state, padded_unsharded_grad, new_sharded_grad)
         # NOTE: HSDP variants do not support communication hook.
+
+    # Already set below: handle.flat_param._saved_grad_shard = xxx
     # grad_to_offload = _accumulate_sharded_grad(state, handle, new_sharded_grad)
+    # Not supported by ODC
+    assert not handle._offload_params, "ODC does not support offloading"
+    assert not handle._use_orig_params, "ODC does not support using original parameters"
     # _post_reduce_grad_callback(state, handle, grad_to_offload)
 
 
@@ -160,8 +167,6 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
         dist.all_gather(tensor_list, sharded_flat_param, group=pg)
     else:
-        import os
-
         if os.environ.get("ODC_NCCL_COMM", "0") == "1":
             ag_func = gather_service.all_gather_into_tensor_nccl_comm
         else:
