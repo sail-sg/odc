@@ -31,26 +31,16 @@ import numpy as np
 import packing
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import wandb
 from args import get_args
-from datasets import load_dataset, load_from_disk
+from datasets import load_from_disk
 from lm_head import FusedLinearForPPOFunction
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
-from torch.profiler import ProfilerActivity, profile, record_function
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.data.dataset import TensorDataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Qwen2Config,
-    Qwen2ForCausalLM,
-)
+from torch.profiler import ProfilerActivity, profile
+from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 
 import odc
 from data import BatchedDataset
@@ -74,11 +64,11 @@ args = get_args()
 def forward_with_fused_linear(
     self,
     input_ids,
-    attention_mask=None,
+    _attention_mask=None,
     position_ids=None,
-    logits_to_keep=0,
-    temperature=None,
-    **loss_kwargs,
+    _logits_to_keep=0,
+    _temperature=None,
+    **_loss_kwargs,
 ):
     base_outputs = self.model(input_ids=input_ids, attention_mask=None, position_ids=position_ids)
     hidden_states = base_outputs.last_hidden_state
@@ -215,7 +205,7 @@ def setup_hybrid_sharding():
     return sharding_group, replication_group
 
 
-def create_fsdp_model(model, sharding_group, replication_group):
+def create_fsdp_model(model, _sharding_group, _replication_group):
     """Wrap model with FSDP using HYBRID_SHARD strategy"""
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
@@ -250,7 +240,7 @@ def create_fsdp_model(model, sharding_group, replication_group):
     return fsdp_model
 
 
-def setup_wandb(rank, world_size, config):
+def setup_wandb(rank, _world_size, config):
     """Initialize wandb for experiment tracking (only on rank 0)"""
     if rank == 0:
         # Initialize wandb
@@ -261,7 +251,6 @@ def setup_wandb(rank, world_size, config):
             tags=["fsdp", "hybrid-sharding", "qwen2.5", "distributed-training"],
         )
         print("Wandb initialized successfully!")
-    return
 
 
 def create_profiler(rank):
@@ -294,6 +283,8 @@ def create_profiler(rank):
 class Timer:
     def __init__(self, name):
         self.name = name
+        self.start_time = 0.0
+        self.end_time = 0.0
 
     def start(self):
         torch.cuda.synchronize()
@@ -308,7 +299,7 @@ class Timer:
 def train_step(model, batch):
     """Single training step with gradient accumulation"""
     with torch.cuda.nvtx.range("data_transfer"):
-        input_ids, position_ids, attention_mask, loss_scale, num_seqs = (
+        input_ids, position_ids, attention_mask, loss_scale, _num_seqs = (
             batch["input_ids"],
             batch["position_ids"],
             batch["attention_mask"],
@@ -340,11 +331,12 @@ def train_step(model, batch):
 def main():
     setup_distributed()
     if args.forward_only:
-        import odc.fsdp.fsdp1
+        from odc.fsdp import fsdp1
 
         src_tensor = torch.randn(1024, dtype=torch.bfloat16, device="cuda")
-        odc.fsdp.fsdp1.reduction_service.scatter_accumulate(0, src_tensor, dist.group.WORLD)
-    """Main training function"""
+        fsdp1.reduction_service.scatter_accumulate(0, src_tensor, dist.group.WORLD)
+
+    # Main training function
     # Set deterministic training first
     set_deterministic_training(seed=42)
 
@@ -354,7 +346,7 @@ def main():
     # sharding_group, replication_group = setup_hybrid_sharding()
 
     # Create Qwen 2.5 0.5B model
-    model, tokenizer = create_qwen_model()
+    model, _tokenizer = create_qwen_model()
     # print('original model dtype', model.dtype)
 
     # Wrap with FSDP using HYBRID_SHARD
@@ -374,14 +366,13 @@ def main():
     )
 
     # Worker init function for deterministic data loading
-    def worker_init_fn(worker_id):
+    def _worker_init_fn(_worker_id):
         worker_seed = torch.initial_seed() % 2**32
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
     # Training parameters
     num_epochs = 1  # More epochs to see loss decrease
-    log_interval = 1
     max_steps = 2000  # Limit steps for demo purposes
     max_steps = 2
 
@@ -523,7 +514,7 @@ def main():
                 print(f"Epoch {epoch} completed. Total time: {epoch_total_time:.2f}s")
 
     if dist.get_rank() == 0:
-        print(f"Deterministic training completed successfully!")
+        print("Deterministic training completed successfully!")
         # Finish wandb run
         wandb.finish()
         print("Wandb run finished!")
@@ -536,11 +527,10 @@ def main():
     if enable_decouple:
         stop()
     dist.destroy_process_group()
-    import os
 
     completion_file = f"logs/{args.project_name}/{args.run_name}.done"
     os.makedirs(os.path.dirname(completion_file), exist_ok=True)
-    with open(completion_file, "w") as f:
+    with open(completion_file, "w", encoding="utf-8") as f:
         f.write("done")
 
 

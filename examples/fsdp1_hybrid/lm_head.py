@@ -1,3 +1,4 @@
+# pylint: skip-file
 from typing import Optional, Tuple
 
 import torch

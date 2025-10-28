@@ -56,14 +56,9 @@ if __name__ == "__main__":
         comp_sizes = [2]
         dtype = torch.int64
 
-        group_count = 1
-
-        for i in range(group_count):
-            group_ranks_ = list(range(i, world_size, group_count))
-            group_ = torch.distributed.new_group(ranks=group_ranks_, backend="nccl")
-            if rank in group_ranks_:
-                group_ranks = group_ranks_
-                group = group_
+        group_ranks = list(range(0, world_size, 1))
+        group = torch.distributed.new_group(ranks=group_ranks, backend="nccl")
+        assert rank in group_ranks
         group_size = len(group_ranks)
         print(f"Rank {rank} group: {group_ranks}")
 
@@ -128,7 +123,9 @@ if __name__ == "__main__":
                 dist.barrier()
                 torch.cuda.synchronize()
                 # print(f"Rank {rank} comm time: {[start_events[i].elapsed_time(comm_events[i]) for i in range(cnt)]}, compute time: {[comm_events[i].elapsed_time(compute_events[i]) for i in range(cnt)]}")
-                all_gather_payload = size * (group_size - 1) * dtype.itemsize
+                all_gather_payload = (
+                    size * (group_size - 1) * dtype.itemsize  # pylint: disable=no-member
+                )
                 print(
                     f"Rank {rank} {all_gather_func.__name__} bw: {all_gather_payload / 1024 ** 2 * (cnt - 1) / start.elapsed_time(end)}"
                 )

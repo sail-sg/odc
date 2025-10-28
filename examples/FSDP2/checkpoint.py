@@ -58,7 +58,7 @@ class Checkpointer:
             set_model_state_dict(
                 model=model,
                 model_state_dict=full_sd,
-                options=StateDictOptions(
+                options=StateDictOptions(  # pylint: disable=unexpected-keyword-arg
                     full_state_dict=True,
                     broadcast_from_rank0=True,
                 ),
@@ -90,7 +90,7 @@ class Checkpointer:
                 model=model,
                 optimizers=opt,
                 optim_state_dict=full_sd,
-                options=StateDictOptions(
+                options=StateDictOptions(  # pylint: disable=unexpected-keyword-arg
                     full_state_dict=True,
                     broadcast_from_rank0=True,
                 ),

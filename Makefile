@@ -4,6 +4,7 @@ lint:
 	isort .
 	pylint odc
 	pylint tests
+	pylint examples
 
 .PHONY: test
 test:

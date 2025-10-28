@@ -59,14 +59,10 @@ def main():
         # size = 16
         # comp_sizes = torch.rand(cnt).tolist()
         comp_sizes = [2]
-        group_count = 1
 
-        for i in range(group_count):
-            group_ranks_ = range(i, world_size, group_count)
-            group_ = torch.distributed.new_group(ranks=group_ranks_, backend="nccl")
-            if rank in group_ranks_:
-                group_ranks = group_ranks_
-                group = group_
+        group_ranks = list(range(0, world_size, 1))
+        group = torch.distributed.new_group(ranks=group_ranks, backend="nccl")
+        assert rank in group_ranks
         group_size = len(group_ranks)
         print(f"Rank {rank} group: {group_ranks}")
 
@@ -88,7 +84,7 @@ def main():
             torch.empty(int(x * 16384), 8192, dtype=torch.bfloat16, device="cuda")
             for x in comp_sizes
         ]
-        compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
+        # compute_param = torch.empty(8192, 8192, dtype=torch.bfloat16, device="cuda")
 
         def some_compute(x):
             return x

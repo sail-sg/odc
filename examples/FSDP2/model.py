@@ -40,7 +40,7 @@ class Attention(nn.Module):
         keys = keys.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
         values = values.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
 
-        output = F.scaled_dot_product_attention(
+        output = F.scaled_dot_product_attention(  # pylint: disable=not-callable
             queries,
             keys,
             values,

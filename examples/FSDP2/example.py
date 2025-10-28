@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import torch
 from checkpoint import Checkpointer
@@ -37,7 +38,7 @@ def main(args):
     _min_gpu_count = 2
     if not verify_min_gpu_count(min_gpus=_min_gpu_count):
         print(f"Unable to locate sufficient {_min_gpu_count} gpus to run this example. Exiting.")
-        exit()
+        sys.exit(1)
     rank = int(os.environ["LOCAL_RANK"])
     if torch.accelerator.is_available():
         device_type = torch.accelerator.current_accelerator()
@@ -48,7 +49,7 @@ def main(args):
         device = torch.device("cpu")
         print(f"Running on device {device}")
 
-    backend = torch.distributed.get_default_backend_for_device(device)
+    backend = torch.distributed.get_default_backend_for_device(device)  # pylint: disable=no-member
     torch.distributed.init_process_group(backend=backend, device_id=device)
 
     torch.manual_seed(0)
@@ -117,6 +118,6 @@ if __name__ == "__main__":
     parser.add_argument("--explicit-prefetching", action="store_true", default=False)
     parser.add_argument("--mixed-precision", action="store_true", default=False)
     parser.add_argument("--dcp-api", action="store_true", default=False)
-    args = parser.parse_args()
+    arguments = parser.parse_args()
 
-    main(args)
+    main(arguments)

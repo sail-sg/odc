@@ -30,8 +30,6 @@ def tokenize_function(examples):
         messages = examples["messages"]
         text = tokenizer.apply_chat_template(messages, tokenize=False)
     elif args.dataset == "SWE-bench/SWE-smith-trajectories":
-        import json
-
         # TODO: Theoretically this should apply chat template, but it's pretraining anyways.
         text = examples["messages"]
     else:

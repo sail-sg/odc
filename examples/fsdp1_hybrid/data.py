@@ -84,8 +84,8 @@ def do_packing(batch, minibatch_size):
     }
 
 
-if __name__ == "__main__":
-    from datasets import load_dataset, load_from_disk
+def main():
+    from datasets import load_from_disk
 
     dataset = load_from_disk("fsdp/data/longalign256")
     batched_dataset = BatchedDataset(
@@ -93,3 +93,7 @@ if __name__ == "__main__":
     )
     print(len(batched_dataset))
     print(batched_dataset[0])
+
+
+if __name__ == "__main__":
+    main()

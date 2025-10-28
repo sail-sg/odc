@@ -78,7 +78,7 @@ def bin_packing_best_fit_decreasing(bin_capacity, items):
 
         for i, bin_content in enumerate(bins_volume):
             remaining_space = bin_capacity - sum(bin_content)
-            if remaining_space >= volume and remaining_space < min_remaining_space:
+            if volume <= remaining_space < min_remaining_space:
                 min_remaining_space = remaining_space
                 best_bin_idx = i
 
@@ -424,7 +424,7 @@ def rearrange_micro_batches(
         )
         check_failed = False
         for partition in micro_bsz_idx:
-            cur_sum = sum([seq_len_effective[i] for i in partition])
+            cur_sum = sum(seq_len_effective[i] for i in partition)
             if cur_sum > max_token_len:  # should satisfy the memory constraint
                 check_failed = True
                 break
@@ -451,7 +451,7 @@ def rearrange_micro_batches(
 
 
 def get_seq_costs_linear(seq_len: List[int]):
-    costs = [s for s in seq_len]
+    costs = list(seq_len)
     return costs
 
 
@@ -478,11 +478,11 @@ def _get_seq_costs_flops(model, seq_len):
     def compute_flops(seq):
         linear_flops = 0
         # flops of Linear layers
-        for name, module in model.named_modules():
+        for _name, module in model.named_modules():
             if isinstance(module, torch.nn.Linear):
                 linear_flops += module.weight.numel()
         attn_flops = 0
-        for name, module in model.named_modules():
+        for _name, module in model.named_modules():
             if hasattr(module, "q_proj"):
                 attn_flops += module.q_proj.out_features
         assert attn_flops > 0
@@ -591,7 +591,7 @@ def dynamic_packing(
     local_mini_length_np = length_np[local_mini_index_np]
     if not same_micro_num:  # for odc
         if use_bin_packing:  # guarantee the least number of micros
-            micro_num, micro_indexes, micro_lengths = bin_packing_best_fit_decreasing(
+            _micro_num, micro_indexes, _micro_lengths = bin_packing_best_fit_decreasing(
                 max_token_len, local_mini_length_np.tolist()
             )
         else:  # balance the workload between micros
@@ -632,7 +632,7 @@ def debug_even_packing(lengths, rank, world_size):
     return [local_idx[i : i + micro_batch_size] for i in range(0, len(local_idx), micro_batch_size)]
 
 
-if __name__ == "__main__":
+def main():
     import random
 
     max_token_len = 24000
@@ -796,3 +796,7 @@ if __name__ == "__main__":
         print("\n", "-" * 50, "\n")
 
     print(32000 * 2.611821 / 1536 / 1.982122)
+
+
+if __name__ == "__main__":
+    main()
