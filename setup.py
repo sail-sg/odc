@@ -28,12 +28,6 @@ long_description = readme_file.read_text() if readme_file.exists() else ""
 
 setup(
     name="odc",
-    use_scm_version={
-        "write_to": "odc/_version.py",
-        "fallback_version": "0.1.0",
-    },
-    author="Your Name",
-    author_email="your.email@example.com",
     description="On-Demand Communication",
     long_description=long_description,
     long_description_content_type="text/markdown",

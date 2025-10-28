@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp._flat_param import FlatParamHandle, HandleShardingStrategy
@@ -8,6 +10,8 @@ from torch.distributed.fsdp._runtime_utils import (
 )
 
 import odc
+
+logger = logging.getLogger(__name__)
 
 reduction_service = None
 gather_service = None
@@ -221,15 +225,8 @@ def pre_optimizer_step(fsdp_module):
         )
 
 
-def pre_minibatch_start(fsdp_module):
+def pre_minibatch_start(_fsdp_module):
     reduction_service.clear_accumulations()
-    # for handle in fsdp_module._all_handles:
-    #     odc.all_gather_sync_cache(handle.flat_param, fsdp_module.process_group)
-
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-    for fsdp_mod in FSDP.fsdp_modules(fsdp_module):
-        gather_service.all_gather_sync_cache(fsdp_mod._flat_param, fsdp_mod.process_group)
 
     # Make sure optimizer updates are visible to all ranks
     dist.barrier()

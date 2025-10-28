@@ -1,7 +1,6 @@
 [build-system]
 requires = [
     "setuptools>=62",
-    "setuptools_scm",
     "wheel",
     "torch",
     "nvidia-nvshmem-cu12",
@@ -10,11 +9,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "odc"
-dynamic = ["version"]
+version = "0.1.0-alpha.0"
 description = "Optimized Distributed Computing - Collection of distributed computing tools and bindings"
-authors = [
-    {name = "Your Name", email = "your.email@example.com"}
-]
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
@@ -50,10 +46,6 @@ dev = [
     "isort",
     "pylint>=4.0.0",
 ]
-
-[tool.setuptools_scm]
-write_to = "odc/_version.py"
-fallback_version = "0.1.0"
 
 [tool.black]
 line-length = 100

@@ -7,7 +7,6 @@ import torch.distributed as dist
 from loguru import logger
 
 from odc.primitives.scatter_accumulate import ReductionService
-from odc.primitives.scatter_accumulate_intra_node import ReductionIntraNodeService
 from odc.primitives.utils import SymmBufferRegistry, init_nvshmem
 
 

@@ -85,18 +85,6 @@ def finalize_distributed():
     nvshmem.core.finalize()
 
 
-def get_odc_hybrid_group_size():
-    return int(os.environ.get("ODC_HYBRID_GROUP_SIZE", get_local_world_size()))
-
-
-def check_odc_hybrid_group_ranks(ranks: List[int]):
-    odc_hybrid_group_size = get_odc_hybrid_group_size()
-    assert len(ranks) == odc_hybrid_group_size
-    min_rank = min(ranks)
-    for i in range(odc_hybrid_group_size):
-        assert ranks[i] == min_rank + i
-
-
 class SymmBufferRegistry:
     def __init__(self):
         self.local_tensor = {}
@@ -130,21 +118,12 @@ class SymmBufferRegistry:
     def allocate_symm_buffer(self, key, shape, dtype, group_rank: int):
         assert key not in self.local_tensor
         local_world_size = get_local_world_size()
-        odc_hybrid_group_size = get_odc_hybrid_group_size()
-        peer_tensors = []
-        for _node_rank in range(odc_hybrid_group_size // local_world_size):
-            tensor = nvshmem_create_tensor(shape, dtype)
-            same_node_tensors = get_same_node_tensors(tensor, group_rank, local_world_size)
-            self.allocations.append(tensor)
-            peer_tensors.extend(same_node_tensors)
-        assert len(peer_tensors) == odc_hybrid_group_size
-        local_group_size = len(peer_tensors)
-        # ranks inside hybrid group must be contiguous
-        # TODO: maybe we should accept the process group as parameter in this method
-        # to tell the ranks inside the hybrid group.
-        local_group_rank = group_rank % local_group_size
-        # tensors = nvshmem_create_tensors(shape, dtype, rank, local_world_size)
-        self.local_tensor[key] = peer_tensors[local_group_rank]
+        tensor = nvshmem_create_tensor(shape, dtype)
+        peer_tensors = get_same_node_tensors(tensor, group_rank, local_world_size)
+        self.allocations.append(tensor)
+        assert len(peer_tensors) == local_world_size
+        # ranks inside the same node must be contiguous.
+        self.local_tensor[key] = tensor
         self.peer_tensors[key] = peer_tensors
 
         self.local_tensor_to_keys[self.local_tensor[key].data_ptr()] = key
@@ -152,13 +131,6 @@ class SymmBufferRegistry:
             f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}"
         )
         return self.local_tensor[key]
-
-    def get_local_peer_tensors(self, local_tensor):
-        peer_tensors = self.get_peer_tensors(local_tensor)
-        local_world_size = get_local_world_size()
-        local_rank = torch.distributed.get_rank() % local_world_size
-        num_nodes = torch.distributed.get_world_size() // local_world_size
-        return [peer_tensors[local_rank + i * local_world_size] for i in range(num_nodes)]
 
     def has_key(self, key):
         return key in self.local_tensor
@@ -175,33 +147,6 @@ class SymmBufferRegistry:
         self.local_tensor_to_keys.clear()
         self.updated.clear()
         self.peer_tensors.clear()
-
-
-same_local_rank_pg = None
-
-
-# TODO: support hybrid mode, where pg is only a subset of the world
-def get_same_local_rank_pg(pg: torch.distributed.ProcessGroup):
-    local_world_size = get_local_world_size()
-    assert torch.distributed.get_world_size() == torch.distributed.get_world_size(
-        group=pg
-    ), "Cached AG only supports pure data parallelism"
-    assert (
-        local_world_size != torch.distributed.get_world_size()
-    ), "No need to call this for single node"
-    local_rank = torch.distributed.get_rank() % local_world_size
-    global same_local_rank_pg
-    if same_local_rank_pg is None:
-        for i in range(local_world_size):
-            ranks = [
-                i + j * local_world_size
-                for j in range(torch.distributed.get_world_size() // local_world_size)
-            ]
-            new_gp = torch.distributed.new_group(ranks=ranks, backend="nccl")
-            if i == local_rank:
-                same_local_rank_pg = new_gp
-    assert same_local_rank_pg is not None
-    return same_local_rank_pg
 
 
 local_world_pg = None

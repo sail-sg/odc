@@ -14,8 +14,6 @@ from odc.primitives.utils import (
     SymmBufferRegistry,
     get_comm_stream,
     get_local_world_size,
-    get_odc_hybrid_group_size,
-    get_same_local_rank_pg,
     sync_cta,
 )
 
@@ -111,24 +109,15 @@ class GatherService:
         get_comm_stream().wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(get_comm_stream()):
             output_tensor_split = output_tensor.view(group_world_size, -1)
-            # TODO: support ODC_HYBRID_WORLD_SIZE > 1
-            # In this case, we need to avoid copying tensors using getmem_nbi_block
-            # between nodes within the same odc hybrid group.
-            # The copy has been done below via mem-copy.
-            # local_group_size can be
-            # 1. #gpus on single node for multi-node settings.
-            # 2. #gpus on single node for single node settings.
-            # 3. #gpus on multi-nodes within a hybrid group. There can be multiple hybrid groups.
-            local_group_size = len(peer_tensors)
-            odc_hybrid_group_size = get_odc_hybrid_group_size()
-            assert local_group_size == odc_hybrid_group_size
-            local_group_rank = group_rank % local_group_size
-            rank_local_group_start = group_rank - local_group_rank
-            rank_local_group_end = rank_local_group_start + local_group_size
-            for r_offset in range(local_group_size):
-                src_local_group_rank = (local_group_rank + r_offset) % local_group_size
-                src_group_rank = rank_local_group_start + src_local_group_rank
-                output_tensor_split[src_group_rank].copy_(peer_tensors[src_local_group_rank])
+            local_world_size = get_local_world_size()
+            assert local_world_size == len(peer_tensors)
+            local_rank = group_rank % local_world_size
+            rank_same_node_start = group_rank - local_rank
+            rank_same_node_end = rank_same_node_start + local_world_size
+            for r_offset in range(local_world_size):
+                src_local_rank = (local_rank + r_offset) % local_world_size
+                src_group_rank = rank_same_node_start + src_local_rank
+                output_tensor_split[src_group_rank].copy_(peer_tensors[src_local_rank])
 
             assert buf_size % group_world_size == 0
             local_buf_size = buf_size // group_world_size
@@ -162,32 +151,18 @@ class GatherService:
                     extern_libs=NVSHMEM_EXTERN_LIBS,
                 )
                 if buf_size == output_size:
-                    local_group_data_size = size * local_group_size
-                    local_group_idx = group_rank // local_group_size
-                    data_start_idx = local_group_data_size * local_group_idx
-                    data_end_idx = data_start_idx + local_group_data_size
+                    local_world_data_size = size * local_world_size
+                    local_world_idx = group_rank // local_world_size
+                    data_start_idx = local_world_data_size * local_world_idx
+                    data_end_idx = data_start_idx + local_world_data_size
                     output_tensor[:data_start_idx].copy_(target_tensor[:data_start_idx])
                     output_tensor[data_end_idx:].copy_(target_tensor[data_end_idx:])
                     # output_tensor.copy_(target_tensor)
                 else:
                     for r in range(group_world_size):
-                        if rank_local_group_start <= r < rank_local_group_end:
+                        if rank_same_node_start <= r < rank_same_node_end:
                             continue
                         output_tensor_split[r, start : start + size].copy_(
                             target_tensor_split[r, :]
                         )
         torch.cuda.current_stream().wait_stream(get_comm_stream())
-
-    def all_gather_sync_cache(self, input_tensor: Tensor, pg: dist.ProcessGroup):
-        local_world_size = get_local_world_size()
-        if local_world_size == torch.distributed.get_world_size():
-            return []
-
-        same_local_rank_pg = get_same_local_rank_pg(pg)
-        same_local_rank_pg_ranks = dist.get_process_group_ranks(group=same_local_rank_pg)
-
-        registry = SymmBufferRegistry.get_instance()
-        # print(registry.get_peer_tensors(input_tensor))
-        tensors = [registry.get_peer_tensors(input_tensor)[r] for r in same_local_rank_pg_ranks]
-        torch.distributed.all_gather(tensors, input_tensor, group=same_local_rank_pg)
-        return tensors
