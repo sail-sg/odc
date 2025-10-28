@@ -26,7 +26,10 @@ py::bytes get_ipc_handle(at::Tensor tensor) {
 
     CUdeviceptr base;
     size_t size;
-    CU_CHECK(cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr));
+    // Use cuMemGetAddressRange_v2 to avoid
+    //     undefined symbol: cuMemGetAddressRange_v2
+    // CU_CHECK(cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr));
+    CU_CHECK(cuMemGetAddressRange_v2(&base, &size, (CUdeviceptr)ptr));
     // printf("ptr: %p, base ptr: %p, device: %d\n", ptr, base, attr.device);
 
     size_t pointer_offset = (size_t)ptr - (size_t)base;

@@ -3,34 +3,9 @@
 # Build script for odc package
 set -e
 
-# Check if clang-21 is installed
-if ! command -v clang-21 &> /dev/null; then
-    echo "clang-21 not found, installing..."
-    apt-get update
-    apt-get install -y lsb-release wget software-properties-common gnupg
-    wget https://apt.llvm.org/llvm.sh
-    chmod +x llvm.sh
-    ./llvm.sh 21 all
-else
-    echo "clang-21 is already installed, skipping installation."
-fi
+bash build_nvshmem_wrapper.sh
 
-echo "Building odc package..."
-
-# Clean previous builds
-# echo "Cleaning previous builds..."
-# rm -rf build/ dist/ *.egg-info/
-
-# Create build directory
-mkdir -p build
-
-# Build the package
 echo "Building package..."
-python -m pip install build
-python -m pip install setuptools_scm
-python -m pip install -U pip setuptools wheel
-python -m pip install cmake>=3.18 scikit-build-core>=0.3.3
-python -m pip install nvidia-nvshmem-cu12
 python -m build --no-isolation --verbose
 
 echo "Build completed successfully!"

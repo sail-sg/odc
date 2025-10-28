@@ -9,6 +9,9 @@ lint:
 test:
 	bash run_tests.sh
 
+build_nvshmem:
+	bash build_nvshmem_wrapper.sh
+
 .PHONY: build
 build:
 	bash build_package.sh

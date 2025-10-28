@@ -5,9 +5,9 @@ import torch
 from checkpoint import Checkpointer
 from model import ModelArgs, Transformer
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from utils import inspect_mixed_precision, inspect_model
 
 from odc.fsdp.fsdp2 import ODCAllGather, set_custom_all_gather
-from utils import inspect_mixed_precision, inspect_model
 
 
 def verify_min_gpu_count(min_gpus: int = 2) -> bool:

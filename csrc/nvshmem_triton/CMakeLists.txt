@@ -128,36 +128,15 @@ add_custom_target(nvshmem_wrapper_bc ALL
     DEPENDS ${OUTPUT_DIR}/nvshmem_wrapper_full.bc
 )
 
-# Install the bitcode file to the Python package
-if(DEFINED SKBUILD_PLATLIB_DIR)
-    install(FILES ${OUTPUT_DIR}/nvshmem_wrapper.bc
-            DESTINATION ${SKBUILD_PLATLIB_DIR}/odc/primitives/
-            COMPONENT Runtime)
-    install(FILES ${OUTPUT_DIR}/nvshmem_wrapper_full.bc
-            DESTINATION ${SKBUILD_PLATLIB_DIR}/odc/primitives/
-            COMPONENT Runtime)
-else()
-    # Fallback for manual cmake builds
-    install(FILES ${OUTPUT_DIR}/nvshmem_wrapper.bc
-            DESTINATION odc/primitives/
-            COMPONENT Runtime)
-    install(FILES ${OUTPUT_DIR}/nvshmem_wrapper_full.bc
-            DESTINATION odc/primitives/
-            COMPONENT Runtime)
-endif()
-
-# For development: also copy to source directory
-add_custom_command(
-    TARGET nvshmem_wrapper_bc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${OUTPUT_DIR}/nvshmem_wrapper.bc
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../odc/primitives/nvshmem_wrapper.bc
-    COMMENT "Copying nvshmem_wrapper.bc to primitives directory for development"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${OUTPUT_DIR}/nvshmem_wrapper_full.bc
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../odc/primitives/nvshmem_wrapper_full.bc
-    COMMENT "Copying nvshmem_wrapper_full.bc to primitives directory for development"
-)
+# Install the bitcode files (for deployment/development builds)
+# Note: These are installed to a standard location, but in practice the files
+# are copied to odc/primitives/ by the parent CMakeLists.txt for development
+install(FILES ${OUTPUT_DIR}/nvshmem_wrapper.bc
+        DESTINATION odc/primitives/
+        COMPONENT Runtime)
+install(FILES ${OUTPUT_DIR}/nvshmem_wrapper_full.bc
+        DESTINATION odc/primitives/
+        COMPONENT Runtime)
 
 # Clean up intermediate files
 add_custom_command(
@@ -175,8 +154,18 @@ message(STATUS "  - NVSHMEM_HOME: ${NVSHMEM_HOME}")
 message(STATUS "  - Output Directory: ${OUTPUT_DIR}")
 message(STATUS "  - Clang: ${CLANG_EXECUTABLE}")
 message(STATUS "  - LLVM Tools: ${LLVM_DIS_EXECUTABLE}, ${LLVM_AS_EXECUTABLE}, ${LLVM_LINK_EXECUTABLE}")
-if(DEFINED SKBUILD_PLATLIB_DIR)
-    message(STATUS "  - Install Destination: ${SKBUILD_PLATLIB_DIR}/odc/primitives/")
-else()
-    message(STATUS "  - Install Destination: odc/primitives/")
-endif()
+message(STATUS "  - Install Destination: odc/primitives/")
+
+
+# Copy bitcode files to odc/primitives/ for local development
+# This allows the module to find them without running 'pip install'
+add_custom_command(TARGET nvshmem_wrapper_bc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/odc/primitives
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OUTPUT_DIR}/nvshmem_wrapper.bc
+        ${CMAKE_SOURCE_DIR}/odc/primitives/
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OUTPUT_DIR}/nvshmem_wrapper_full.bc
+        ${CMAKE_SOURCE_DIR}/odc/primitives/
+    COMMENT "Copying nvshmem bitcode files to odc/primitives/ for development and packaging"
+)

@@ -54,7 +54,7 @@ from transformers import (
 
 import odc
 from data import BatchedDataset
-from odc.fsdp.patch_fsdp1 import patch_fsdp1, pre_minibatch_start, pre_optimizer_step, stop
+from odc.fsdp.fsdp1 import patch_fsdp1, pre_minibatch_start, pre_optimizer_step, stop
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
 enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
@@ -340,10 +340,10 @@ def train_step(model, batch):
 def main():
     setup_distributed()
     if args.forward_only:
-        import odc.fsdp.patch_fsdp1
+        import odc.fsdp.fsdp1
 
         src_tensor = torch.randn(1024, dtype=torch.bfloat16, device="cuda")
-        odc.fsdp.patch_fsdp1.reduction_service.reduce_scatter_accumulation(
+        odc.fsdp.fsdp1.reduction_service.reduce_scatter_accumulation(
             0, src_tensor, dist.group.WORLD
         )
     """Main training function"""
