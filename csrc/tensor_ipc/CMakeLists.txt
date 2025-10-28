@@ -9,7 +9,8 @@ endif()
 
 # Find required packages (CUDA should already be found by parent)
 if(NOT CUDA_FOUND)
-    find_package(CUDA REQUIRED)
+    # find_package(CUDA REQUIRED)
+    enable_language(CUDA)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
@@ -40,7 +41,7 @@ message(STATUS "CUDA_LIBRARIES: ${CUDA_LIBRARIES}")
 target_link_libraries(tensor_ipc PRIVATE
     ${TORCH_LIBRARIES}
     ${TORCH_PYTHON_LIBRARY}
-    ${CUDA_LIBRARIES}
+    # ${CUDA_LIBRARIES}
     cuda
 )
 

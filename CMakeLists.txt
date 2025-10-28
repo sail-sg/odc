@@ -17,7 +17,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(pybind11)
 
 # Find required packages
-find_package(CUDA REQUIRED)
+enable_language(CUDA)
+# find_package(CUDA REQUIRED)
 
 find_program(PYTHON_EXECUTABLE NAMES python3 python)
 execute_process(

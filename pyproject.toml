@@ -3,7 +3,6 @@ requires = [
     "setuptools>=62",
     "setuptools_scm",
     "wheel",
-    "cmake>=3.18",
     "scikit-build-core>=0.3.3",
     # "torch>=2.8.0",
     "nvidia-nvshmem-cu12",

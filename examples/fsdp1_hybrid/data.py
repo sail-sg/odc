@@ -1,6 +1,5 @@
-from datasets import Dataset
-
 import torch
+from datasets import Dataset
 
 
 class BatchedDataset:

@@ -4,22 +4,24 @@ import os
 import torch
 from checkpoint import Checkpointer
 from model import ModelArgs, Transformer
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+from odc.fsdp.fsdp2 import ODCAllGather, set_custom_all_gather
 from utils import inspect_mixed_precision, inspect_model
 
+
 def verify_min_gpu_count(min_gpus: int = 2) -> bool:
-    """ verification that we have at least 2 gpus to run dist examples """
+    """verification that we have at least 2 gpus to run dist examples"""
     has_gpu = torch.accelerator.is_available()
     gpu_count = torch.accelerator.device_count()
     return has_gpu and gpu_count >= min_gpus
+
 
 def set_modules_to_forward_prefetch(model, num_to_forward_prefetch):
     for i, layer in enumerate(model.layers):
         if i >= len(model.layers) - num_to_forward_prefetch:
             break
-        layers_to_prefetch = [
-            model.layers[i + j] for j in range(1, num_to_forward_prefetch + 1)
-        ]
+        layers_to_prefetch = [model.layers[i + j] for j in range(1, num_to_forward_prefetch + 1)]
         layer.set_modules_to_forward_prefetch(layers_to_prefetch)
 
 
@@ -27,9 +29,7 @@ def set_modules_to_backward_prefetch(model, num_to_backward_prefetch):
     for i, layer in enumerate(model.layers):
         if i < num_to_backward_prefetch:
             continue
-        layers_to_prefetch = [
-            model.layers[i - j] for j in range(1, num_to_backward_prefetch + 1)
-        ]
+        layers_to_prefetch = [model.layers[i - j] for j in range(1, num_to_backward_prefetch + 1)]
         layer.set_modules_to_backward_prefetch(layers_to_prefetch)
 
 
@@ -72,9 +72,13 @@ def main(args):
         )
     for layer in model.layers:
         fully_shard(layer, **fsdp_kwargs)
-    fully_shard(model, **fsdp_kwargs)
+    fsdp_model = fully_shard(model, **fsdp_kwargs)
 
     inspect_model(model)
+    from torch.distributed.fsdp import FSDPModule
+
+    print(f"model {type(model)} {isinstance(model, FSDPModule)} {model._get_fsdp_state()}")
+    set_custom_all_gather(fsdp_model, ODCAllGather())
 
     if args.explicit_prefetching:
         set_modules_to_forward_prefetch(model, num_to_forward_prefetch=2)
@@ -86,7 +90,7 @@ def main(args):
         model.reset_parameters()
     else:
         checkpointer.load_model(model)
-    
+
     if args.mixed_precision:
         inspect_mixed_precision(model)
 
@@ -114,5 +118,5 @@ if __name__ == "__main__":
     parser.add_argument("--mixed-precision", action="store_true", default=False)
     parser.add_argument("--dcp-api", action="store_true", default=False)
     args = parser.parse_args()
-    
+
     main(args)

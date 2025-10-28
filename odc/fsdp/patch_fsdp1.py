@@ -1,7 +1,11 @@
-import os
-
 import torch
 import torch.distributed as dist
+from torch.distributed.fsdp._flat_param import FlatParamHandle, HandleShardingStrategy
+from torch.distributed.fsdp._runtime_utils import (
+    _div_if_needed,
+    _FSDPState,
+    _get_reduce_scatter_tensors,
+)
 
 import odc
 
@@ -14,15 +18,6 @@ def _reduce_grad(state, handle) -> None:
     For sharded strategies, this runs gradient reduction, sharded gradient
     accumulation if needed, and the post-reduction callback.
     """
-    from torch.distributed.fsdp._common_utils import _no_dispatch_record_stream
-    from torch.distributed.fsdp._flat_param import HandleShardingStrategy
-    from torch.distributed.fsdp._runtime_utils import (
-        _accumulate_sharded_grad,
-        _div_if_needed,
-        _FSDPState,
-        _get_reduce_scatter_tensors,
-        _post_reduce_grad_callback,
-    )
 
     flat_param = handle.flat_param
     uses_hybrid_sharded_strategy = handle._sharding_strategy in (
@@ -49,10 +44,7 @@ def _reduce_grad(state, handle) -> None:
         # )
         # print(f"Rank {dist.get_rank()}: reduce_scatter_accumulation")
 
-        if os.environ.get("ODC_NCCL_COMM", "0") == "1":
-            rs_func = reduction_service.reduce_scatter_accumulation_nccl_comm
-        else:
-            rs_func = reduction_service.reduce_scatter_accumulation
+        rs_func = reduction_service.reduce_scatter_accumulation
         rs_func(id(handle.flat_param), padded_unsharded_grad, pg)
         handle.flat_param._saved_grad_shard = reduction_service.get_accumulation(
             id(handle.flat_param)
@@ -167,11 +159,7 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
         dist.all_gather(tensor_list, sharded_flat_param, group=pg)
     else:
-        if os.environ.get("ODC_NCCL_COMM", "0") == "1":
-            ag_func = gather_service.all_gather_into_tensor_nccl_comm
-        else:
-            # ag_func = odc.all_gather_into_tensor
-            ag_func = gather_service.all_gather_into_tensor
+        ag_func = gather_service.all_gather_into_tensor
         ag_func(
             padded_unsharded_flat_param,
             sharded_flat_param,
@@ -188,8 +176,6 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
     return padded_unsharded_flat_param
 
-
-from torch.distributed.fsdp._flat_param import FlatParamHandle
 
 old_get_shard = FlatParamHandle._get_shard
 
@@ -209,11 +195,9 @@ def patch_fsdp1(reduce_dtype=None):
     global reduction_service, gather_service
     reduction_service = odc.ReductionService(accumulation_dtype=reduce_dtype)
     gather_service = odc.GatherService()
-    import torch.distributed.fsdp._runtime_utils as _runtime_utils
+    from torch.distributed.fsdp import _runtime_utils
 
     _runtime_utils._reduce_grad = _reduce_grad
-
-    from torch.distributed.fsdp._flat_param import FlatParamHandle
 
     FlatParamHandle.prepare_gradient_for_optim = prepare_gradient_for_optim
     FlatParamHandle._get_shard = custom_get_shard
@@ -221,12 +205,9 @@ def patch_fsdp1(reduce_dtype=None):
 
 
 def pre_optimizer_step(fsdp_module):
-    import torch.distributed as dist
-    from torch.distributed.fsdp._runtime_utils import _div_if_needed, _FSDPState
 
     assert isinstance(fsdp_module, _FSDPState)
     reduction_service.sync(fsdp_module.process_group)
-    import time
 
     # time.sleep(1)
     for acc in reduction_service.accumulations:
@@ -242,23 +223,19 @@ def pre_optimizer_step(fsdp_module):
 
 
 def pre_minibatch_start(fsdp_module):
-    global reduction_service
-    import torch.distributed as dist
-
     reduction_service.clear_accumulations()
     # for handle in fsdp_module._all_handles:
     #     odc.all_gather_sync_cache(handle.flat_param, fsdp_module.process_group)
 
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-    for fsdp_module in FSDP.fsdp_modules(fsdp_module):
-        gather_service.all_gather_sync_cache(fsdp_module._flat_param, fsdp_module.process_group)
+    for fsdp_mod in FSDP.fsdp_modules(fsdp_module):
+        gather_service.all_gather_sync_cache(fsdp_mod._flat_param, fsdp_mod.process_group)
 
     # Make sure optimizer updates are visible to all ranks
     dist.barrier()
 
 
 def stop():
-    global reduction_service
     reduction_service.stop()
     odc.SymmBufferRegistry.get_instance().finalize()

@@ -4,16 +4,15 @@ import time
 import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
     _init_optim_state,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
-    StateDictOptions,
 )
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import distribute_tensor, DTensor
-
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 MODEL_CHECKPOINT = "model_state_dict.pt"
 OPTIM_CHECKPOINT = "optim_state_dict.pt"
@@ -201,7 +200,9 @@ class Checkpointer:
         optim_state_dict = self._get_full_optimizer_state_dict(model, optim)
         if torch.distributed.get_rank() == 0:
             new_training_time = int(time.time() * 1000)
-            new_checkpoint_folder = f"{self.folder}/{'dcp_api' if self.dcp_api else 'dtensor_api'}/{new_training_time}"
+            new_checkpoint_folder = (
+                f"{self.folder}/{'dcp_api' if self.dcp_api else 'dtensor_api'}/{new_training_time}"
+            )
             new_model_checkpoint = f"{new_checkpoint_folder}/{MODEL_CHECKPOINT}"
             new_optim_checkpoint = f"{new_checkpoint_folder}/{OPTIM_CHECKPOINT}"
             os.makedirs(new_checkpoint_folder, exist_ok=True)

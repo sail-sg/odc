@@ -1,5 +1,6 @@
-from datasets import load_dataset
 import argparse
+
+from datasets import load_dataset
 from transformers import AutoTokenizer
 
 

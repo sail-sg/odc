@@ -1,37 +1,38 @@
-from functools import partial
-import os
-import torch
-import numpy as np
 import heapq
-from torch import distributed as dist
+import os
+from functools import partial
 from typing import List
+
+import numpy as np
+import torch
 from args import get_args
+from torch import distributed as dist
 
 
 def bin_packing_first_fit_decreasing(bin_capacity, items):
     """
-    使用First Fit Decreasing算法解决装箱问题
+    Solve the bin packing problem using First Fit Decreasing algorithm
 
     Args:
-        bin_capacity (int): 每个背包的容量
-        items (list): 物品体积列表
+        bin_capacity (int): Capacity of each bin
+        items (list): List of item volumes
 
     Returns:
-        tuple: (最少背包数量, 背包分配详情(索引), 背包分配详情(体积))
+        tuple: (minimum number of bins, bin allocation details (indices), bin allocation details (volumes))
     """
     if not items:
         return 0, [], []
 
-    # 创建(体积, 原始索引)的元组列表，按体积从大到小排序
+    # Create a list of (volume, original_index) tuples, sorted by volume in descending order
     indexed_items = [(volume, idx) for idx, volume in enumerate(items)]
     indexed_items.sort(key=lambda x: x[0], reverse=True)
 
-    # 初始化背包列表
-    bins_volume = []  # 存储体积
-    bins_index = []   # 存储索引
+    # Initialize bin lists
+    bins_volume = []  # Store volumes
+    bins_index = []  # Store indices
 
     for volume, original_idx in indexed_items:
-        # 尝试将物品放入现有背包
+        # Try to place the item into an existing bin
         placed = False
         for i, bin_content in enumerate(bins_volume):
             if sum(bin_content) + volume <= bin_capacity:
@@ -40,7 +41,7 @@ def bin_packing_first_fit_decreasing(bin_capacity, items):
                 placed = True
                 break
 
-        # 如果无法放入现有背包，创建新背包
+        # If unable to fit into existing bins, create a new bin
         if not placed:
             bins_volume.append([volume])
             bins_index.append([original_idx])
@@ -50,30 +51,30 @@ def bin_packing_first_fit_decreasing(bin_capacity, items):
 
 def bin_packing_best_fit_decreasing(bin_capacity, items):
     """
-    使用Best Fit Decreasing算法解决装箱问题
+    Solve the bin packing problem using Best Fit Decreasing algorithm
 
     Args:
-        bin_capacity (int): 每个背包的容量
-        items (list): 物品体积列表
+        bin_capacity (int): Capacity of each bin
+        items (list): List of item volumes
 
     Returns:
-        tuple: (最少背包数量, 背包分配详情(索引), 背包分配详情(体积))
+        tuple: (minimum number of bins, bin allocation details (indices), bin allocation details (volumes))
     """
     if not items:
         return 0, [], []
 
-    # 创建(体积, 原始索引)的元组列表，按体积从大到小排序
+    # Create a list of (volume, original_index) tuples, sorted by volume in descending order
     indexed_items = [(volume, idx) for idx, volume in enumerate(items)]
     indexed_items.sort(key=lambda x: x[0], reverse=True)
 
-    # 初始化背包列表
-    bins_volume = []  # 存储体积
-    bins_index = []   # 存储索引
+    # Initialize bin lists
+    bins_volume = []  # Store volumes
+    bins_index = []  # Store indices
 
     for volume, original_idx in indexed_items:
-        # 找到剩余空间最小且能装下该物品的背包
+        # Find the bin with the smallest remaining space that can fit this item
         best_bin_idx = -1
-        min_remaining_space = float('inf')
+        min_remaining_space = float("inf")
 
         for i, bin_content in enumerate(bins_volume):
             remaining_space = bin_capacity - sum(bin_content)
@@ -81,7 +82,7 @@ def bin_packing_best_fit_decreasing(bin_capacity, items):
                 min_remaining_space = remaining_space
                 best_bin_idx = i
 
-        # 如果找到合适的背包，放入；否则创建新背包
+        # If a suitable bin is found, place the item; otherwise create a new bin
         if best_bin_idx != -1:
             bins_volume[best_bin_idx].append(volume)
             bins_index[best_bin_idx].append(original_idx)
@@ -165,8 +166,7 @@ def karmarkar_karp(seq_cost_list: list[int], k_partitions: int, equal_size: bool
             repr_str += "]"
             return repr_str
 
-    sorted_seq_cost_list = sorted([(seqlen, i)
-                                  for i, seqlen in enumerate(seq_cost_list)])
+    sorted_seq_cost_list = sorted([(seqlen, i) for i, seqlen in enumerate(seq_cost_list)])
     states_pq = []
     if equal_size:
         assert len(seq_cost_list) % k_partitions == 0
@@ -178,8 +178,7 @@ def karmarkar_karp(seq_cost_list: list[int], k_partitions: int, equal_size: bool
             heapq.heappush(states_pq, State(items=items, k=k_partitions))
     else:
         for seqlen, idx in sorted_seq_cost_list:
-            heapq.heappush(states_pq, State(
-                items=[(idx, seqlen)], k=k_partitions))
+            heapq.heappush(states_pq, State(items=[(idx, seqlen)], k=k_partitions))
 
     while len(states_pq) > 1:
         state0 = heapq.heappop(states_pq)
@@ -192,16 +191,15 @@ def karmarkar_karp(seq_cost_list: list[int], k_partitions: int, equal_size: bool
     partitions = final_state.get_partitions()
     if equal_size:
         for i, partition in enumerate(partitions):
-            assert len(partition) * k_partitions == len(seq_cost_list), (
-                f"{len(partition)} * {k_partitions} != {len(seq_cost_list)}"
-            )
+            assert len(partition) * k_partitions == len(
+                seq_cost_list
+            ), f"{len(partition)} * {k_partitions} != {len(seq_cost_list)}"
     return partitions
 
 
 def greedy_partition(seqlen_list: list[int], k_partitions: int, equal_size: bool):
     bias = sum(seqlen_list) + 1 if equal_size else 0
-    sorted_seqlen = [(seqlen + bias, i)
-                     for i, seqlen in enumerate(seqlen_list)]
+    sorted_seqlen = [(seqlen + bias, i) for i, seqlen in enumerate(seqlen_list)]
     partitions = [[] for _ in range(k_partitions)]
     partition_sums = [0 for _ in range(k_partitions)]
     for seqlen, i in sorted_seqlen:
@@ -213,9 +211,9 @@ def greedy_partition(seqlen_list: list[int], k_partitions: int, equal_size: bool
         partition_sums[min_idx] += seqlen
     if equal_size:
         for i, partition in enumerate(partitions):
-            assert len(partition) * k_partitions == len(seqlen_list), (
-                f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
-            )
+            assert len(partition) * k_partitions == len(
+                seqlen_list
+            ), f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
     return partitions
 
 
@@ -233,7 +231,10 @@ def swap_two_partitions(seq_cost_list: list[int], partitions: list[list[int]]):
                 cost_2 = seq_cost_list[idx_2]
                 if cost_1 - cost_2 <= eps:
                     continue
-                if max_cost - cost_1 + cost_2 > min_cost + eps and min_cost - cost_1 + cost_2 + eps < max_cost:
+                if (
+                    max_cost - cost_1 + cost_2 > min_cost + eps
+                    and min_cost - cost_1 + cost_2 + eps < max_cost
+                ):
                     partition_1[i] = idx_2
                     partition_2[j] = idx_1
                     return True
@@ -257,7 +258,10 @@ def swap_max_partition(seq_cost_list: list[int], partitions: list[list[int]]):
                 swap_cost = seq_cost_list[swap_idx]
                 if item_cost - swap_cost <= eps:
                     continue
-                if cost_j - swap_cost + item_cost + eps < max_cost and max_cost - item_cost + swap_cost > min_cost + eps:
+                if (
+                    cost_j - swap_cost + item_cost + eps < max_cost
+                    and max_cost - item_cost + swap_cost > min_cost + eps
+                ):
                     partitions[j][k] = item_idx
                     partitions[0][i] = swap_idx
                     return True
@@ -275,7 +279,10 @@ def swap_min_partition(seq_cost_list: list[int], partitions: list[list[int]]):
                 swap_cost = seq_cost_list[swap_idx]
                 if swap_cost - item_cost <= eps:
                     continue
-                if cost_j - swap_cost + item_cost > min_cost + eps and min_cost - item_cost + swap_cost + eps < max_cost:
+                if (
+                    cost_j - swap_cost + item_cost > min_cost + eps
+                    and min_cost - item_cost + swap_cost + eps < max_cost
+                ):
                     partitions[j][k] = item_idx
                     partitions[-1][i] = swap_idx
                     return True
@@ -285,7 +292,9 @@ def swap_min_partition(seq_cost_list: list[int], partitions: list[list[int]]):
 def print_partitions(seq_cost_list: list[int], partitions: list[list[int]]):
     print("seq_cost_list: ", seq_cost_list)
     for i, partition in enumerate(partitions):
-        print(f"partition[{i}]: {partition}, sum of workloads: {sum(seq_cost_list[i] for i in partition)}")
+        print(
+            f"partition[{i}]: {partition}, sum of workloads: {sum(seq_cost_list[i] for i in partition)}"
+        )
     print("-" * 50)
 
 
@@ -293,10 +302,11 @@ def balance_partition(seq_cost_list: list[int], partitions: list[list[int]]):
     # print("before balance:")
     # print_partitions(seq_cost_list, partitions)
     while True:
-        partitions = sorted(partitions, key=lambda x: (
-            sum(seq_cost_list[i] for i in x),
-            min(x) if x else 0
-        ), reverse=True)
+        partitions = sorted(
+            partitions,
+            key=lambda x: (sum(seq_cost_list[i] for i in x), min(x) if x else 0),
+            reverse=True,
+        )
         if swap_max_partition(seq_cost_list, partitions):
             continue
         if swap_min_partition(seq_cost_list, partitions):
@@ -308,7 +318,9 @@ def balance_partition(seq_cost_list: list[int], partitions: list[list[int]]):
 
 
 def get_seqlen_balanced_partitions(
-    seqlen_list: list[int], k_partitions: int, equal_size: bool,
+    seqlen_list: list[int],
+    k_partitions: int,
+    equal_size: bool,
     get_seq_costs_func=None,
 ):
     """
@@ -339,12 +351,12 @@ def get_seqlen_balanced_partitions(
     if get_seq_costs_func is None:
         get_seq_costs_func = get_seq_costs_linear
     seq_cost_list = get_seq_costs_func(seqlen_list)
-    assert len(seq_cost_list) >= k_partitions, f"number of items:[{
-        len(seq_cost_list)}] < k_partitions:[{k_partitions}]"
+    assert (
+        len(seq_cost_list) >= k_partitions
+    ), f"number of items:[{len(seq_cost_list)}] < k_partitions:[{k_partitions}]"
 
     def _check_and_sort_partitions(partitions):
-        assert len(partitions) == k_partitions, f"{
-            len(partitions)} != {k_partitions}"
+        assert len(partitions) == k_partitions, f"{len(partitions)} != {k_partitions}"
         seen_idx = set()
         sorted_partitions = [None] * k_partitions
         for i, partition in enumerate(partitions):
@@ -356,16 +368,17 @@ def get_seqlen_balanced_partitions(
         return sorted_partitions
 
     def _get_workload_diff(partitions):
-        partition_workloads = [sum(seq_cost_list[i]
-                                   for i in partition) for partition in partitions]
+        partition_workloads = [sum(seq_cost_list[i] for i in partition) for partition in partitions]
         return max(partition_workloads) - min(partition_workloads)
 
     partitions = karmarkar_karp(
-        seq_cost_list=seq_cost_list, k_partitions=k_partitions, equal_size=equal_size)
+        seq_cost_list=seq_cost_list, k_partitions=k_partitions, equal_size=equal_size
+    )
     partitions = balance_partition(seq_cost_list, partitions)
     if not equal_size and len(seq_cost_list) % k_partitions == 0:
         equal_partitions = karmarkar_karp(
-            seq_cost_list=seq_cost_list, k_partitions=k_partitions, equal_size=True)
+            seq_cost_list=seq_cost_list, k_partitions=k_partitions, equal_size=True
+        )
         equal_partitions = balance_partition(seq_cost_list, equal_partitions)
         if _get_workload_diff(partitions) > _get_workload_diff(equal_partitions):
             partitions = equal_partitions
@@ -392,20 +405,21 @@ def rearrange_micro_batches(
         get_seq_costs_func = get_seq_costs_linear
     total_seqlen = sum(seq_len_effective)
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
-    num_micro_batches = min(len(seq_len_effective),
-                            ceildiv(total_seqlen, max_token_len))
+    num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
     if dist.is_initialized() and same_num_in_dp:
         num_micro_batches = torch.tensor([num_micro_batches]).cuda()
-        dist.all_reduce(num_micro_batches,
-                        op=dist.ReduceOp.MAX, group=dp_group)
+        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
 
     # Guarantee that the sum of sequence lengths in each partition is less than max_token_len
     while True:
-        assert num_micro_batches <= len(seq_len_effective), f"{num_micro_batches} <= {
-            len(seq_len_effective)}"
+        assert num_micro_batches <= len(
+            seq_len_effective
+        ), f"{num_micro_batches} <= {len(seq_len_effective)}"
         micro_bsz_idx = get_seqlen_balanced_partitions(
-            seq_len_effective, num_micro_batches, equal_size=False,
+            seq_len_effective,
+            num_micro_batches,
+            equal_size=False,
             get_seq_costs_func=get_seq_costs_func,
         )
         check_failed = False
@@ -414,8 +428,7 @@ def rearrange_micro_batches(
             if cur_sum > max_token_len:  # should satisfy the memory constraint
                 check_failed = True
                 break
-        actual_size = num_micro_batches + \
-            1 if check_failed else len(micro_bsz_idx)
+        actual_size = num_micro_batches + 1 if check_failed else len(micro_bsz_idx)
         if dist.is_initialized() and same_num_in_dp:
             actual_size = torch.tensor([actual_size]).cuda()
             dist.all_reduce(actual_size, op=dist.ReduceOp.MAX, group=dp_group)
@@ -428,8 +441,7 @@ def rearrange_micro_batches(
         # Use the sum of squared sequence lengths to approximate attention computation workload
         micro_bsz_idx.sort(
             key=lambda partition: (
-                sum(get_seq_costs_func(
-                    [seq_len_effective[idx] for idx in partition])),
+                sum(get_seq_costs_func([seq_len_effective[idx] for idx in partition])),
                 min(partition) if partition else 0,
             ),
             reverse=True,
@@ -462,6 +474,7 @@ def get_seq_costs_fit(seq_len: List[int]):
 
 def _get_seq_costs_flops(model, seq_len):
     """Compute flops of the model"""
+
     def compute_flops(seq):
         linear_flops = 0
         # flops of Linear layers
@@ -477,6 +490,7 @@ def _get_seq_costs_flops(model, seq_len):
         # flops = (linear_flops + attn_flops * seq) * seq
         flops = (linear_flops / attn_flops + seq) / 32000 * seq / 32000
         return flops
+
     return [compute_flops(_) for _ in seq_len]
 
 
@@ -495,20 +509,32 @@ def get_packing_function(packing_method, *args, **kwargs):
     else:
         raise ValueError(f"Cost model {cost_model} not supported")
     if packing_method in {"DebugUneven"}:
-        assert os.environ.get(
-            "ODC", "0") == "1", "Packing method that results in different number of micro batches per minibatch requires ODC to be enabled"
+        assert (
+            os.environ.get("ODC", "0") == "1"
+        ), "Packing method that results in different number of micro batches per minibatch requires ODC to be enabled"
     if packing_method == "None":
         function = none_packing
     elif packing_method == "DynamicSameMicro":
         max_token_len = get_args().max_token_len
-        function = partial(dynamic_packing, max_token_len=max_token_len, same_micro_num=True,
-                           use_bin_packing=False, get_seq_costs_func=get_seq_costs_func,)
+        function = partial(
+            dynamic_packing,
+            max_token_len=max_token_len,
+            same_micro_num=True,
+            use_bin_packing=False,
+            get_seq_costs_func=get_seq_costs_func,
+        )
     elif packing_method == "DynamicDiffMicro":
         max_token_len = get_args().max_token_len
-        assert os.environ.get(
-            "ODC", "0") == "1", "Packing method that results in different number of micro batches per minibatch requires ODC to be enabled"
-        function = partial(dynamic_packing, max_token_len=max_token_len, same_micro_num=False,
-                           use_bin_packing=False, get_seq_costs_func=get_seq_costs_func,)
+        assert (
+            os.environ.get("ODC", "0") == "1"
+        ), "Packing method that results in different number of micro batches per minibatch requires ODC to be enabled"
+        function = partial(
+            dynamic_packing,
+            max_token_len=max_token_len,
+            same_micro_num=False,
+            use_bin_packing=False,
+            get_seq_costs_func=get_seq_costs_func,
+        )
     elif packing_method == "LocalSort":
         function = local_sort_packing
     elif packing_method == "DebugUneven":
@@ -518,6 +544,7 @@ def get_packing_function(packing_method, *args, **kwargs):
 
     def wrapper(lengths, rank, world_size):
         return function(lengths, rank, world_size, *args, **kwargs)
+
     return wrapper
 
 
@@ -527,14 +554,21 @@ def none_packing(lengths, rank, world_size):
 
 
 def dynamic_packing(
-    lengths, rank, world_size, max_token_len,
-    same_micro_num=False, use_bin_packing=False, get_seq_costs_func=None
+    lengths,
+    rank,
+    world_size,
+    max_token_len,
+    same_micro_num=False,
+    use_bin_packing=False,
+    get_seq_costs_func=None,
 ):
     assert max(lengths) <= max_token_len, f"{max(lengths)} <= {max_token_len}"
     length_np = np.array(lengths, dtype=np.int32)
     # we enforce equal partition size to guarantee a valid solution exist for the same micro num
     mini_partitions = get_seqlen_balanced_partitions(
-        lengths, world_size, equal_size=same_micro_num,
+        lengths,
+        world_size,
+        equal_size=same_micro_num,
         get_seq_costs_func=get_seq_costs_func,
     )
     min_workload = int(1e18)
@@ -550,7 +584,9 @@ def dynamic_packing(
         min_workload = min(min_workload, workload)
         max_workload = max(max_workload, workload)
     if rank == 0:
-        print(f"min_workload: {min_workload}, max_workload: {max_workload}, diff: {(max_workload - min_workload) / (min_workload + 1e-10)}")
+        print(
+            f"min_workload: {min_workload}, max_workload: {max_workload}, diff: {(max_workload - min_workload) / (min_workload + 1e-10)}"
+        )
     local_mini_index_np = np.array(mini_partitions[rank], dtype=np.int32)
     local_mini_length_np = length_np[local_mini_index_np]
     if not same_micro_num:  # for odc
@@ -566,8 +602,7 @@ def dynamic_packing(
                 sort_partition_workload=True,
                 get_seq_costs_func=get_seq_costs_func,
             )
-        local_idx = [local_mini_index_np[micro_idx].tolist()
-                     for micro_idx in micro_indexes]
+        local_idx = [local_mini_index_np[micro_idx].tolist() for micro_idx in micro_indexes]
     else:  # for baseline
         micro_indexes = rearrange_micro_batches(
             local_mini_length_np.tolist(),
@@ -576,8 +611,7 @@ def dynamic_packing(
             sort_partition_workload=True,
             get_seq_costs_func=get_seq_costs_func,
         )
-        local_idx = [local_mini_index_np[micro_idx].tolist()
-                     for micro_idx in micro_indexes]
+        local_idx = [local_mini_index_np[micro_idx].tolist() for micro_idx in micro_indexes]
     return local_idx
 
 
@@ -595,25 +629,113 @@ def debug_even_packing(lengths, rank, world_size):
         micro_batch_size = 1
     else:
         micro_batch_size = 2
-    return [local_idx[i:i+micro_batch_size] for i in range(0, len(local_idx), micro_batch_size)]
+    return [local_idx[i : i + micro_batch_size] for i in range(0, len(local_idx), micro_batch_size)]
 
 
 if __name__ == "__main__":
     import random
+
     max_token_len = 24000
-    test_case_1 = [3935, 4591, 5994, 6805, 7086, 8335, 9503, 10414, 11438, 12668, 13060, 14036,
-                   15997, 16164, 17815, 18436, 19247, 20807, 21465, 22502, 23177, 24181, 25622, 26959]
-    test_case_2 = [2124, 3614, 2676, 5724, 4391, 7025, 7563, 9595, 8410, 9059, 12683, 12109,
-                   12728, 15604, 16704, 17581, 17335, 18072, 20323, 19439, 21038, 22028, 22641, 23787]
-    test_case_3 = [1703, 6758, 4134, 8195, 8167, 9043, 10393, 9567, 8820, 14510, 14469, 16277,
-                   16042, 14128, 15989, 17185, 18315, 22962, 19951, 22917, 23478, 23601, 24000, 24000]
-    test_case_4 = [134, 4340, 7768, 8056, 7682, 5980, 10714,
-                   9368, 8042, 10225, 10101, 12527, 12955, 14022, 19783, 20110]
+    test_case_1 = [
+        3935,
+        4591,
+        5994,
+        6805,
+        7086,
+        8335,
+        9503,
+        10414,
+        11438,
+        12668,
+        13060,
+        14036,
+        15997,
+        16164,
+        17815,
+        18436,
+        19247,
+        20807,
+        21465,
+        22502,
+        23177,
+        24181,
+        25622,
+        26959,
+    ]
+    test_case_2 = [
+        2124,
+        3614,
+        2676,
+        5724,
+        4391,
+        7025,
+        7563,
+        9595,
+        8410,
+        9059,
+        12683,
+        12109,
+        12728,
+        15604,
+        16704,
+        17581,
+        17335,
+        18072,
+        20323,
+        19439,
+        21038,
+        22028,
+        22641,
+        23787,
+    ]
+    test_case_3 = [
+        1703,
+        6758,
+        4134,
+        8195,
+        8167,
+        9043,
+        10393,
+        9567,
+        8820,
+        14510,
+        14469,
+        16277,
+        16042,
+        14128,
+        15989,
+        17185,
+        18315,
+        22962,
+        19951,
+        22917,
+        23478,
+        23601,
+        24000,
+        24000,
+    ]
+    test_case_4 = [
+        134,
+        4340,
+        7768,
+        8056,
+        7682,
+        5980,
+        10714,
+        9368,
+        8042,
+        10225,
+        10101,
+        12527,
+        12955,
+        14022,
+        19783,
+        20110,
+    ]
 
     test_cases = []
     for _ in range(10):
-        test_cases.append([i * 1000 + random.randint(0, 6000)
-                          for i in range(16)])
+        test_cases.append([i * 1000 + random.randint(0, 6000) for i in range(16)])
     test_cases.extend([test_case_1, test_case_2, test_case_3, test_case_4])
 
     get_seq_costs_func = get_seq_costs_linear
@@ -625,36 +747,52 @@ if __name__ == "__main__":
         max_workload = 0
         for i in range(8):
             local_idx = dynamic_packing(
-                lengths, i, 8,
+                lengths,
+                i,
+                8,
                 max_token_len=max_token_len,
-                same_micro_num=True, use_bin_packing=False,
+                same_micro_num=True,
+                use_bin_packing=False,
                 get_seq_costs_func=get_seq_costs_func,
             )
             local_lengths = [lengths[j] for j in sum(local_idx, [])]
             local_workload = get_seq_costs_func(local_lengths)
-            print(local_idx, "\t|\t", local_lengths,
-                  "\t|\t", sum(local_workload))
+            print(local_idx, "\t|\t", local_lengths, "\t|\t", sum(local_workload))
             min_workload = min(min_workload, sum(local_workload))
             max_workload = max(max_workload, sum(local_workload))
-        print("[Baseline] min_workload: ", min_workload, "max_workload: ",
-              max_workload, "diff: ", (max_workload - min_workload) / min_workload)
+        print(
+            "[Baseline] min_workload: ",
+            min_workload,
+            "max_workload: ",
+            max_workload,
+            "diff: ",
+            (max_workload - min_workload) / min_workload,
+        )
         min_workload = int(1e18)
         max_workload = 0
         for i in range(8):
             local_idx = dynamic_packing(
-                lengths, i, 8,
+                lengths,
+                i,
+                8,
                 max_token_len=max_token_len,
-                same_micro_num=False, use_bin_packing=False,
+                same_micro_num=False,
+                use_bin_packing=False,
                 get_seq_costs_func=get_seq_costs_func,
             )
             local_lengths = [lengths[j] for j in sum(local_idx, [])]
             local_workload = get_seq_costs_func(local_lengths)
-            print(local_idx, "\t|\t", local_lengths,
-                  "\t|\t", sum(local_workload))
+            print(local_idx, "\t|\t", local_lengths, "\t|\t", sum(local_workload))
             min_workload = min(min_workload, sum(local_workload))
             max_workload = max(max_workload, sum(local_workload))
-        print("[ODC] min_workload: ", min_workload, "max_workload: ",
-              max_workload, "diff: ", (max_workload - min_workload) / min_workload)
+        print(
+            "[ODC] min_workload: ",
+            min_workload,
+            "max_workload: ",
+            max_workload,
+            "diff: ",
+            (max_workload - min_workload) / min_workload,
+        )
         print("\n", "-" * 50, "\n")
 
     print(32000 * 2.611821 / 1536 / 1.982122)

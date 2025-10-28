@@ -79,9 +79,7 @@ class TransformerBlock(nn.Module):
         self.attention_norm = nn.LayerNorm(args.dim)
         self.attention = Attention(args)
         self.ffn_norm = nn.LayerNorm(args.dim)
-        self.feed_forward = FeedForward(
-            args.dim, hidden_dim=4 * args.dim, dropout_p=args.dropout_p
-        )
+        self.feed_forward = FeedForward(args.dim, hidden_dim=4 * args.dim, dropout_p=args.dropout_p)
 
     def forward(self, x):
         h = x + self.attention(self.attention_norm(x))

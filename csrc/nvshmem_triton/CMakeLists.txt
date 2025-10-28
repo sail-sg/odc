@@ -9,7 +9,8 @@ endif()
 
 # Find required packages (CUDA should already be found by parent)
 if(NOT CUDA_FOUND)
-    find_package(CUDA REQUIRED)
+    # find_package(CUDA REQUIRED)
+    enable_language(CUDA)
 endif()
 
 # Function to find NVSHMEM_HOME
