@@ -92,7 +92,7 @@ if __name__ == "__main__":
         gather_service = GatherService()
 
         comp_stream = torch.cuda.Stream()
-        for all_gather_func in [all_gather_into_tensor_nccl, gather_service.all_gather_into_tensor]:
+        for all_gather_func in [all_gather_into_tensor_nccl, gather_service.gather_into_tensor]:
             with torch.cuda.nvtx.range(all_gather_func.__name__):
                 start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]
                 comm_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]

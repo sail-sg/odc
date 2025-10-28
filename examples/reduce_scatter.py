@@ -109,8 +109,8 @@ def main():
             )
             nccl_accumulations[dest_idx].add_(output)
 
-        def reduce_scatter_accumulation(src_tensor, dest_idx, pg: dist.ProcessGroup):
-            reduction_service.reduce_scatter_accumulation(dest_idx, src_tensor, pg)
+        def scatter_accumulation(src_tensor, dest_idx, pg: dist.ProcessGroup):
+            reduction_service.scatter_accumulate(dest_idx, src_tensor, pg)
 
         dist.barrier()
         torch.cuda.synchronize()
@@ -119,18 +119,18 @@ def main():
         sync_inputs = torch.zeros(world_size, dtype=torch.int32, device="cuda")
 
         reduction_service.clear_accumulations()
-        with torch.cuda.nvtx.range("reduce_scatter_accumulation"):
+        with torch.cuda.nvtx.range("scatter_accumulation"):
             for i in range(cnt * times):
                 dst_idx = i % cnt
                 torch.distributed.all_reduce(sync_inputs, group=group)
-                reduce_scatter_accumulation(data[i], dst_idx, group)
+                scatter_accumulation(data[i], dst_idx, group)
             reduction_service.sync(group)
             dist.barrier()
             torch.cuda.synchronize()
 
         for reduce_scatter_func in [
             reduce_scatter_accumulation_nccl,
-            reduce_scatter_accumulation,
+            scatter_accumulation,
         ]:
             reduction_service.clear_accumulations()
 
@@ -165,7 +165,7 @@ def main():
                 end = torch.cuda.Event(enable_timing=True)
                 end.record()
 
-                if reduce_scatter_func == reduce_scatter_accumulation:
+                if reduce_scatter_func == scatter_accumulation:
                     reduction_service.sync(group)
                     for i in range(cnt):
                         # print(f"Rank {rank} nccl_accumulations: {nccl_accumulations[i]} reduction_service: {reduction_service.accumulations[i]}")

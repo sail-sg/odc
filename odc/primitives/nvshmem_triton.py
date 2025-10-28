@@ -67,7 +67,6 @@ def get_bc_path():
         return str(bc_file)
 
     # Fallback to build directory for development
-    # scikit-build-core uses build/{wheel_tag}/ structure
     build_dir = package_dir.parent / "build"
 
     if build_dir.exists():

@@ -42,9 +42,8 @@ def _reduce_grad(state, handle) -> None:
         #     padded_unsharded_grad,
         #     group=pg,
         # )
-        # print(f"Rank {dist.get_rank()}: reduce_scatter_accumulation")
 
-        rs_func = reduction_service.reduce_scatter_accumulation
+        rs_func = reduction_service.scatter_accumulate
         rs_func(id(handle.flat_param), padded_unsharded_grad, pg)
         handle.flat_param._saved_grad_shard = reduction_service.get_accumulation(
             id(handle.flat_param)
@@ -159,7 +158,7 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
         dist.all_gather(tensor_list, sharded_flat_param, group=pg)
     else:
-        ag_func = gather_service.all_gather_into_tensor
+        ag_func = gather_service.gather_into_tensor
         ag_func(
             padded_unsharded_flat_param,
             sharded_flat_param,

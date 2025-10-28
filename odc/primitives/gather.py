@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced(
+def nvshmem_device_producer_gather_2d_get_block_kernel_chunked_synced(
     remote_tensor_ptr,
     target_tensor_ptr,
     elem_per_rank,
@@ -74,7 +74,7 @@ class GatherService:
         self.shaped_buffer = {}
         self.buffer_splitter = BufferSplitter()
 
-    def all_gather_into_tensor(
+    def gather_into_tensor(
         self, output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup
     ):
         buf_size = self.buffer_splitter.get_global_buffer_size(output_tensor.shape)
@@ -147,7 +147,7 @@ class GatherService:
                 # grid_size = 8 if world_size == 32 else world_size
                 grid_size = get_local_world_size()
                 # logger.warning(f"Rank {torch.distributed.get_rank()} group_rank: {group_rank} group_size: {group_world_size} grid_size: {grid_size}")
-                nvshmem_device_producer_all_gather_2d_get_block_kernel_chunked_synced[(grid_size,)](
+                nvshmem_device_producer_gather_2d_get_block_kernel_chunked_synced[(grid_size,)](
                     remote_tensor_ptr=sub_input_tensor,
                     target_tensor_ptr=target_tensor_split.view(-1),
                     elem_per_rank=sub_input_tensor.numel(),

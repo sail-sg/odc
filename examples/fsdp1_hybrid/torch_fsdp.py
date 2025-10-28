@@ -343,9 +343,7 @@ def main():
         import odc.fsdp.fsdp1
 
         src_tensor = torch.randn(1024, dtype=torch.bfloat16, device="cuda")
-        odc.fsdp.fsdp1.reduction_service.reduce_scatter_accumulation(
-            0, src_tensor, dist.group.WORLD
-        )
+        odc.fsdp.fsdp1.reduction_service.scatter_accumulate(0, src_tensor, dist.group.WORLD)
     """Main training function"""
     # Set deterministic training first
     set_deterministic_training(seed=42)

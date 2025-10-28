@@ -28,7 +28,7 @@ class ODCAllGather(DefaultAllocMixin, AllGather):
         if async_op:
             event = torch.cuda.Event()
         gather = self.get_odc_all_gather()
-        gather.all_gather_into_tensor(output_tensor, input_tensor, group)
+        gather.gather_into_tensor(output_tensor, input_tensor, group)
         if async_op:
             event.record()
             return event

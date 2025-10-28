@@ -41,7 +41,7 @@ MAX_REQUEST_COUNT = 2 * 100000
 
 
 @triton.jit(do_not_specialize=[])
-def nvshmem_reduce_scatter_kernel(
+def nvshmem_scatter_kernel(
     input_tensor_ptr,
     rank_input_size,
     input_segment_start,
@@ -483,7 +483,7 @@ class ReductionService:
                 output_tensor_shape, world_size
             )
             output_size = reduce(lambda x, y: x * y, output_tensor_shape)
-            logger.warning(
+            logger.info(
                 f"buffer_size: {buffer_size} output_size: {output_size} num_split: {math.ceil(output_size / buffer_size)}"
             )
             buffer_shape = (buffer_size,)
@@ -519,7 +519,7 @@ class ReductionService:
         assert input_tensor.shape[0] % dist.get_world_size(pg) == 0
         return (input_tensor.shape[0] // dist.get_world_size(pg),)
 
-    def reduce_scatter_accumulation(self, key, input_tensor, pg: dist.ProcessGroup):
+    def scatter_accumulate(self, key, input_tensor, pg: dist.ProcessGroup):
         output_tensor_shape = self.infer_output_shape(input_tensor, pg)
         accum_dtype = (
             self.accumulation_dtype if self.accumulation_dtype is not None else input_tensor.dtype
@@ -603,7 +603,7 @@ class ReductionService:
 
             with torch.cuda.stream(get_comm_stream()):
                 signal_ptr.fill_(0)
-                nvshmem_reduce_scatter_kernel[(grid_size,)](
+                nvshmem_scatter_kernel[(grid_size,)](
                     input_tensor_ptr=input_tensor,
                     rank_input_size=rank_input_size,
                     input_segment_start=start,

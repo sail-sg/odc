@@ -23,7 +23,7 @@ fi
 # Install build dependencies
 echo "Installing build dependencies..."
 pip install -U pip setuptools wheel
-pip install cmake>=3.18 scikit-build-core>=0.3.3
+pip install cmake>=3.18
 pip install nvidia-nvshmem-cu12
 
 # Build nvshmem wrapper
