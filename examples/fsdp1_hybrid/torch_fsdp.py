@@ -90,7 +90,8 @@ def create_qwen_model():
 
     # Modify config for training
     config.use_cache = False  # Disable cache for training
-    config.torch_dtype = torch.bfloat16
+    # config.torch_dtype = torch.bfloat16
+    config.torch_dtype = torch.float32
 
     # Create model from config (this will use random initialization)
 
@@ -99,7 +100,7 @@ def create_qwen_model():
         model_name,
         trust_remote_code=True,
         attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
+        torch_dtype=config.torch_dtype,
         # use_cache=False,
     )
     model.__class__.forward = forward_with_fused_linear
@@ -372,9 +373,9 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 1  # More epochs to see loss decrease
+    num_epochs = 10  # More epochs to see loss decrease
     max_steps = 2000  # Limit steps for demo purposes
-    max_steps = 2
+    max_steps = 50
 
     # Setup wandb configuration
     wandb_config = {
@@ -511,7 +512,8 @@ def main():
                     "epoch/epoch_time": epoch_total_time,
                 }
                 wandb.log(epoch_log, step=epoch)
-                print(f"Epoch {epoch} completed. Total time: {epoch_total_time:.2f}s")
+                loss = minibatch_loss.item() / torch.distributed.get_world_size()
+                print(f"Epoch {epoch} completed. Loss: {loss}, Total time: {epoch_total_time:.2f}s")
 
     if dist.get_rank() == 0:
         print("Deterministic training completed successfully!")

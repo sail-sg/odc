@@ -162,12 +162,27 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         )
         dist.all_gather(tensor_list, sharded_flat_param, group=pg)
     else:
+        # padded_unsharded_flat_param output torch.bfloat16 sharded_flat_param input torch.float32
+        assert padded_unsharded_flat_param.dtype == self._fwd_bwd_param_dtype
+        assert sharded_flat_param.dtype == self._orig_param_dtype
+        padded_unsharded_flat_param_orig_dtype = padded_unsharded_flat_param
+        if padded_unsharded_flat_param.dtype != sharded_flat_param.dtype:
+            assert self._uses_param_mixed_precision
+            padded_unsharded_flat_param_orig_dtype = padded_unsharded_flat_param.to(
+                self._orig_param_dtype
+            )
         ag_func = gather_service.gather_into_tensor
         ag_func(
-            padded_unsharded_flat_param,
+            padded_unsharded_flat_param_orig_dtype,  # Could be fp32
+            # padded_unsharded_flat_param,
             sharded_flat_param,
             pg,
         )
+        # Convert back to fwd_bwd_param_dtype
+        if padded_unsharded_flat_param.dtype != sharded_flat_param.dtype:
+            padded_unsharded_flat_param = padded_unsharded_flat_param_orig_dtype.to(
+                self._fwd_bwd_param_dtype
+            )
 
     if self._offload_params:
         # In case of offloading, `flat_param.data` (i.e. sharded param) is
@@ -194,6 +209,58 @@ def custom_get_shard(tensor, rank, world_size):
     return sharded_in_nvshmem, padded
 
 
+def _use_low_precision_shard(self):
+    """
+    Allocate on the compute device and switch to using the low precision sharded flat parameter.
+    call path:
+        _runtime_utils.py:_unshard()
+            -> pre_unshard()
+                -> self._use_low_precision_shard()
+    """
+    self._check_low_precision_shard()
+    # flat_param = self.flat_param
+    # _alloc_storage(
+    #     flat_param._mp_shard,
+    #     flat_param._local_shard.size(),  # type: ignore[attr-defined]
+    # )
+    # # `copy_()` implicitly casts to the low precision
+    # flat_param._mp_shard.copy_(  # type: ignore[attr-defined]
+    #     flat_param._local_shard.to(  # type: ignore[attr-defined]
+    #         self.device, non_blocking=True
+    #     )
+    # )
+    # # Invariant: `_mp_shard` is always on the compute device.
+    # flat_param.data = flat_param._mp_shard  # type: ignore[attr-defined]
+    # flat_param.data = flat_param._local_shard.to(self.device, non_blocking=True)
+
+    # todo: need to check
+    # flat_param.data.copy_(flat_param._local_shard.to(self.device, non_blocking=True))
+
+
+def _free_low_precision_sharded_param(self):
+    """
+    Frees the low precision sharded flat parameter.
+
+    call path:
+        _runtime_utils.py:_unshard()
+            -> handle.post_unshard()
+                -> self._free_low_precision_sharded_param()
+    """
+    self._check_low_precision_shard()
+    # `_mp_shard` is allocated in the pre-unshard stream, consumed in the
+    # unshard stream for sharded strategies, and consumed in both the
+    # unshard and default streams for `NO_SHARD`. For sharded strategies,
+    # the current stream here is the unshard stream, and for `NO_SHARD`,
+    # it is the default stream. For `NO_SHARD`, only recording for the
+    # default stream suffices since the default stream waits for the
+    # unshard stream.
+    # _no_dispatch_record_stream(
+    #     self.flat_param._mp_shard,
+    #     self._device_handle.current_stream(),  # type: ignore[attr-defined]
+    # )
+    # _free_storage(self.flat_param._mp_shard)  # type: ignore[attr-defined]
+
+
 def patch_fsdp1(reduce_dtype=None):
     global reduction_service, gather_service
     reduction_service = odc.ReductionService(accumulation_dtype=reduce_dtype)
@@ -205,6 +272,8 @@ def patch_fsdp1(reduce_dtype=None):
     FlatParamHandle.prepare_gradient_for_optim = prepare_gradient_for_optim
     FlatParamHandle._get_shard = custom_get_shard
     FlatParamHandle._all_gather_flat_param = all_gather_flat_param
+    FlatParamHandle._use_low_precision_shard = _use_low_precision_shard
+    FlatParamHandle._free_low_precision_sharded_param = _free_low_precision_sharded_param
 
 
 def pre_optimizer_step(fsdp_module):
