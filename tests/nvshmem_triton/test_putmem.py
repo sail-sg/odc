@@ -5,7 +5,7 @@ import triton.language as tl
 from cuda.core.experimental import Device
 
 # Import the putmem_nbi_block function from our custom API
-from odc.primitives import BC_PATH, putmem_nbi_block, quiet
+from odc.primitives import NVSHMEM_EXTERN_LIBS, putmem_nbi_block, quiet
 
 
 @triton.jit
@@ -57,9 +57,7 @@ def test_putmem():
     print(f"[PE {my_pe}] Launching putmem kernel...")
     print(f"[PE {my_pe}] Copying {nbytes} bytes from source to dest on PE {my_pe}")
 
-    extern_libs = {
-        "nvshmem_wrapper": BC_PATH,
-    }
+    extern_libs = NVSHMEM_EXTERN_LIBS
     putmem_test_kernel[grid_size](
         source_data, dest_data, nbytes, my_pe, num_warps=32, extern_libs=extern_libs
     )

@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from cuda.core.experimental import Device
 
-from odc.primitives import BC_PATH, __syncthreads, int_g, quiet, tid
+from odc.primitives import NVSHMEM_EXTERN_LIBS, __syncthreads, int_g, quiet, tid
 
 
 @triton.jit
@@ -42,9 +42,7 @@ def test_int_g():
     dest.fill_(-1)
 
     # Run the kernel that uses int_g to get the value
-    int_g_test_kernel[(1,)](
-        data, dest, my_pe, num_warps=4, extern_libs={"nvshmem_wrapper": BC_PATH}
-    )
+    int_g_test_kernel[(1,)](data, dest, my_pe, num_warps=4, extern_libs=NVSHMEM_EXTERN_LIBS)
     torch.cuda.synchronize()
 
     # Verify the value was correctly retrieved

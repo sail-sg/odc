@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from cuda.core.experimental import Device
 
-from odc.primitives import BC_PATH, getmem_nbi_block, quiet
+from odc.primitives import NVSHMEM_EXTERN_LIBS, getmem_nbi_block, quiet
 
 
 @triton.jit
@@ -52,9 +52,7 @@ def test_getmem():
     print(f"[PE {my_pe}] Launching getmem kernel...")
     print(f"[PE {my_pe}] Copying {nbytes} bytes from source on PE {my_pe} to dest locally")
 
-    extern_libs = {
-        "nvshmem_wrapper": BC_PATH,
-    }
+    extern_libs = NVSHMEM_EXTERN_LIBS
     getmem_test_kernel[grid_size](
         dest_data, source_data, nbytes, my_pe, num_warps=1, extern_libs=extern_libs
     )

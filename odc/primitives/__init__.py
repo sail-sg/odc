@@ -1,5 +1,4 @@
 from .nvshmem_triton import (
-    BC_PATH,
     LIB_NVSHMEM_PATH,
     NVSHMEM_EXTERN_LIBS,
     __syncthreads,
@@ -40,7 +39,6 @@ __all__ = [
     "int_g",
     "tid",
     "__syncthreads",
-    "BC_PATH",
     "LIB_NVSHMEM_PATH",
     "NVSHMEM_EXTERN_LIBS",
     # tensor_ipc

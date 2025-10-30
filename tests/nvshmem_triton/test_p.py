@@ -5,7 +5,7 @@ import triton.language as tl
 from cuda.core.experimental import Device
 
 # Import the putmem_nbi_block function from our custom API
-from odc.primitives import BC_PATH, __syncthreads, int_p, quiet, tid
+from odc.primitives import NVSHMEM_EXTERN_LIBS, __syncthreads, int_p, quiet, tid
 
 
 @triton.jit
@@ -34,7 +34,7 @@ def test_int_p():
     print(f"[PE {my_pe}] Running with {n_pes} PE(s)")
 
     data = nvshmem.core.tensor((1,), dtype=torch.int32)
-    int_p_test_kernel[(1,)](data, 42, my_pe, num_warps=4, extern_libs={"nvshmem_wrapper": BC_PATH})
+    int_p_test_kernel[(1,)](data, 42, my_pe, num_warps=4, extern_libs=NVSHMEM_EXTERN_LIBS)
     torch.cuda.synchronize()
     assert data.item() == 42
     nvshmem.core.free_tensor(data)

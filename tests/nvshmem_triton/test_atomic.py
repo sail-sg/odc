@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from cuda.core.experimental import Device
 
-from odc.primitives import BC_PATH, int_atomic_compare_swap, int_atomic_swap
+from odc.primitives import NVSHMEM_EXTERN_LIBS, int_atomic_compare_swap, int_atomic_swap
 
 
 @triton.jit
@@ -64,9 +64,7 @@ def test_atomic_compare_swap():
 
     print(f"[PE {my_pe}] Launching kernel with {num_threads} threads...")
 
-    extern_libs = {
-        "nvshmem_wrapper": BC_PATH,
-    }
+    extern_libs = NVSHMEM_EXTERN_LIBS
     print(f"extern_libs: {extern_libs}")
     kernel_test_atomic_compare_swap[grid_size](target, results, extern_libs=extern_libs)
 
@@ -154,9 +152,7 @@ def test_atomic_swap():
 
     print(f"[PE {my_pe}] Launching kernel with {num_threads} threads...")
 
-    extern_libs = {
-        "nvshmem_wrapper": BC_PATH,
-    }
+    extern_libs = NVSHMEM_EXTERN_LIBS
     print(f"extern_libs: {extern_libs}")
     kernel_test_atomic_swap[grid_size](target, results, extern_libs=extern_libs)
 
