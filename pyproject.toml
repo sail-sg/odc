@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "odc"
 version = "0.1.0-alpha.0"
-description = "Optimized Distributed Computing - Collection of distributed computing tools and bindings"
+description = "On-demand Communication Library"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [

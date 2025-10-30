@@ -5,9 +5,9 @@ set -e
 
 echo "Setting up nvshmem-triton for development..."
 
-# Install the package in editable mode with dev dependencies
+# Install the package in editable mode
 echo "Installing package in editable mode..."
-pip install --no-build-isolation -e ".[dev]"
+pip install --no-build-isolation -e "."
 
 echo ""
 echo "Development setup completed!"
