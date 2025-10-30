@@ -3,7 +3,8 @@
 # Build script for odc package
 set -e
 
-bash build_nvshmem_wrapper.sh
+echo "Installing build dependencies..."
+pip install -U pip setuptools wheel
 
 echo "Building package..."
 python -m build --no-isolation --verbose
