@@ -54,6 +54,7 @@ def nvshmem_scatter_kernel(
     group_world_size: tl.constexpr,
     pg_ranks_ptr,
     chunk_size: tl.constexpr,
+    signal_next_expected,
     signal_ptr,
 ):
     pid = tl.program_id(axis=0)
@@ -63,7 +64,7 @@ def nvshmem_scatter_kernel(
     np = num_ranks_per_node
     assert group_world_size % np == 0
     num_nodes = group_world_size // np
-    expected = 0
+    expected = signal_next_expected
     chunk_buffer_seg = chunk_buffer + pid * chunk_size
 
     # Use different kernel for the ranks in the same node.
@@ -108,6 +109,8 @@ def nvshmem_scatter_kernel(
             quiet()
         __syncthreads()
 
+    return expected
+
 
 @triton.jit(do_not_specialize=["rank", "peer", "next_request_id"])
 def nvshmem_cross_node_scatter(
@@ -124,17 +127,23 @@ def nvshmem_cross_node_scatter(
     local_buf_size,
     chunk_size: tl.constexpr,
     signal_ptr,
+    # client request
+    request_buffer_ptr,
+    response_buffer_ptr,
+    rank_start_same_node,
+    rank_end_same_node,
+    accumulation_command,
+    next_request_id,
 ):
+    signal_next_expected = 0
     for start in range(0, output_size, local_buf_size):
         size = min(local_buf_size, output_size - start)
-        # buf = buffer[:size]
-        buf = trans_buffer
-        nvshmem_scatter_kernel(
+        signal_next_expected = nvshmem_scatter_kernel(
             input_tensor_ptr=input_tensor_ptr,
             rank_input_size=rank_input_size,
             input_segment_start=start,
             chunk_buffer=chunk_buffer,
-            output_tensor_ptr=buf,
+            output_tensor_ptr=trans_buffer,
             elem_per_rank=size,
             size_per_elem=size_per_elem,
             group_rank=group_rank,
@@ -142,8 +151,32 @@ def nvshmem_cross_node_scatter(
             group_world_size=group_world_size,
             pg_ranks_ptr=pg_ranks_ptr,
             chunk_size=chunk_size,
+            signal_next_expected=signal_next_expected,
             signal_ptr=signal_ptr,
         )
+
+        nvshmem_request_accumulation_remote_node_kernel(
+            request_buffer_ptr=request_buffer_ptr,
+            group_rank=group_rank,
+            rank_start_same_node=rank_start_same_node,
+            rank_end_same_node=rank_end_same_node,
+            group_world_size=group_world_size,
+            accumulation_command=accumulation_command,
+        )
+        nvshmem_wait_accumulation_remote_node_kernel(
+            response_buffer_ptr=response_buffer_ptr,
+            group_rank=group_rank,
+            rank_start_same_node=rank_start_same_node,
+            rank_end_same_node=rank_end_same_node,
+            group_world_size=group_world_size,
+            next_request_id=next_request_id,
+        )
+        next_request_id += 1
+
+        # All CTAs need to wait for the first CTA to finish the accumulation request.
+        if start + local_buf_size < output_size:
+            signal_next_expected += num_ranks_per_node
+            sync_cta(signal_ptr, signal_next_expected)
 
 
 @triton.jit(do_not_specialize=["rank", "peer", "accumulation_command"])
@@ -181,58 +214,58 @@ def nvshmem_wait_accumulation_same_node_kernel(
 
 @triton.jit(
     do_not_specialize=[
-        "rank",
+        "group_rank",
         "rank_start_same_node",
         "rank_end_same_node",
-        "world_size",
+        "group_world_size",
         "accumulation_command",
     ]
 )
 def nvshmem_request_accumulation_remote_node_kernel(
     request_buffer_ptr,
-    rank,
+    group_rank,
     rank_start_same_node,
     rank_end_same_node,
-    world_size,
+    group_world_size,
     accumulation_command,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     if pid == 0:
         if tidx == 0:
-            for peer in range(world_size):
+            for peer in range(group_world_size):
                 if peer < rank_start_same_node or peer >= rank_end_same_node:
-                    int_p(request_buffer_ptr + rank, accumulation_command, peer)
+                    int_p(request_buffer_ptr + group_rank, accumulation_command, peer)
         __syncthreads()
 
 
 @triton.jit(
     do_not_specialize=[
-        "rank",
+        "group_rank",
         "rank_start_same_node",
         "rank_end_same_node",
-        "world_size",
+        "group_world_size",
         "next_request_id",
     ]
 )
 def nvshmem_wait_accumulation_remote_node_kernel(
     response_buffer_ptr,
-    rank,
+    group_rank,
     rank_start_same_node,
     rank_end_same_node,
-    world_size,
+    group_world_size,
     next_request_id,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     if pid == 0:
         if tidx == 0:
-            for peer in range(world_size):
+            for peer in range(group_world_size):
                 if peer < rank_start_same_node or peer >= rank_end_same_node:
                     r = next_request_id - 1
                     while r != next_request_id:
                         quiet()
-                        r = int_g(response_buffer_ptr + rank, peer)
+                        r = int_g(response_buffer_ptr + group_rank, peer)
         __syncthreads()
 
 
@@ -241,6 +274,7 @@ class ClientContext:
     request_buffer: torch.Tensor
     response_buffer: torch.Tensor
     next_request_id: int
+    local_next_request_id: int
 
 
 @dataclass
@@ -293,7 +327,7 @@ class DistLock:
         )
         self.request_buffer.fill_(0)
         self.response_buffer.fill_(0)
-        self.client_context = ClientContext(self.request_buffer, self.response_buffer, 1)
+        self.client_context = ClientContext(self.request_buffer, self.response_buffer, 1, 1)
 
 
 class ReductionWatcher:
@@ -587,7 +621,7 @@ class ReductionService:
         accumulation_command = (buffer_id << 16) | accumulation_id
         assert (buffer.numel() * buffer.element_size()) % (
             2**6
-        ) == 0, "better align to 64 for efficiency"
+        ) == 0 or output_size * buffer.element_size() < 2**6, "better align to 64 for efficiency"
 
         get_comm_stream().wait_stream(torch.cuda.current_stream())
         rank_start_same_node = rank - rank % get_local_world_size()
@@ -637,10 +671,13 @@ class ReductionService:
                         response_buffer_ptr=self.lock.response_buffer,
                         rank=rank,
                         peer=local_peer,
-                        next_request_id=self.lock.client_context.next_request_id,
+                        next_request_id=self.lock.client_context.local_next_request_id,
                         num_warps=1,
                         extern_libs=NVSHMEM_EXTERN_LIBS,
                     )
+            self.lock.client_context.local_next_request_id += 1
+            if self.lock.client_context.local_next_request_id > MAX_REQUEST_COUNT:
+                self.lock.client_context.local_next_request_id = 1
         with torch.cuda.stream(get_comm_stream()):
             signal_ptr.fill_(0)
             nvshmem_cross_node_scatter[(grid_size,)](
@@ -657,28 +694,14 @@ class ReductionService:
                 local_buf_size=local_buf_size,
                 chunk_size=chunk_size,
                 signal_ptr=signal_ptr,
-                num_warps=32,
-                extern_libs=NVSHMEM_EXTERN_LIBS,
-            )
-        with torch.cuda.stream(get_comm_stream()):
-            nvshmem_request_accumulation_remote_node_kernel[(1,)](
+                # client request
                 request_buffer_ptr=self.lock.request_buffer,
-                rank=rank,
-                rank_start_same_node=rank_start_same_node,
-                rank_end_same_node=rank_end_same_node,
-                world_size=world_size,
-                accumulation_command=accumulation_command,
-                num_warps=1,
-                extern_libs=NVSHMEM_EXTERN_LIBS,
-            )
-            nvshmem_wait_accumulation_remote_node_kernel[(1,)](
                 response_buffer_ptr=self.lock.response_buffer,
-                rank=rank,
                 rank_start_same_node=rank_start_same_node,
                 rank_end_same_node=rank_end_same_node,
-                world_size=world_size,
+                accumulation_command=accumulation_command,
                 next_request_id=self.lock.client_context.next_request_id,
-                num_warps=1,
+                num_warps=32,
                 extern_libs=NVSHMEM_EXTERN_LIBS,
             )
         self.lock.client_context.next_request_id += num_requests
