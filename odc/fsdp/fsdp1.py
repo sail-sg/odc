@@ -17,6 +17,14 @@ reduction_service = None
 gather_service = None
 
 
+def get_reduction_service():
+    return reduction_service
+
+
+def get_gather_service():
+    return gather_service
+
+
 def _reduce_grad(state, handle) -> None:
     """
     For sharded strategies, this runs gradient reduction, sharded gradient
@@ -47,9 +55,9 @@ def _reduce_grad(state, handle) -> None:
         #     group=pg,
         # )
 
-        rs_func = reduction_service.scatter_accumulate
+        rs_func = get_reduction_service().scatter_accumulate
         rs_func(id(handle.flat_param), padded_unsharded_grad, pg)
-        handle.flat_param._saved_grad_shard = reduction_service.get_accumulation(
+        handle.flat_param._saved_grad_shard = get_reduction_service().get_accumulation(
             id(handle.flat_param)
         )
 
@@ -279,28 +287,30 @@ def patch_fsdp1(reduce_dtype=None):
 def pre_optimizer_step(fsdp_module):
 
     assert isinstance(fsdp_module, _FSDPState)
-    reduction_service.sync(fsdp_module.process_group)
+    get_reduction_service().sync(fsdp_module.process_group)
 
     # time.sleep(1)
-    for acc in reduction_service.accumulations:
+    for acc in get_reduction_service().accumulations:
         if hasattr(fsdp_module, "_inter_node_pg"):
             dist.all_reduce(acc, group=fsdp_module._inter_node_pg)
         _div_if_needed(acc, fsdp_module._gradient_postdivide_factor)
     # print(f"Model parameters: {[p.numel()/ 1e6 for p in fsdp_module.parameters()]}")
     for handle in fsdp_module._all_handles:
         # print(f"Rank {dist.get_rank()}: cast_grad_to_param_dtype_if_needed shape: {handle.flat_param.shape}")
-        handle.flat_param.grad = reduction_service.get_accumulation(id(handle.flat_param)).to(
-            handle.flat_param.dtype
+        handle.flat_param.grad = (
+            get_reduction_service()
+            .get_accumulation(id(handle.flat_param))
+            .to(handle.flat_param.dtype)
         )
 
 
 def pre_minibatch_start(_fsdp_module):
-    reduction_service.clear_accumulations()
+    get_reduction_service().clear_accumulations()
 
     # Make sure optimizer updates are visible to all ranks
     dist.barrier()
 
 
 def stop():
-    reduction_service.stop()
+    get_reduction_service().stop()
     odc.SymmBufferRegistry.get_instance().finalize()

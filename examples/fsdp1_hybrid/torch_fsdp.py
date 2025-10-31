@@ -44,7 +44,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 
 import odc
 from data import BatchedDataset
-from odc.fsdp.fsdp1 import patch_fsdp1, pre_minibatch_start, pre_optimizer_step, stop
+from odc.fsdp import fsdp1
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
 enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
@@ -55,7 +55,7 @@ reduce_dtype = torch.float32
 buffer_dtype = torch.float32
 
 if enable_decouple:
-    patch_fsdp1(reduce_dtype=reduce_dtype)
+    fsdp1.patch_fsdp1(reduce_dtype=reduce_dtype)
 
 
 args = get_args()
@@ -236,7 +236,7 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
         use_orig_params=False,
     )
     if enable_decouple:
-        pre_minibatch_start(fsdp_model)
+        fsdp1.pre_minibatch_start(fsdp_model)
 
     return fsdp_model
 
@@ -332,10 +332,8 @@ def train_step(model, batch):
 def main():
     setup_distributed()
     if args.forward_only:
-        from odc.fsdp import fsdp1
-
         src_tensor = torch.randn(1024, dtype=torch.bfloat16, device="cuda")
-        fsdp1.reduction_service.scatter_accumulate(0, src_tensor, dist.group.WORLD)
+        fsdp1.get_reduction_service().scatter_accumulate(0, src_tensor, dist.group.WORLD)
 
     # Main training function
     # Set deterministic training first
@@ -373,9 +371,8 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 10  # More epochs to see loss decrease
-    max_steps = 2000  # Limit steps for demo purposes
-    max_steps = 50
+    num_epochs = 5  # More epochs to see loss decrease
+    max_steps = 25  # Limit steps for demo purposes
 
     # Setup wandb configuration
     wandb_config = {
@@ -463,7 +460,7 @@ def main():
                     if enable_decouple:
                         timer = Timer("pre_optimizer_step")
                         timer.start()
-                        pre_optimizer_step(model)
+                        fsdp1.pre_optimizer_step(model)
                         sync_time = timer.stop()
                         sync_time = torch.tensor(sync_time).to("cuda")
                         torch.distributed.all_reduce(sync_time, op=torch.distributed.ReduceOp.SUM)
@@ -479,7 +476,7 @@ def main():
                         optimizer.step()
                         optimizer.zero_grad()
                     if enable_decouple:
-                        pre_minibatch_start(model)
+                        fsdp1.pre_minibatch_start(model)
 
                 dist.barrier()
                 torch.cuda.synchronize()
@@ -527,7 +524,7 @@ def main():
 
     # Cleanup
     if enable_decouple:
-        stop()
+        fsdp1.stop()
     dist.destroy_process_group()
 
     completion_file = f"logs/{args.project_name}/{args.run_name}.done"

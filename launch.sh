@@ -125,17 +125,17 @@ function set_nvshmem_home() {
 }
 
 set_nvshmem_home
-export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-16}
 export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}
 export TORCH_CPP_LOG_LEVEL=1
 export NCCL_DEBUG=ERROR
 
-export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-4000000000}
+export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-30000000000}
 NVSHMEM_DIR=${NVSHMEM_DIR:-$NVSHMEM_HOME}
 export LD_LIBRARY_PATH=${NVSHMEM_DIR}/lib:${LD_LIBRARY_PATH}
 export NVSHMEM_DISABLE_CUDA_VMM=${NVSHMEM_DISABLE_CUDA_VMM:-1} # moving from cpp to shell
 export NVSHMEM_BOOTSTRAP=UID
-export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-eth0}
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-bond0}
 export NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=${NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY:-AF_INET}
 
 check_nvshmem_bootstrap_uid_sock
@@ -143,16 +143,16 @@ check_nvshmem_bootstrap_uid_sock
 if [ -n "$user_nproc_per_node" ]; then
   nproc_per_node=${user_nproc_per_node}
 else
-  nproc_per_node=${ARNOLD_WORKER_GPU:=$(nvidia-smi --list-gpus | wc -l)}
+  nproc_per_node=${GPUS_PER_NODE:=$(nvidia-smi --list-gpus | wc -l)}
 fi
-nnodes=${ARNOLD_WORKER_NUM:=1}
-node_rank=${ARNOLD_ID:=0}
+nnodes=${WORLD_SIZE:=1}
+node_rank=${RANK:=0}
 
-master_addr=${ARNOLD_WORKER_0_HOST:="127.0.0.1"}
-if [ -z ${ARNOLD_WORKER_0_PORT} ]; then
-  master_port="25299"
+master_addr=${MASTER_ADDR:="127.0.0.1"}
+if [ -z ${MASTER_PORT} ]; then
+  master_port="23457"
 else
-  master_port=$(echo "$ARNOLD_WORKER_0_PORT" | cut -d "," -f 1)
+  master_port=$(echo "$MASTER_PORT" | cut -d "," -f 1)
 fi
 
 additional_args="--rdzv_endpoint=${master_addr}:${master_port}"
@@ -161,6 +161,9 @@ additional_args="--rdzv_endpoint=${master_addr}:${master_port}"
 # export PYTORCH_NO_CUDA_MEMORY_CACHING=1
 # TORCHRUN="/usr/local/cuda/bin/compute-sanitizer --tool memcheck torchrun"
 TORCHRUN=torchrun
+if [ ! -z "$PROFILED" ]; then
+  TORCHRUN="nsys profile --trace=cuda,nvtx -o $RUN_NAME.$RANK --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop torchrun"
+fi
 CMD="${TORCHRUN} \
   --node_rank=${node_rank} \
   --nproc_per_node=${nproc_per_node} \
@@ -170,8 +173,14 @@ CMD="${TORCHRUN} \
   $@"
 
 echo ${CMD}
+
+export PYTHONPATH=$PYTHONPATH:..
+
+# pkill -f mps
+# nvidia-cuda-mps-control -d
+# ps aux  | grep python  | grep -v experiment_runner | awk '{print $2}' | xargs kill
+
 ${CMD}
 
 ret=$?
-
-
+exit $ret
