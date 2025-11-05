@@ -8,7 +8,8 @@ from model import ModelArgs, Transformer
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from utils import inspect_mixed_precision, inspect_model
 
-from odc.fsdp.fsdp2 import ODCAllGather, set_custom_all_gather
+from odc import init_nvshmem
+from odc.fsdp import fsdp2
 
 
 def verify_min_gpu_count(min_gpus: int = 2) -> bool:
@@ -51,6 +52,7 @@ def main(args):
 
     backend = torch.distributed.get_default_backend_for_device(device)  # pylint: disable=no-member
     torch.distributed.init_process_group(backend=backend, device_id=device)
+    init_nvshmem()
 
     torch.manual_seed(0)
     vocab_size = 1024
@@ -79,7 +81,7 @@ def main(args):
     from torch.distributed.fsdp import FSDPModule
 
     print(f"model {type(model)} {isinstance(model, FSDPModule)} {model._get_fsdp_state()}")
-    set_custom_all_gather(fsdp_model, ODCAllGather())
+    fsdp2.patch_fsdp2(fsdp_model)
 
     if args.explicit_prefetching:
         set_modules_to_forward_prefetch(model, num_to_forward_prefetch=2)
@@ -99,7 +101,7 @@ def main(args):
     if checkpointer.last_training_time is not None:
         checkpointer.load_optim(model, optim)
 
-    for _ in range(10):
+    for epoch in range(10):
         if args.explicit_prefetching:
             model.unshard()
         x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
@@ -108,9 +110,11 @@ def main(args):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
         optim.zero_grad()
+        print(f"epoch {epoch} loss: {loss.detach().item()}")
 
-    checkpointer.save(model, optim)
+    # checkpointer.save(model, optim)
     torch.distributed.destroy_process_group()
+    fsdp2.stop()
 
 
 if __name__ == "__main__":
