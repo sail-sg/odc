@@ -100,22 +100,16 @@ class FSDPParamsGatherBuffers:
             cls._instance = FSDPParamsGatherBuffers()
         return cls._instance
 
-    def __init__(self):
-        self.buffers = {}
-
     def get_buffer(
         self, fsdp_params: list[FSDPParam], input_tensor: torch.Tensor, rank: int
     ) -> torch.Tensor:
         key = self._get_fsdp_params_key(fsdp_params)
-        if key not in self.buffers:
-            registry = SymmBufferRegistry.get_instance()
-            self.buffers[key] = registry.allocate_symm_buffer(
-                key, input_tensor.shape, input_tensor.dtype, rank
-            )
-        else:
-            assert self.buffers[key].shape == input_tensor.shape
-            assert self.buffers[key].dtype == input_tensor.dtype
-        return self.buffers[key]
+        buf = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
+            key, input_tensor.shape, input_tensor.dtype, rank
+        )
+        assert buf.shape == input_tensor.shape
+        assert buf.dtype == input_tensor.dtype
+        return buf
 
     def _get_fsdp_params_key(self, fsdp_params: list[FSDPParam]) -> str:
         ids = "_".join([str(id(param)) for param in fsdp_params])
@@ -465,26 +459,6 @@ def patch_fsdp2(fsdp_model: FSDPModule) -> None:
     _fsdp_param_group.foreach_reduce = custom_foreach_reduce
 
     set_custom_all_gather(fsdp_model, ODCAllGather())
-
-
-# def pre_optimizer_step(fsdp_module):
-
-#     assert isinstance(fsdp_module, _FSDPState)
-#     get_reduction_service().sync(fsdp_module.process_group)
-
-#     # time.sleep(1)
-#     for acc in get_reduction_service().accumulations:
-#         if hasattr(fsdp_module, "_inter_node_pg"):
-#             dist.all_reduce(acc, group=fsdp_module._inter_node_pg)
-#         _div_if_needed(acc, fsdp_module._gradient_postdivide_factor)
-#     # print(f"Model parameters: {[p.numel()/ 1e6 for p in fsdp_module.parameters()]}")
-#     for handle in fsdp_module._all_handles:
-#         # print(f"Rank {dist.get_rank()}: cast_grad_to_param_dtype_if_needed shape: {handle.flat_param.shape}")
-#         handle.flat_param.grad = (
-#             get_reduction_service()
-#             .get_accumulation(id(handle.flat_param))
-#             .to(handle.flat_param.dtype)
-#         )
 
 
 def stop():

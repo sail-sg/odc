@@ -135,6 +135,11 @@ class SymmBufferRegistry:
     def has_key(self, key):
         return key in self.local_tensor
 
+    def get_or_create_symm_buffer(self, key, shape, dtype, group_rank: int):
+        if self.has_key(key):
+            return self.local_tensor[key]
+        return self.allocate_symm_buffer(key, shape, dtype, group_rank)
+
     def get_peer_tensors(self, local_tensor):
         # Returns tensors in the same node.
         buffer_key = self.local_tensor_to_keys[local_tensor.data_ptr()]

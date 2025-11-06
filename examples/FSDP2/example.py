@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import sys
 
@@ -10,6 +11,8 @@ from utils import inspect_mixed_precision, inspect_model
 
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
+
+enable_decouple = os.environ.get("ODC", "0") == "1"
 
 
 def verify_min_gpu_count(min_gpus: int = 2) -> bool:
@@ -52,7 +55,8 @@ def main(args):
 
     backend = torch.distributed.get_default_backend_for_device(device)  # pylint: disable=no-member
     torch.distributed.init_process_group(backend=backend, device_id=device)
-    init_nvshmem()
+    if enable_decouple:
+        init_nvshmem()
 
     torch.manual_seed(0)
     vocab_size = 1024
@@ -78,10 +82,9 @@ def main(args):
     fsdp_model = fully_shard(model, **fsdp_kwargs)
 
     inspect_model(model)
-    from torch.distributed.fsdp import FSDPModule
 
-    print(f"model {type(model)} {isinstance(model, FSDPModule)} {model._get_fsdp_state()}")
-    fsdp2.patch_fsdp2(fsdp_model)
+    if enable_decouple:
+        fsdp2.patch_fsdp2(fsdp_model)
 
     if args.explicit_prefetching:
         set_modules_to_forward_prefetch(model, num_to_forward_prefetch=2)
@@ -101,21 +104,30 @@ def main(args):
     if checkpointer.last_training_time is not None:
         checkpointer.load_optim(model, optim)
 
+    num_microbatches = 5
     for epoch in range(10):
-        fsdp2.pre_minibatch_start()
+        if enable_decouple:
+            fsdp2.pre_minibatch_start()
         if args.explicit_prefetching:
             model.unshard()
-        x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-        loss = model(x).sum()
-        with fsdp2.last_microbatch_context():
-            loss.backward()
+
+        for mb in range(num_microbatches):
+            x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+            loss = model(x).sum()
+            if enable_decouple and mb == num_microbatches - 1:
+                ctx = fsdp2.last_microbatch_context()
+            else:
+                ctx = contextlib.nullcontext()
+            with ctx:
+                loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
         optim.zero_grad()
         print(f"epoch {epoch} loss: {loss.detach().item()}")
 
     # checkpointer.save(model, optim)
-    fsdp2.stop()
+    if enable_decouple:
+        fsdp2.stop()
     torch.distributed.destroy_process_group()
 
 
@@ -126,4 +138,6 @@ if __name__ == "__main__":
     parser.add_argument("--dcp-api", action="store_true", default=False)
     arguments = parser.parse_args()
 
+    if enable_decouple:
+        print("Running in decoupled mode")
     main(arguments)
