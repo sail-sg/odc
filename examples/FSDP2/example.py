@@ -102,19 +102,21 @@ def main(args):
         checkpointer.load_optim(model, optim)
 
     for epoch in range(10):
+        fsdp2.pre_minibatch_start()
         if args.explicit_prefetching:
             model.unshard()
         x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
         loss = model(x).sum()
-        loss.backward()
+        with fsdp2.last_microbatch_context():
+            loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
         optim.zero_grad()
         print(f"epoch {epoch} loss: {loss.detach().item()}")
 
     # checkpointer.save(model, optim)
-    torch.distributed.destroy_process_group()
     fsdp2.stop()
+    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

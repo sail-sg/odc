@@ -7,7 +7,7 @@ echo "Setting up nvshmem-triton for development..."
 
 # Install the package in editable mode
 echo "Installing package in editable mode..."
-pip install --no-build-isolation -e "."
+pip install --no-build-isolation -e "." --index-url https://pypi.org/simple
 
 echo ""
 echo "Development setup completed!"
