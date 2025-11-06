@@ -187,6 +187,9 @@ def get_comm_stream():
 
 
 class BufferSplitter:
+    def __init__(self):
+        self.round_data_size = 2**6
+
     def get_max_global_buffer_size(self):
         DEFAULT_MAX_BUFFER_SIZE = 64 * 1024 * 1024
         max_buffer_size = int(os.environ.get("ODC_MAX_BUFFER_SIZE", DEFAULT_MAX_BUFFER_SIZE))
@@ -200,17 +203,20 @@ class BufferSplitter:
         buf_size = min(max_buffer_size, original_size)
         return buf_size
 
+    def round_to_data_size(self, size):
+        return (size + self.round_data_size - 1) // self.round_data_size * self.round_data_size
+
     def get_local_buffer_size(self, original_buffer_shape, world_size):
         original_size = reduce(lambda x, y: x * y, original_buffer_shape)
         max_buffer_size = self.get_max_global_buffer_size()
         if max_buffer_size <= 0:
-            return original_size
+            return self.round_to_data_size(original_size)
         assert (
             max_buffer_size % world_size == 0
         ), f"ODC_MAX_BUFFER_SIZE: {max_buffer_size} % world_size: {world_size} != 0"
         local_max_buffer_size = max_buffer_size // world_size
         buf_size = min(local_max_buffer_size, original_size)
-        return buf_size
+        return self.round_to_data_size(buf_size)
 
 
 @triton.jit

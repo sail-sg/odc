@@ -559,7 +559,6 @@ class ReductionService:
         shared_buffer_key = (grad_dtype, buffer_shape)
         if shared_buffer_key not in self.shared_buffer:
             output_size = reduce(lambda x, y: x * y, output_tensor_shape)
-            buffer_size = reduce(lambda x, y: x * y, buffer_shape)
             logger.info(
                 f"Rank {torch.distributed.get_rank()} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buffer_size)} buffer_size: {buffer_size}",
             )
@@ -596,10 +595,8 @@ class ReductionService:
         world_size = torch.distributed.get_world_size(pg)
         local_buf_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
-        assert local_buf_size <= output_size
 
         chunk_size = self.get_chunk_size(input_tensor.dtype)
-        # grid_size = 8 if world_size == 32 else world_size
         grid_size = get_local_world_size()
         input_tensor_symm_shape = (chunk_size * grid_size,)
         rank = torch.distributed.get_rank(pg)
@@ -619,9 +616,9 @@ class ReductionService:
         accumulation_id = self.accumulation_indices[key] + 1
 
         accumulation_command = (buffer_id << 16) | accumulation_id
-        assert (buffer.numel() * buffer.element_size()) % (
-            2**6
-        ) == 0 or output_size * buffer.element_size() < 2**6, "better align to 64 for efficiency"
+        assert (
+            buffer.nbytes % (2**6) == 0
+        ), f"better align to 64 for efficiency. Found {buffer.nbytes} bytes"
 
         get_comm_stream().wait_stream(torch.cuda.current_stream())
         rank_start_same_node = rank - rank % get_local_world_size()
@@ -640,7 +637,7 @@ class ReductionService:
 
         for start in range(0, output_size, local_buf_size):
             size = min(local_buf_size, output_size - start)
-            assert local_buf_size <= buffer.numel()
+            assert local_buf_size == buffer.numel()
             buf = buffer[:size]
             # Use mem-copy for the ranks in the same node.
             same_node_tensors = SymmBufferRegistry.get_instance().get_peer_tensors(buffer)
