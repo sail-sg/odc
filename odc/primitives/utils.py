@@ -115,10 +115,19 @@ class SymmBufferRegistry:
             torch.distributed.barrier()
         return self.local_tensor[buffer_key]
 
+    @classmethod
+    def set_nvshmem_flag(cls, tensor):
+        tensor._odc_is_nvshmem = True
+
+    @classmethod
+    def is_nvshmem_tensor(cls, tensor):
+        return hasattr(tensor, "_odc_is_nvshmem") and tensor._odc_is_nvshmem
+
     def allocate_symm_buffer(self, key, shape, dtype, group_rank: int):
         assert key not in self.local_tensor
         local_world_size = get_local_world_size()
         tensor = nvshmem_create_tensor(shape, dtype)
+        self.set_nvshmem_flag(tensor)
         peer_tensors = get_same_node_tensors(tensor, group_rank, local_world_size)
         self.allocations.append(tensor)
         assert len(peer_tensors) == local_world_size
