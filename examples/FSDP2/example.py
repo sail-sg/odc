@@ -7,12 +7,15 @@ import torch
 from checkpoint import Checkpointer
 from model import ModelArgs, Transformer
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.profiler import ProfilerActivity, profile
 from utils import inspect_mixed_precision, inspect_model
 
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
+enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
+enable_cuda_profiler = os.environ.get("CUDA_PROFILED", "0") == "1"
 
 
 def verify_min_gpu_count(min_gpus: int = 2) -> bool:
@@ -104,31 +107,71 @@ def main(args):
     if checkpointer.last_training_time is not None:
         checkpointer.load_optim(model, optim)
 
-    num_microbatches = 5
-    for epoch in range(10):
-        if enable_decouple:
-            fsdp2.pre_minibatch_start()
-        if args.explicit_prefetching:
-            model.unshard()
+    prof = create_profiler(rank)
+    profiler_context = prof if prof is not None else contextlib.nullcontext()
+    cuda_prof = cuda_profiler_context() if enable_cuda_profiler else contextlib.nullcontext()
 
-        for mb in range(num_microbatches):
-            x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-            loss = model(x).sum()
-            if enable_decouple and mb == num_microbatches - 1:
-                ctx = fsdp2.last_microbatch_context()
-            else:
-                ctx = contextlib.nullcontext()
-            with ctx:
-                loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optim.step()
-        optim.zero_grad()
-        print(f"epoch {epoch} loss: {loss.detach().item()}")
+    with cuda_prof, profiler_context:
+        num_microbatches = 5
+        for epoch in range(10):
+            if enable_decouple:
+                fsdp2.pre_minibatch_start()
+            if args.explicit_prefetching:
+                model.unshard()
+
+            with torch.cuda.nvtx.range(f"epoch_{epoch}"):
+                for mb in range(num_microbatches):
+                    x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+                    loss = model(x).sum()
+                    if enable_decouple and mb == num_microbatches - 1:
+                        ctx = fsdp2.last_microbatch_context()
+                    else:
+                        ctx = contextlib.nullcontext()
+                    with torch.cuda.nvtx.range(f"backward_{mb}"), ctx:
+                        loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optim.step()
+                optim.zero_grad()
+                print(f"epoch {epoch} loss: {loss.detach().item()}")
 
     # checkpointer.save(model, optim)
     if enable_decouple:
         fsdp2.stop()
     torch.distributed.destroy_process_group()
+
+
+def create_profiler(rank):
+    """Create torch profiler for the first 4 training steps"""
+    if not enable_profiler:
+        return None
+
+    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+
+    profiler = profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True,
+        with_modules=True,
+        # Profile first 4 steps: warmup + 3 active steps
+        schedule=torch.profiler.schedule(
+            wait=0,  # No initial wait
+            warmup=1,  # 1 warmup step
+            active=1,  # Profile 3 active steps (steps 1-3)
+            repeat=1,  # Only run once
+        ),
+        on_trace_ready=lambda prof: prof.export_chrome_trace(f"fsdp_profile_rank_{rank}.json"),
+    )
+
+    return profiler
+
+
+@contextlib.contextmanager
+def cuda_profiler_context():
+    torch.cuda.cudart().cudaProfilerStart()
+    yield
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 if __name__ == "__main__":
