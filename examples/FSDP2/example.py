@@ -129,10 +129,19 @@ def main(args):
                         ctx = contextlib.nullcontext()
                     with torch.cuda.nvtx.range(f"backward_{mb}"), ctx:
                         loss.backward()
+                    if prof is not None:
+                        prof.step()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optim.step()
                 optim.zero_grad()
                 print(f"epoch {epoch} loss: {loss.detach().item()}")
+    if prof is not None:
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        print(
+            prof.key_averages(group_by_input_shape=True).table(
+                sort_by="cpu_time_total", row_limit=10
+            )
+        )
 
     # checkpointer.save(model, optim)
     if enable_decouple:
@@ -145,6 +154,7 @@ def create_profiler(rank):
     if not enable_profiler:
         return None
 
+    print("Enable torch profiler")
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
     profiler = profile(

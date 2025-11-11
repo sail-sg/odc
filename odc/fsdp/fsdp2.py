@@ -1,7 +1,7 @@
 import logging
 from contextlib import contextmanager
 from itertools import chain
-from typing import Callable, Optional, cast
+from typing import Callable, List, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -17,7 +17,6 @@ from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     _div_if_needed,
     _get_all_gather_input_metadatas,
     _get_gradient_divide_factors,
-    _get_param_all_gather_inputs,
     foreach_reduce_scatter_copy_in,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
@@ -50,6 +49,21 @@ class ODCAllGather(DefaultAllocMixin, AllGather):
         if cls._odc_gather_instance is None:
             cls._odc_gather_instance = GatherService()
         return cls._odc_gather_instance
+
+    def gather(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensors: List[torch.Tensor],
+        group: dist.ProcessGroup,
+        async_op=False,
+    ) -> Optional[dist.Work]:
+        gather = self.get_odc_gather()
+        gather.gather_multi_into_tensor(output_tensor, input_tensors, group)
+        if async_op:
+            event = torch.cuda.Event()
+            event.record()
+            return event
+        return None
 
     def __call__(
         self,
@@ -349,6 +363,64 @@ def reset_sharded_param(self):
 
 
 @torch.no_grad()
+def custom_get_param_all_gather_inputs(
+    fsdp_params: list[FSDPParam],
+) -> list[list[torch.Tensor]]:
+    if compiled_autograd_enabled():
+        return [fsdp_param.all_gather_inputs for fsdp_param in fsdp_params]
+
+    # Intentionally try to run a fast-path that bypasses abstractions for the
+    # common FSDP case of bf16/fp32 mixed precision in order to use foreach
+    # copy for lower CPU overhead and more efficient copying in eager
+    def use_foreach_copy(fsdp_param: FSDPParam) -> bool:
+        return (
+            fsdp_param.param_dtype is not None
+            and not fsdp_param.offload_to_cpu
+            and not hasattr(fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather")
+        )
+
+    param_all_gather_inputs: list[list[torch.Tensor]] = [[] for _ in fsdp_params]
+    foreach_copy_indices: list[int] = []
+    # foreach_copy_inputs: list[torch.Tensor] = []
+    # foreach_copy_input_numels: list[int] = []
+
+    # 1st pass: for foreach-copy parameters, get inputs and metadata for the
+    # foreach copy, and for the others, actually get their all-gather inputs
+    for i, fsdp_param in enumerate(fsdp_params):
+        # assert use_foreach_copy(fsdp_param), f"{fsdp_param.param_dtype=} {fsdp_param.offload_to_cpu=} {hasattr(fsdp_param._sharded_local_tensor, 'fsdp_pre_all_gather')=}"
+        assert not hasattr(fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather")
+        if use_foreach_copy(fsdp_param):
+            foreach_copy_indices.append(i)
+            # reshard_after_forward=int not supported for now
+            # TODO: support reshard_after_forward=int
+            assert fsdp_param.sharded_state == ShardedState.SHARDED, f"{fsdp_param.sharded_state=}"
+            all_gather_input = (
+                fsdp_param._sharded_param_data
+                if fsdp_param.sharded_state == ShardedState.SHARDED
+                else cast(torch.Tensor, fsdp_param._sharded_post_forward_param_data)
+            )
+            # foreach_copy_inputs.append(all_gather_input)
+            # foreach_copy_input_numels.append(all_gather_input.numel())
+            param_all_gather_inputs[i] = [all_gather_input]
+        else:
+            param_all_gather_inputs[i] = fsdp_param.all_gather_inputs
+
+    # # 2nd pass: use foreach copy to compute the remaining all-gather inputs
+    # if foreach_copy_inputs:
+    #     fsdp_param_0 = fsdp_params[foreach_copy_indices[0]]
+    #     param_dtype, device = fsdp_param_0.param_dtype, fsdp_param_0.device
+    #     flat_foreach_copy_input = torch.empty(
+    #         (sum(foreach_copy_input_numels),), device=device, dtype=param_dtype
+    #     )
+    #     splits = torch.split(flat_foreach_copy_input, foreach_copy_input_numels)
+    #     torch._foreach_copy_(splits, foreach_copy_inputs)
+    #     for i, split in zip(foreach_copy_indices, splits):
+    #         param_all_gather_inputs[i] = [split]
+
+    return param_all_gather_inputs
+
+
+@torch.no_grad()
 def custom_foreach_all_gather(
     fsdp_params: list[FSDPParam],
     group: dist.ProcessGroup,
@@ -358,10 +430,11 @@ def custom_foreach_all_gather(
     device: torch.device,
     all_gather_comm: AllGather,
 ) -> Optional[AllGatherResult]:
-    world_size, rank = group.size(), group.rank()
+    world_size, _rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
+    gather_comm = ODCAllGather()
     with device_handle.stream(all_gather_copy_in_stream):
-        param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
+        param_all_gather_inputs = custom_get_param_all_gather_inputs(fsdp_params)
         (
             param_all_gather_input_dtypes,
             param_all_gather_input_numels,
@@ -376,27 +449,33 @@ def custom_foreach_all_gather(
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input_numel * world_size,), dtype=dtype, device=device
         )
-        all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
-            all_gather_inputs,
-            all_gather_output,
-            inp_split_sizes,
-            all_gather_input_numel,
-            rank,
-        )
-        del param_all_gather_inputs
-        symm_buffer = FSDPParamsGatherBuffers.get_instance().get_buffer(
-            fsdp_params, all_gather_input, rank
-        )
-        symm_buffer.copy_(all_gather_input, non_blocking=True)
+        # all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
+        #     all_gather_inputs,
+        #     all_gather_output,
+        #     inp_split_sizes,
+        #     all_gather_input_numel,
+        #     rank,
+        # )
+        # del param_all_gather_inputs
+        # symm_buffer = FSDPParamsGatherBuffers.get_instance().get_buffer(
+        #     fsdp_params, all_gather_input, rank
+        # )
+        # symm_buffer.copy_(all_gather_input, non_blocking=True)
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
-        all_gather_work = all_gather_comm(
+        all_gather_work = gather_comm.gather(
             output_tensor=all_gather_output,
-            # input_tensor=all_gather_input,
-            input_tensor=symm_buffer,
+            input_tensors=all_gather_inputs,
             group=group,
             async_op=async_op,
         )
+        # all_gather_work = all_gather_comm(
+        #     output_tensor=all_gather_output,
+        #     # input_tensor=all_gather_input,
+        #     input_tensor=symm_buffer,
+        #     group=group,
+        #     async_op=async_op,
+        # )
         all_gather_event = all_gather_stream.record_event()
         return AllGatherResult(
             all_gather_output,
@@ -663,9 +742,18 @@ def set_custom_all_gather(fsdp_model: FSDPModule, comm: AllGather) -> None:
     Args:
         comm (AllGather): Custom all-gather communication.
     """
-    state = fsdp_model._get_fsdp_state()
-    if (fsdp_param_group := state._fsdp_param_group) is not None:
-        fsdp_param_group._all_gather_comm = comm
+    # state = fsdp_model._get_fsdp_state()
+    # if (fsdp_param_group := state._fsdp_param_group) is not None:
+    #     fsdp_param_group._all_gather_comm = comm
+    # Get all FSDP states in the module tree (not just the root)
+    from torch.distributed.fsdp._traversal_utils import _get_fsdp_states
+
+    all_states = _get_fsdp_states(fsdp_model)
+
+    # Set _all_gather_comm for all FSDP states that have a param group
+    for state in all_states:
+        if (fsdp_param_group := state._fsdp_param_group) is not None:
+            fsdp_param_group._all_gather_comm = comm
 
 
 def set_custom_reduce_scatter(fsdp_model: FSDPModule, comm: ReduceScatter) -> None:

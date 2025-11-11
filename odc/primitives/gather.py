@@ -192,6 +192,8 @@ class GatherService:
         target_tensor = self.shaped_buffer[(buffer_shape, output_tensor.dtype)]
 
         first_input_tensor = input_tensors[0]
+        for t in input_tensors:
+            assert t.dtype == first_input_tensor.dtype, f"{t.dtype=} {first_input_tensor.dtype=}"
         assert (first_input_tensor.numel() * first_input_tensor.element_size()) % (
             2**6
         ) == 0 or first_input_tensor.numel() < 2**6, "better align to 64 for efficiency"

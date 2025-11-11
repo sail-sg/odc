@@ -5,7 +5,7 @@
 
 # samples to run include:
 # example.py
-export ODC=1
+# export ODC=1
 
 SCRIPT_DIR=$(dirname $BASH_SOURCE)
 # echo "SCRIPT_DIR: ${SCRIPT_DIR}"
