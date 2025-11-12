@@ -70,6 +70,7 @@ def main(args):
         n_heads=4,
         vocab_size=vocab_size,
         max_seq_len=seq_len,
+        dim=1024 * 2,
         dropout_p=0,
     )
     with torch.device("meta"):
@@ -122,7 +123,8 @@ def main(args):
             with torch.cuda.nvtx.range(f"epoch_{epoch}"):
                 for mb in range(num_microbatches):
                     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-                    loss = model(x).sum()
+                    with torch.cuda.nvtx.range(f"forward_{mb}"):
+                        loss = model(x).sum()
                     if enable_decouple and mb == num_microbatches - 1:
                         ctx = fsdp2.last_microbatch_context()
                     else:

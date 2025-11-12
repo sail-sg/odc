@@ -389,11 +389,11 @@ def custom_get_param_all_gather_inputs(
     for i, fsdp_param in enumerate(fsdp_params):
         # assert use_foreach_copy(fsdp_param), f"{fsdp_param.param_dtype=} {fsdp_param.offload_to_cpu=} {hasattr(fsdp_param._sharded_local_tensor, 'fsdp_pre_all_gather')=}"
         assert not hasattr(fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather")
+        assert fsdp_param.sharded_state == ShardedState.SHARDED, f"{fsdp_param.sharded_state=}"
         if use_foreach_copy(fsdp_param):
             foreach_copy_indices.append(i)
             # reshard_after_forward=int not supported for now
             # TODO: support reshard_after_forward=int
-            assert fsdp_param.sharded_state == ShardedState.SHARDED, f"{fsdp_param.sharded_state=}"
             all_gather_input = (
                 fsdp_param._sharded_param_data
                 if fsdp_param.sharded_state == ShardedState.SHARDED
@@ -403,6 +403,7 @@ def custom_get_param_all_gather_inputs(
             # foreach_copy_input_numels.append(all_gather_input.numel())
             param_all_gather_inputs[i] = [all_gather_input]
         else:
+            # TODO: support reshard_after_forward=int in all_gather_inputs
             param_all_gather_inputs[i] = fsdp_param.all_gather_inputs
 
     # # 2nd pass: use foreach copy to compute the remaining all-gather inputs

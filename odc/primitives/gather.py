@@ -72,6 +72,10 @@ class GatherService:
     def __init__(self):
         self.shaped_buffer = {}
         self.buffer_splitter = BufferSplitter()
+        self.chunk_size_bytes = 2**20
+    
+    def get_chunk_size(self, buffer_dtype):
+        return self.chunk_size_bytes // buffer_dtype.itemsize
 
     def gather_into_tensor(
         self, output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup
@@ -99,7 +103,7 @@ class GatherService:
         assert (input_tensor.numel() * input_tensor.element_size()) % (
             2**6
         ) == 0 or input_tensor.numel() < 2**6, "better align to 64 for efficiency"
-        chunk_size = 2**20 // input_tensor.element_size()
+        chunk_size = self.get_chunk_size(input_tensor.dtype)
         # assert input_tensor.numel() % chunk_size == 0
 
         pg_ranks_tensor = PROCESS_GROUP_RANKS_TENSORS.get_pg_ranks_tensor(pg)
@@ -197,7 +201,7 @@ class GatherService:
         assert (first_input_tensor.numel() * first_input_tensor.element_size()) % (
             2**6
         ) == 0 or first_input_tensor.numel() < 2**6, "better align to 64 for efficiency"
-        chunk_size = 2**20 // first_input_tensor.element_size()
+        chunk_size = self.get_chunk_size(first_input_tensor.dtype)
 
         pg_ranks_tensor = PROCESS_GROUP_RANKS_TENSORS.get_pg_ranks_tensor(pg)
         registry = SymmBufferRegistry.get_instance()
@@ -224,6 +228,10 @@ class GatherService:
                 assert buf_size % group_world_size == 0
                 local_buf_size = buf_size // group_world_size
                 signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
+                
+                if local_world_size == group_world_size:
+                    output_start += input_tensor.numel()
+                    continue
                 for start in range(0, input_tensor.numel(), local_buf_size):
                     size = min(local_buf_size, input_tensor.numel() - start)
                     sub_input_tensor = input_tensor.view(-1)[start : start + size]
