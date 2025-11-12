@@ -73,7 +73,7 @@ class GatherService:
         self.shaped_buffer = {}
         self.buffer_splitter = BufferSplitter()
         self.chunk_size_bytes = 2**20
-    
+
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
 
@@ -228,7 +228,7 @@ class GatherService:
                 assert buf_size % group_world_size == 0
                 local_buf_size = buf_size // group_world_size
                 signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
-                
+
                 if local_world_size == group_world_size:
                     output_start += input_tensor.numel()
                     continue

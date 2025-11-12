@@ -101,6 +101,13 @@ def main(args):
     else:
         checkpointer.load_model(model)
 
+    if enable_decouple:
+        state = fsdp_model._get_fsdp_state()
+        state._lazy_init()
+        for layer in fsdp_model.layers:
+            fsdp2.replace_sharded_param_with_symm_buffer(layer, rank)
+        fsdp2.replace_sharded_param_with_symm_buffer(fsdp_model, rank)
+
     if args.mixed_precision:
         inspect_mixed_precision(model)
 

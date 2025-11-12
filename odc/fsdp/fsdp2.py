@@ -1,5 +1,7 @@
 import logging
+import operator
 from contextlib import contextmanager
+from functools import reduce
 from itertools import chain
 from typing import Callable, List, Optional, cast
 
@@ -136,6 +138,64 @@ class FSDPParamsGatherBuffers:
     def _get_fsdp_params_key(self, fsdp_params: list[FSDPParam]) -> str:
         ids = "_".join([str(id(param)) for param in fsdp_params])
         return f"fsdp_params_gather_{ids}"
+
+
+def get_fsdp_params_key(fsdp_params: list[FSDPParam]) -> str:
+    ids = "_".join([str(id(param)) for param in fsdp_params])
+    return f"fsdp_params_gather_{ids}"
+
+
+@torch.no_grad()
+def replace_sharded_param_with_symm_buffer(
+    fsdp_model,
+    group_rank: int,
+) -> torch.Tensor:
+    state = fsdp_model._get_fsdp_state()
+    fsdp_param_group = state._fsdp_param_group
+    if fsdp_param_group is None:
+        return
+
+    dtype = fsdp_param_group.fsdp_params[0]._sharded_param_data.dtype
+    for fsdp_params in fsdp_param_group.fsdp_params:
+        if fsdp_params._sharded_param_data.dtype != dtype:
+            raise ValueError(
+                f"All FSDP parameters must have the same dtype: {fsdp_params._sharded_param_data.dtype=} {dtype=}"
+            )
+
+    total_size = sum(
+        fsdp_params._sharded_param_data.numel() for fsdp_params in fsdp_param_group.fsdp_params
+    )
+    key = get_fsdp_params_key(fsdp_param_group.fsdp_params)
+    symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
+        key, (total_size,), dtype, group_rank
+    )
+    offset = 0
+    for fsdp_params in fsdp_param_group.fsdp_params:
+        param_size = fsdp_params._sharded_param_data.numel()
+        numel = reduce(operator.mul, fsdp_params.padded_sharded_param_size, 1)
+        assert numel == param_size, f"{fsdp_params.padded_sharded_param_size=} {param_size=}"
+        symm_buffer[offset : offset + param_size].copy_(fsdp_params._sharded_param_data)
+        padded_sharded_param = symm_buffer[offset : offset + param_size]
+        padded_sharded_param = padded_sharded_param.view(fsdp_params.padded_sharded_param_size)
+        offset += param_size
+
+        fsdp_params._sharded_param_data = padded_sharded_param.view(-1)
+        shard_dim = fsdp_params.fsdp_placement.dim
+        old_sharded_param = fsdp_params.sharded_param._local_tensor
+        length = old_sharded_param.size(shard_dim) if old_sharded_param.numel() > 0 else 0
+        sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
+        fsdp_params.sharded_param._local_tensor = sharded_param
+
+    # self._sharded_param_data = padded_sharded_param.view(-1)
+    # length = sharded_param.size(shard_dim) if sharded_param.numel() > 0 else 0
+    # sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
+    # assert sharded_param.is_contiguous(), f"{self.fsdp_placement=}"
+    # self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))
+    # self.sharded_param.requires_grad_(param.requires_grad)
+    # # Let `param_data` be freed normally when its ref count reaches 0 when
+    # # the `fully_shard` call returns to allow provided parameters to alias
+    # self._setattr_on_modules(self.sharded_param)
+    # self.sharded_state = ShardedState.SHARDED
 
 
 @torch.no_grad()
@@ -435,6 +495,11 @@ def custom_foreach_all_gather(
     device_handle = _get_device_handle(device.type)
     gather_comm = ODCAllGather()
     with device_handle.stream(all_gather_copy_in_stream):
+        key = get_fsdp_params_key(fsdp_params)
+        all_gather_input = SymmBufferRegistry.get_instance().get_symm_buffer(key)
+        all_gather_output = all_gather_comm.allocate(
+            (all_gather_input.numel() * world_size,), dtype=all_gather_input.dtype, device=device
+        )
         param_all_gather_inputs = custom_get_param_all_gather_inputs(fsdp_params)
         (
             param_all_gather_input_dtypes,
@@ -446,10 +511,10 @@ def custom_foreach_all_gather(
         else:
             all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
         inp_split_sizes = [t.numel() for t in all_gather_inputs]
-        all_gather_input_numel = sum(inp_split_sizes)
-        all_gather_output = all_gather_comm.allocate(
-            (all_gather_input_numel * world_size,), dtype=dtype, device=device
-        )
+        # all_gather_input_numel = sum(inp_split_sizes)
+        # all_gather_output = all_gather_comm.allocate(
+        #     (all_gather_input_numel * world_size,), dtype=dtype, device=device
+        # )
         # all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
         #     all_gather_inputs,
         #     all_gather_output,
@@ -464,9 +529,15 @@ def custom_foreach_all_gather(
         # symm_buffer.copy_(all_gather_input, non_blocking=True)
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
-        all_gather_work = gather_comm.gather(
+        # all_gather_work = gather_comm.gather(
+        #     output_tensor=all_gather_output,
+        #     input_tensors=all_gather_inputs,
+        #     group=group,
+        #     async_op=async_op,
+        # )
+        all_gather_work = gather_comm(
             output_tensor=all_gather_output,
-            input_tensors=all_gather_inputs,
+            input_tensor=all_gather_input,
             group=group,
             async_op=async_op,
         )
@@ -778,8 +849,8 @@ def patch_fsdp2(fsdp_model: FSDPModule) -> None:
     _fsdp_param_group.foreach_all_gather = custom_foreach_all_gather
     _fsdp_collectives.foreach_reduce = custom_foreach_reduce
     _fsdp_param_group.foreach_reduce = custom_foreach_reduce
-    FSDPParam._init_sharded_param = _init_sharded_param
-    FSDPParam.reset_sharded_param = reset_sharded_param
+    # FSDPParam._init_sharded_param = _init_sharded_param
+    # FSDPParam.reset_sharded_param = reset_sharded_param
 
     set_custom_all_gather(fsdp_model, ODCAllGather())
 
