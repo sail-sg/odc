@@ -136,6 +136,9 @@ class GatherService:
                 target_buf_size = size * group_world_size
                 assert target_buf_size <= buf_size
                 target_tensor_split = target_tensor[:target_buf_size].view(group_world_size, size)
+                if local_world_size == group_world_size:
+                    continue
+
                 signal_ptr.fill_(0)
                 assert group_world_size % 8 == 0 or group_world_size < 8
                 # grid_size = 8 if world_size == 32 else world_size

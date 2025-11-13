@@ -75,7 +75,6 @@ class ODCAllGather(DefaultAllocMixin, AllGather):
         async_op: bool = False,
     ) -> Optional[dist.Work]:
         gather = self.get_odc_gather()
-        torch.distributed.barrier(group)  # TODO: remove this
         gather.gather_into_tensor(output_tensor, input_tensor, group)
         if async_op:
             event = torch.cuda.Event()
@@ -493,9 +492,13 @@ def custom_foreach_all_gather(
 ) -> Optional[AllGatherResult]:
     world_size, _rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
-    gather_comm = ODCAllGather()
+    # Override the all-gather comm with ODCAllGather
+    all_gather_comm = ODCAllGather()
     with device_handle.stream(all_gather_copy_in_stream):
         key = get_fsdp_params_key(fsdp_params)
+        assert SymmBufferRegistry.get_instance().has_key(
+            key
+        ), f"{key=} not found. The fsdp param group has not been replaced with symm buffer yet."
         all_gather_input = SymmBufferRegistry.get_instance().get_symm_buffer(key)
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input.numel() * world_size,), dtype=all_gather_input.dtype, device=device
@@ -523,31 +526,14 @@ def custom_foreach_all_gather(
         #     rank,
         # )
         # del param_all_gather_inputs
-        # symm_buffer = FSDPParamsGatherBuffers.get_instance().get_buffer(
-        #     fsdp_params, all_gather_input, rank
-        # )
-        # symm_buffer.copy_(all_gather_input, non_blocking=True)
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
-        # all_gather_work = gather_comm.gather(
-        #     output_tensor=all_gather_output,
-        #     input_tensors=all_gather_inputs,
-        #     group=group,
-        #     async_op=async_op,
-        # )
-        all_gather_work = gather_comm(
+        all_gather_work = all_gather_comm(
             output_tensor=all_gather_output,
             input_tensor=all_gather_input,
             group=group,
             async_op=async_op,
         )
-        # all_gather_work = all_gather_comm(
-        #     output_tensor=all_gather_output,
-        #     # input_tensor=all_gather_input,
-        #     input_tensor=symm_buffer,
-        #     group=group,
-        #     async_op=async_op,
-        # )
         all_gather_event = all_gather_stream.record_event()
         return AllGatherResult(
             all_gather_output,
@@ -692,7 +678,8 @@ def custom_foreach_reduce(
                 partial_reduce_output,
             )
 
-        scatter.sync(reduce_scatter_group)
+        with torch.cuda.nvtx.range("scatter_accumulate_sync"):
+            scatter.sync(reduce_scatter_group)
         reduce_output = scatter.get_accumulation(key)
         assert reduce_scatter_op in [
             torch.distributed.ReduceOp.SUM,

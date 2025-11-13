@@ -716,12 +716,13 @@ class ReductionService:
         return acc
 
     def sync(self, pg: dist.ProcessGroup):
-        # TODO: This actually only syncs CPU of reduction workers, it's possible that the last reduction is on-the-fly.
         dispatched_task_list = [None for _ in range(dist.get_world_size(pg))]
-        torch.distributed.all_gather_object(dispatched_task_list, self.dispatched_tasks, group=pg)
-        torch.cuda.synchronize()
-
+        with torch.cuda.nvtx.range("task_all_gather"):
+            torch.distributed.all_gather_object(
+                dispatched_task_list, self.dispatched_tasks, group=pg
+            )
         target = sum(dispatched_task_list)
+
         call_watcher(self.reduction_watcher, "wait_and_reset_task_count", target)
         self.dispatched_tasks = 0
 
