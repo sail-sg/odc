@@ -45,13 +45,13 @@ def nvshmem_device_producer_gather_2d_get_block_kernel_chunked_synced(
     for i in range(1, num_nodes):
         peer_node = (i + group_rank // np) % num_nodes
         peer = (pid + peer_node * np) % group_world_size
+        global_peer = tl.load(pg_ranks_ptr + peer)
         # chunk_size = elem_per_rank // num_chunks
         num_chunks = tl.cdiv(elem_per_rank, chunk_size)
         for chunk in range(num_chunks):
             this_chunk_size = chunk_size
             if chunk == num_chunks - 1:
                 this_chunk_size = elem_per_rank - chunk * chunk_size
-            global_peer = tl.load(pg_ranks_ptr + peer)
             getmem_nbi_block(
                 target_tensor_ptr + peer * elem_per_rank + (chunk * chunk_size),
                 remote_tensor_ptr + (chunk * chunk_size),

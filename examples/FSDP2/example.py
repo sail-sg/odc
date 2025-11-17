@@ -12,6 +12,7 @@ from utils import inspect_mixed_precision, inspect_model
 
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
+from odc.primitives.utils import SymmBufferRegistry
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
 enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
@@ -101,12 +102,13 @@ def main(args):
     else:
         checkpointer.load_model(model)
 
+    group_rank = torch.distributed.get_rank()
     if enable_decouple:
         state = fsdp_model._get_fsdp_state()
         state._lazy_init()
         for layer in fsdp_model.layers:
-            fsdp2.replace_sharded_param_with_symm_buffer(layer, rank)
-        fsdp2.replace_sharded_param_with_symm_buffer(fsdp_model, rank)
+            fsdp2.replace_sharded_param_with_symm_buffer(layer, group_rank)
+        fsdp2.replace_sharded_param_with_symm_buffer(fsdp_model, group_rank)
 
     if args.mixed_precision:
         inspect_mixed_precision(model)
@@ -144,6 +146,10 @@ def main(args):
                 optim.step()
                 optim.zero_grad()
                 print(f"epoch {epoch} loss: {loss.detach().item()}")
+
+    torch_memory_allocated = torch.cuda.max_memory_allocated()
+    symm_buffer_memory_allocated = SymmBufferRegistry.get_instance().memory_allocated()
+    print(f"Rank {rank} {torch_memory_allocated=} {symm_buffer_memory_allocated=}")
 
     # checkpointer.save(model, optim)
     if enable_decouple:

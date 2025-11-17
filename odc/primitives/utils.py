@@ -167,6 +167,9 @@ class SymmBufferRegistry:
         self.updated.clear()
         self.peer_tensors.clear()
 
+    def memory_allocated(self):
+        return sum(t.nbytes for t in self.allocations)
+
 
 local_world_pg = None
 
