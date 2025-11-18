@@ -3,7 +3,7 @@ import operator
 from contextlib import contextmanager
 from functools import reduce
 from itertools import chain
-from typing import Callable, List, Optional, cast
+from typing import Callable, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -51,21 +51,6 @@ class ODCAllGather(DefaultAllocMixin, AllGather):
         if cls._odc_gather_instance is None:
             cls._odc_gather_instance = GatherService()
         return cls._odc_gather_instance
-
-    def gather(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensors: List[torch.Tensor],
-        group: dist.ProcessGroup,
-        async_op=False,
-    ) -> Optional[dist.Work]:
-        gather = self.get_odc_gather()
-        gather.gather_multi_into_tensor(output_tensor, input_tensors, group)
-        if async_op:
-            event = torch.cuda.Event()
-            event.record()
-            return event
-        return None
 
     def __call__(
         self,

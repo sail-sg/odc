@@ -1,7 +1,7 @@
 """
-FSDP Hybrid Sharding Training Example with Hugging Face Qwen 2.5 0.5B
+FSDP2 Hybrid Sharding Training Example with Hugging Face Qwen 2.5 0.5B
 
-This example demonstrates how to use PyTorch's Fully Sharded Data Parallel (FSDP)
+This example demonstrates how to use PyTorch's Fully Sharded Data Parallel (FSDP2)
 with HYBRID_SHARD strategy: 8 GPUs configured as 2 replicas * 4 FSDP groups.
 Includes gradient accumulation and deterministic training for reproducible results.
 
@@ -19,9 +19,10 @@ Deterministic Training:
 - Results should be identical across runs with same configuration
 
 Usage:
-    torchrun --nproc_per_node=8 --nnodes=1 torch_fsdp.py
+    torchrun --nproc_per_node=8 --nnodes=1 torch_fsdp2.py
 """
 
+import contextlib
 import functools
 import os
 import random
@@ -35,16 +36,14 @@ import wandb
 from args import get_args
 from datasets import load_from_disk
 from lm_head import FusedLinearForPPOFunction
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.optim import AdamW
 from torch.profiler import ProfilerActivity, profile
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 
-import odc
 from data import BatchedDataset
-from odc.fsdp import fsdp1
+from odc import init_nvshmem
+from odc.fsdp import fsdp2
 from odc.primitives.utils import SymmBufferRegistry
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
@@ -54,9 +53,6 @@ enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
 param_dtype = torch.bfloat16
 reduce_dtype = torch.float32
 buffer_dtype = torch.float32
-
-if enable_decouple:
-    fsdp1.patch_fsdp1(reduce_dtype=reduce_dtype)
 
 
 args = get_args()
@@ -159,7 +155,7 @@ def setup_distributed():
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank % torch.cuda.device_count())
     if enable_decouple:
-        odc.init_nvshmem()
+        init_nvshmem()
 
 
 def setup_hybrid_sharding():
@@ -208,7 +204,7 @@ def setup_hybrid_sharding():
 
 
 def create_fsdp_model(model, _sharding_group, _replication_group):
-    """Wrap model with FSDP using HYBRID_SHARD strategy"""
+    """Wrap model with FSDP2 using fully_shard"""
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
     if args.model_name.startswith("deepseek-ai/DeepSeek-R1-Distill-Qwen"):
@@ -216,28 +212,22 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
     else:
         raise NotImplementedError(f"Model {args.model_name} not supported")
 
-    # Auto wrap policy for Qwen2 transformer layers
-    auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy, transformer_layer_cls={layer_cls}
+    # FSDP2 configuration with MixedPrecisionPolicy
+    fsdp_kwargs = {}
+    fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
     )
 
-    # FSDP configuration with HYBRID_SHARD
-    fsdp_model = FSDP(
-        model,
-        # sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-        auto_wrap_policy=auto_wrap_policy,
-        # process_group=(sharding_group, replication_group),  # Tuple for hybrid sharding
-        device_id=torch.cuda.current_device(),
-        sync_module_states=True,
-        param_init_fn=None,
-        cpu_offload=None,
-        mixed_precision=MixedPrecision(
-            param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype
-        ),
-        use_orig_params=False,
-    )
+    # Wrap each transformer layer with fully_shard
+    for layer in model.model.layers:
+        fully_shard(layer, **fsdp_kwargs)
+
+    # Wrap the entire model with fully_shard
+    fsdp_model = fully_shard(model, **fsdp_kwargs)
+
     if enable_decouple:
-        fsdp1.pre_minibatch_start(fsdp_model)
+        fsdp2.patch_fsdp2(fsdp_model)
 
     return fsdp_model
 
@@ -250,7 +240,7 @@ def setup_wandb(rank, _world_size, config):
             project=args.project_name,
             name=args.run_name,
             config=config,
-            tags=["fsdp", "hybrid-sharding", "qwen2.5", "distributed-training"],
+            tags=["fsdp2", "hybrid-sharding", "qwen2.5", "distributed-training"],
         )
         print("Wandb initialized successfully!")
 
@@ -298,7 +288,7 @@ class Timer:
         return self.end_time - self.start_time
 
 
-def train_step(model, batch):
+def train_step(model, batch, is_last_microbatch):
     """Single training step with gradient accumulation"""
     with torch.cuda.nvtx.range("data_transfer"):
         input_ids, position_ids, attention_mask, loss_scale, _num_seqs = (
@@ -324,7 +314,11 @@ def train_step(model, batch):
 
     # Backward pass
     if not args.forward_only:
-        with torch.cuda.nvtx.range("backward_pass"):
+        if enable_decouple and is_last_microbatch:
+            ctx = fsdp2.last_microbatch_context()
+        else:
+            ctx = contextlib.nullcontext()
+        with torch.cuda.nvtx.range("backward_pass"), ctx:
             loss.backward()
 
     return loss.item()
@@ -334,7 +328,7 @@ def main():
     setup_distributed()
     if args.forward_only:
         src_tensor = torch.randn(1024, dtype=torch.bfloat16, device="cuda")
-        fsdp1.get_reduction_service().scatter_accumulate(0, src_tensor, dist.group.WORLD)
+        fsdp2.get_reduction_service().scatter_accumulate(0, src_tensor, dist.group.WORLD)
 
     # Main training function
     # Set deterministic training first
@@ -349,9 +343,18 @@ def main():
     model, _tokenizer = create_qwen_model()
     # print('original model dtype', model.dtype)
 
-    # Wrap with FSDP using HYBRID_SHARD
+    # Wrap with FSDP2 using fully_shard
     model = create_fsdp_model(model, None, None)
     # print(model.dtype)
+
+    # Replace sharded parameters with symmetric buffers if decouple is enabled
+    if enable_decouple:
+        group_rank = dist.get_rank()
+        state = model._get_fsdp_state()
+        state._lazy_init()
+        for layer in model.model.layers:
+            fsdp2.replace_sharded_param_with_symm_buffer(layer, group_rank)
+        fsdp2.replace_sharded_param_with_symm_buffer(model, group_rank)
 
     # Optimizer with higher learning rate for faster convergence
     optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
@@ -372,7 +375,7 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 5  # More epochs to see loss decrease
+    num_epochs = 3  # More epochs to see loss decrease
     max_steps = 25  # Limit steps for demo purposes
 
     # Setup wandb configuration
@@ -411,9 +414,7 @@ def main():
     model.train()
 
     # Use context manager only if profiler is enabled
-    from contextlib import nullcontext
-
-    profiler_context = prof if prof is not None else nullcontext()
+    profiler_context = prof if prof is not None else contextlib.nullcontext()
     global_step = 0
 
     with profiler_context:
@@ -429,9 +430,13 @@ def main():
                 if epoch == 0 and global_step == 2:
                     torch.cuda.cudart().cudaProfilerStart()
 
+                if enable_decouple:
+                    fsdp2.pre_minibatch_start()
+
                 minibatch_start_time = time.time()
                 for idx, micro_batch in enumerate(minibatch):
                     # Training step with profiling
+                    is_last_microbatch = idx == accumulation_steps - 1
 
                     # torch.cuda.synchronize()
                     # start_time = time.time()
@@ -440,6 +445,7 @@ def main():
                         loss = train_step(
                             model,
                             micro_batch,
+                            is_last_microbatch,
                         )
                         # TODO: the gradient scaling should be dynamic.
 
@@ -454,6 +460,7 @@ def main():
                     # Step the profiler after each training step (only if enabled)
                     if prof is not None:
                         prof.step()
+
                 sync_time = 0.0
                 optimizer_step_start_time = time.time()
                 grad_norm = torch.tensor(0.0).to("cuda")
@@ -461,7 +468,8 @@ def main():
                     if enable_decouple:
                         timer = Timer("pre_optimizer_step")
                         timer.start()
-                        fsdp1.pre_optimizer_step(model)
+                        # In FSDP2, gradient reduction happens during backward
+                        # No explicit pre_optimizer_step call needed
                         sync_time = timer.stop()
                         sync_time = torch.tensor(sync_time).to("cuda")
                         torch.distributed.all_reduce(sync_time, op=torch.distributed.ReduceOp.SUM)
@@ -476,8 +484,6 @@ def main():
                         # Optimizer step
                         optimizer.step()
                         optimizer.zero_grad()
-                    if enable_decouple:
-                        fsdp1.pre_minibatch_start(model)
 
                 dist.barrier()
                 torch.cuda.synchronize()
@@ -530,7 +536,7 @@ def main():
 
     # Cleanup
     if enable_decouple:
-        fsdp1.stop()
+        fsdp2.stop()
     dist.destroy_process_group()
 
     completion_file = f"logs/{args.project_name}/{args.run_name}.done"

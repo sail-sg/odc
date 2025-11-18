@@ -1,9 +1,21 @@
 # export WANDB_MODE=disabled
-export ODC=1
+export ODC=${ODC:-1}
 export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-20000000000}
 
-run_name='fsdp1_odc'
-group_name='fsdp1_test'
+if [ "${FSDP2:-0}" -eq 1 ]; then
+    FSDP_NAME="FSDP2"
+else
+    FSDP_NAME="FSDP1"
+fi
+
+if [ "${ODC}" -eq 1 ]; then
+    COMM_NAME="ODC"
+else
+    COMM_NAME="NCCL"
+fi
+
+run_name="${FSDP_NAME}_${COMM_NAME}"
+group_name="fsdp_test"
 
 if [ ! -d "data/longalign64" ]; then
     echo "data/longalign64 does not exist, running preprocessing..."
@@ -18,7 +30,19 @@ for netdev in $netdevs; do
 done
 export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdevs}
 
-bash launch.sh examples/fsdp1_hybrid/torch_fsdp.py \
+if [ "${FSDP2:-0}" -eq 1 ]; then
+    echo "Running FSDP2"
+    script="examples/fsdp1_hybrid/torch_fsdp2.py"
+else
+    echo "Running FSDP1"
+    script="examples/fsdp1_hybrid/torch_fsdp.py"
+fi
+
+bash launch.sh ${script} \
+           --limit_dataset_token_len 20000 \
+           --packing_method DynamicSameMicro \
+           --minibatch_size 2 \
+           --micro_batch_size 1 \
            --run_name ${run_name} \
            --project_name ${group_name}
 

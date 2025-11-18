@@ -1,4 +1,5 @@
 import torch
+from args import get_args
 from datasets import Dataset
 
 
@@ -19,6 +20,7 @@ class BatchedDataset:
         from packing import get_packing_function
 
         self.packing_function = get_packing_function(packing_method)
+        self.limit_dataset_token_len = get_args().limit_dataset_token_len
 
     def __len__(self):
         return len(self.dataset) // self.global_batch_size
@@ -27,6 +29,47 @@ class BatchedDataset:
         indices = range(index * self.global_batch_size, (index + 1) * self.global_batch_size)
         data = self.dataset[indices]
         lengths = [len(item) for item in data["input_ids"]]
+
+        if self.limit_dataset_token_len is not None:
+            print(f"Limiting dataset to {self.limit_dataset_token_len} tokens")
+            # Filter out sequences longer than limit_dataset_token_len
+            valid_indices = [
+                i for i, length in enumerate(lengths) if length <= self.limit_dataset_token_len
+            ]
+            if len(valid_indices) == 0:
+                # If all sequences are too long, truncate them instead
+                valid_indices = list(range(len(lengths)))
+                for i in valid_indices:
+                    for key in data.keys():
+                        if (
+                            isinstance(data[key][i], list)
+                            and len(data[key][i]) > self.limit_dataset_token_len
+                        ):
+                            data[key][i] = data[key][i][: self.limit_dataset_token_len]
+                lengths = [
+                    min(len(item), self.limit_dataset_token_len) for item in data["input_ids"]
+                ]
+            else:
+                # Use only valid sequences
+                data = {key: [data[key][i] for i in valid_indices] for key in data.keys()}
+                lengths = [lengths[i] for i in valid_indices]
+
+            # Pad sequences to make count divisible by world_size (required for DynamicSameMicro)
+            # This ensures the packing function can partition sequences evenly across ranks
+            num_valid = len(lengths)
+            remainder = num_valid % self.world_size
+            if remainder != 0:
+                pad_count = self.world_size - remainder
+                # Pad by repeating sequences from the beginning (copy to avoid shared references)
+                for i in range(pad_count):
+                    pad_idx = i % num_valid
+                    for key in data.keys():
+                        # Copy the list to avoid shared references
+                        if isinstance(data[key][pad_idx], list):
+                            data[key].append(data[key][pad_idx].copy())
+                        else:
+                            data[key].append(data[key][pad_idx])
+                    lengths.append(lengths[pad_idx])
 
         packed_indices = self.packing_function(lengths, self.rank, self.world_size)
 

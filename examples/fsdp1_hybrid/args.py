@@ -12,6 +12,7 @@ def get_args():
         parser.add_argument("--minibatch_size", type=int, default=4)
         parser.add_argument("--micro_batch_size", type=int, default=2)
         parser.add_argument("--max_token_len", type=int, default=65536)
+        parser.add_argument("--limit_dataset_token_len", type=int, default=None)
         parser.add_argument(
             "--model_name", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
         )
