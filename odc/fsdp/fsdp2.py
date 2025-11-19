@@ -1,16 +1,16 @@
+import dataclasses
 import logging
 import operator
-from contextlib import contextmanager
 from functools import reduce
 from itertools import chain
-from typing import Callable, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch._prims_common import make_contiguous_strides_for
 from torch.distributed.device_mesh import _get_device_handle
-from torch.distributed.fsdp import FSDPModule
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter, _ReduceOp
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     AllGatherResult,
@@ -23,6 +23,7 @@ from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
 )
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
     HSDPMeshInfo,
+    TrainingState,
     _chunk_with_empty,
     _get_dim0_padded_size,
     _get_dim_chunked_size,
@@ -31,16 +32,32 @@ from torch.distributed.fsdp._fully_shard._fsdp_common import (
     compiled_autograd_enabled,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
+from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
+    AllReduceState,
+    FSDPParamGroup,
+    ReduceScatterState,
+)
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor.device_mesh import _mesh_resources
 from torch.distributed.tensor.placement_types import Placement, _StridedShard
+from torch.profiler import record_function
 
 from odc.primitives.gather import GatherService
 from odc.primitives.scatter_accumulate import ReductionService
 from odc.primitives.utils import SymmBufferRegistry
 
 logger = logging.getLogger(__name__)
+
+
+class nvtx_record_function(record_function):
+    def __enter__(self):
+        torch.cuda.nvtx.range_push(self.name)
+        return super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        torch.cuda.nvtx.range_pop()
 
 
 class ODCAllGather(DefaultAllocMixin, AllGather):
@@ -97,31 +114,6 @@ class ODCReduceScatter(ProcessGroupAllocMixin, ReduceScatter):
         async_op: bool = False,
     ) -> dist.Work:
         raise NotImplementedError("ODCReduceScatter is not implemented")
-
-
-class FSDPParamsGatherBuffers:
-    _instance = None
-
-    @classmethod
-    def get_instance(cls):
-        if cls._instance is None:
-            cls._instance = FSDPParamsGatherBuffers()
-        return cls._instance
-
-    def get_buffer(
-        self, fsdp_params: list[FSDPParam], input_tensor: torch.Tensor, rank: int
-    ) -> torch.Tensor:
-        key = self._get_fsdp_params_key(fsdp_params)
-        buf = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
-            key, input_tensor.shape, input_tensor.dtype, rank
-        )
-        assert buf.shape == input_tensor.shape
-        assert buf.dtype == input_tensor.dtype
-        return buf
-
-    def _get_fsdp_params_key(self, fsdp_params: list[FSDPParam]) -> str:
-        ids = "_".join([str(id(param)) for param in fsdp_params])
-        return f"fsdp_params_gather_{ids}"
 
 
 def get_fsdp_params_key(fsdp_params: list[FSDPParam]) -> str:
@@ -530,17 +522,6 @@ def custom_foreach_all_gather(
         )
 
 
-_is_last_microbatch = False
-
-
-@contextmanager
-def last_microbatch_context():
-    global _is_last_microbatch
-    _is_last_microbatch = True
-    yield
-    _is_last_microbatch = False
-
-
 def pre_minibatch_start():
     ODCReduceScatter.get_odc_reduction().clear_accumulations()
 
@@ -548,8 +529,122 @@ def pre_minibatch_start():
     dist.barrier()
 
 
+def post_backward(self, *_unused: Any):
+    # This method should be idempotent and safe to call even when this
+    # FSDP parameter group was not used in backward (should be a no-op)
+    if not compiled_autograd_enabled():
+        logger.debug("%s", self._with_fqn("FSDP::post_backward"))
+    self._training_state = TrainingState.POST_BACKWARD
+    with record_function(self._with_fqn("FSDP::post_backward_accumulate")):
+        for fsdp_param in self.fsdp_params:
+            fsdp_param.accumulate_unsharded_grad_if_needed()
+    with record_function(self._with_fqn("FSDP::post_backward_reshard")):
+        if not self.reduce_grads:
+            if self.reshard_after_backward:
+                self.reshard()
+            for fsdp_param in self.fsdp_params:
+                fsdp_param.to_accumulated_grad_if_needed()
+            return
+        # Save the autograd-computed gradients before resharding to only
+        # access the unsharded parameters when their data is present
+        fsdp_params_with_grad: list[FSDPParam] = []
+        unsharded_grads: list[torch.Tensor] = []
+        for fsdp_param in self.fsdp_params:
+            if not hasattr(fsdp_param, "_unsharded_param"):
+                continue
+            # May have an accumulated gradient of the reduce dtype if the
+            # previous backward did not reduce-scatter
+            if fsdp_param.unsharded_accumulated_grad is not None:
+                fsdp_params_with_grad.append(fsdp_param)
+                unsharded_grads.append(fsdp_param.unsharded_accumulated_grad_data)
+                fsdp_param.unsharded_accumulated_grad = None
+            elif fsdp_param.unsharded_param.grad is not None:
+                fsdp_params_with_grad.append(fsdp_param)
+                unsharded_grads.append(fsdp_param.unsharded_grad_data)
+                fsdp_param.unsharded_param.grad = None
+        if self.reshard_after_backward:
+            self.reshard()
+    if len(fsdp_params_with_grad) == 0:
+        return
+    with record_function(self._with_fqn("FSDP::post_backward_reduce")):
+        if (
+            self.comm_ctx.reduce_scatter_state is not None
+            and self.comm_ctx.reduce_scatter_state.event is not None
+        ):
+            self.device_handle.current_stream().wait_event(self.comm_ctx.reduce_scatter_state.event)
+        self.comm_ctx.reduce_scatter_state = None
+        all_reduce_pg = self._all_reduce_process_group if self._is_hsdp else None
+        all_reduce_stream: torch.cuda.Stream
+        if all_reduce_pg is None and self._all_reduce_hook_stream is not None:
+            # this means the native HSDP is not enabled,
+            # but user may want to have a custom HSDP setup
+            assert (
+                self._all_reduce_hook is not None
+            ), "all reduce hook stream is specified but hook itself is missing."
+            all_reduce_stream = self._all_reduce_hook_stream
+        else:
+            all_reduce_stream = self.comm_ctx.all_reduce_stream
+
+        self._wait_for_post_backward()
+        (
+            reduce_scatter_input,
+            reduce_scatter_event,
+            self._post_reduce_event,
+            all_reduce_input,
+            all_reduce_event,
+            self._partial_reduce_output,
+        ) = custom_foreach_reduce(
+            self,
+            fsdp_params_with_grad,
+            unsharded_grads,
+            self._reduce_scatter_process_group,
+            self.comm_ctx.reduce_scatter_stream,
+            self._reduce_scatter_comm,
+            self._orig_dtype,
+            self._reduce_dtype,
+            self.device,
+            self.gradient_divide_factor,
+            self._all_reduce_process_group if self._is_hsdp else None,
+            all_reduce_stream,
+            self.all_reduce_grads,
+            self._partial_reduce_output,
+            self._all_reduce_hook,
+            self.force_sum_reduction_for_comms,
+        )
+        self.comm_ctx.reduce_scatter_state = ReduceScatterState(
+            reduce_scatter_input, reduce_scatter_event
+        )
+        if all_reduce_input is not None:
+            if self.device.type != "cpu":
+                assert all_reduce_event is not None
+            self._all_reduce_state = AllReduceState(all_reduce_input, all_reduce_event)
+
+
+@dataclasses.dataclass
+class ReduceScatterContext:
+    # arguments
+    fsdp_params: list[FSDPParam]
+    unsharded_grads: list[torch.Tensor]
+    reduce_scatter_group: dist.ProcessGroup
+    reduce_scatter_stream: torch.Stream
+    orig_dtype: Optional[torch.dtype]
+    reduce_dtype: Optional[torch.dtype]
+    device: torch.device
+    gradient_divide_factor: Optional[float]
+    all_reduce_group: Optional[dist.ProcessGroup]  # not `None` iff HSDP
+    all_reduce_stream: torch.Stream
+    all_reduce_grads: bool
+    partial_reduce_output: Optional[torch.Tensor]  # only used for HSDP
+    all_reduce_hook: Optional[Callable[[torch.Tensor], None]]
+    force_sum_reduction_for_comms: bool
+    # others
+    padded_unsharded_sizes: tuple
+    grad_dtype: torch.dtype
+
+
 @torch.no_grad()
 def custom_foreach_reduce(
+    fsdp_param_group: FSDPParamGroup,
     fsdp_params: list[FSDPParam],
     unsharded_grads: list[torch.Tensor],
     reduce_scatter_group: dist.ProcessGroup,
@@ -587,7 +682,7 @@ def custom_foreach_reduce(
         )
     grad_dtype = unsharded_grads[0].dtype
     reduce_dtype = reduce_dtype or grad_dtype
-    (predivide_factor, postdivide_factor, reduce_scatter_op, all_reduce_op) = (
+    (predivide_factor, _postdivide_factor, _reduce_scatter_op, _all_reduce_op) = (
         _get_gradient_divide_factors(
             reduce_scatter_group,
             all_reduce_group,
@@ -615,7 +710,7 @@ def custom_foreach_reduce(
         _get_dim0_padded_size(grad.size(), world_size) for grad in unsharded_grads
     )
     reduce_scatter_input_numel = sum(s.numel() for s in padded_unsharded_sizes)
-    reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
+    # reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
     reduce_scatter_input = reduce_scatter_comm.allocate(
         (reduce_scatter_input_numel,),
         dtype=reduce_dtype,
@@ -631,11 +726,12 @@ def custom_foreach_reduce(
     all_reduce_event = None
 
     with device_handle.stream(reduce_scatter_stream):
-        reduce_output = reduce_scatter_comm.allocate(
-            (reduce_scatter_output_numel,),
-            dtype=reduce_dtype,
-            device=device,
-        )
+        # with torch.cuda.nvtx.range("reduce_scatter_output_allocate"):
+        #     reduce_output = reduce_scatter_comm.allocate(
+        #         (reduce_scatter_output_numel,),
+        #         dtype=reduce_dtype,
+        #         device=device,
+        #     )
         _div_if_needed(reduce_scatter_input, predivide_factor)
         # if world_size > 1:
         #     reduce_scatter_comm(
@@ -647,24 +743,85 @@ def custom_foreach_reduce(
         # else:
         #     # For single GPU, just copy the input to output (no actual reduce-scatter needed)
         #     reduce_output.copy_(reduce_scatter_input)
-        key = ODCReduceScatter.get_fsdp_params_key(fsdp_params)
+        key = id(fsdp_param_group)
         scatter = ODCReduceScatter.get_odc_reduction()
         scatter.scatter_accumulate(key, reduce_scatter_input, reduce_scatter_group)
 
-        reduce_scatter_event = reduce_scatter_stream.record_event()
         post_reduce_stream = reduce_scatter_stream
-        if not _is_last_microbatch:
-            return (
-                reduce_scatter_input,
-                reduce_scatter_event,
-                post_reduce_stream.record_event(),
-                all_reduce_input,
-                all_reduce_event,
-                partial_reduce_output,
-            )
+        reduce_scatter_event = reduce_scatter_stream.record_event()
 
-        with torch.cuda.nvtx.range("scatter_accumulate_sync"):
-            scatter.sync(reduce_scatter_group)
+        # Save the context for the next update_gradients call
+        fsdp_param_group.__odc_reduce_scatter_context = ReduceScatterContext(
+            fsdp_params=fsdp_params,
+            unsharded_grads=unsharded_grads,
+            reduce_scatter_group=reduce_scatter_group,
+            reduce_scatter_stream=reduce_scatter_stream,
+            orig_dtype=orig_dtype,
+            reduce_dtype=reduce_dtype,
+            device=device,
+            gradient_divide_factor=gradient_divide_factor,
+            all_reduce_group=all_reduce_group,
+            all_reduce_stream=all_reduce_stream,
+            all_reduce_grads=all_reduce_grads,
+            partial_reduce_output=partial_reduce_output,
+            all_reduce_hook=all_reduce_hook,
+            force_sum_reduction_for_comms=force_sum_reduction_for_comms,
+            padded_unsharded_sizes=padded_unsharded_sizes,
+            grad_dtype=grad_dtype,
+        )
+
+        return (
+            reduce_scatter_input,
+            reduce_scatter_event,
+            post_reduce_stream.record_event(),
+            all_reduce_input,
+            all_reduce_event,
+            partial_reduce_output,
+        )
+
+
+# @torch.no_grad()
+def update_gradients(fsdp_param_group: FSDPParamGroup):
+    reduce_scatter_context = fsdp_param_group.__odc_reduce_scatter_context
+    del fsdp_param_group.__odc_reduce_scatter_context
+    fsdp_params = reduce_scatter_context.fsdp_params
+    reduce_scatter_group = reduce_scatter_context.reduce_scatter_group
+    reduce_scatter_stream = reduce_scatter_context.reduce_scatter_stream
+    orig_dtype = reduce_scatter_context.orig_dtype
+    reduce_dtype = reduce_scatter_context.reduce_dtype
+    device = reduce_scatter_context.device
+    gradient_divide_factor = reduce_scatter_context.gradient_divide_factor
+    all_reduce_group = reduce_scatter_context.all_reduce_group
+    all_reduce_stream = reduce_scatter_context.all_reduce_stream
+    # all_reduce_grads = reduce_scatter_context.all_reduce_grads
+    # partial_reduce_output = reduce_scatter_context.partial_reduce_output
+    all_reduce_hook = reduce_scatter_context.all_reduce_hook
+    force_sum_reduction_for_comms = reduce_scatter_context.force_sum_reduction_for_comms
+    padded_unsharded_sizes = reduce_scatter_context.padded_unsharded_sizes
+    grad_dtype = reduce_scatter_context.grad_dtype
+
+    device_handle = _get_device_handle(device.type)
+
+    reduce_dtype = reduce_dtype or grad_dtype
+    (_predivide_factor, postdivide_factor, reduce_scatter_op, all_reduce_op) = (
+        _get_gradient_divide_factors(
+            reduce_scatter_group,
+            all_reduce_group,
+            reduce_dtype,
+            device.type,
+            gradient_divide_factor,
+            force_sum_reduction_for_comms,
+        )
+    )
+    world_size = reduce_scatter_group.size()
+    device_handle = _get_device_handle(device.type)
+    current_stream = device_handle.current_stream()
+
+    with device_handle.stream(reduce_scatter_stream):
+        post_reduce_stream = all_reduce_stream
+
+        scatter = ODCReduceScatter.get_odc_reduction()
+        key = id(fsdp_param_group)
         reduce_output = scatter.get_accumulation(key)
         assert reduce_scatter_op in [
             torch.distributed.ReduceOp.SUM,
@@ -675,9 +832,6 @@ def custom_foreach_reduce(
 
         if all_reduce_group is not None:  # HSDP
             # Accumulations must run in the reduce-scatter stream
-            assert (
-                all_reduce_grads
-            ), "set_is_last_microbatch(True) needs set_requires_all_reduce() for the last microbatch"
             # if not all_reduce_grads:
             #     if partial_reduce_output is not None:
             #         # partial_reduce_output += reduce_output
@@ -705,8 +859,8 @@ def custom_foreach_reduce(
                     group=all_reduce_group,
                     op=all_reduce_op,
                 )
-                all_reduce_input = reduce_output
-                all_reduce_event = all_reduce_stream.record_event()
+                # all_reduce_input = reduce_output
+                # all_reduce_event = all_reduce_stream.record_event()
     # -- END: ops in reduce_scatter stream
 
     if all_reduce_hook is not None:
@@ -762,19 +916,37 @@ def custom_foreach_reduce(
                     hook(fsdp_param.sharded_param)
             padded_sharded_numel = padded_unsharded_size.numel() // world_size
             flat_grad_offset += padded_sharded_numel
-        post_reduce_event = post_reduce_stream.record_event()
+        # post_reduce_event = post_reduce_stream.record_event()
     # The RS output is allocated in the RS stream and used in the default
     # stream (for optimizer). To ensure its memory is not reused for later
     # RSs, we do not need extra synchronization since the sharded parameters
     # hold refs through the end of backward.
-    return (
-        reduce_scatter_input,
-        reduce_scatter_event,
-        post_reduce_event,
-        all_reduce_input,
-        all_reduce_event,
-        None,
-    )
+    # return (
+    #     reduce_scatter_input,
+    #     reduce_scatter_event,
+    #     post_reduce_event,
+    #     all_reduce_input,
+    #     all_reduce_event,
+    #     None,
+    # )
+
+
+def pre_optimizer_step(fsdp_module):
+    scatter = ODCReduceScatter.get_odc_reduction()
+
+    root_state = fully_shard.state(fsdp_module)
+    all_fsdp_states = root_state._state_ctx.all_states
+    all_fsdp_param_groups = [
+        state._fsdp_param_group for state in all_fsdp_states if state._fsdp_param_group is not None
+    ]
+    for i, fsdp_param_group in enumerate(all_fsdp_param_groups):
+        if i == 0:
+            reduce_scatter_group = fsdp_param_group.mesh_info.shard_process_group
+            with torch.cuda.nvtx.range("scatter_accumulate_sync"):
+                scatter.sync(reduce_scatter_group)
+
+        with torch.cuda.nvtx.range(f"update_gradients:{fsdp_param_group._module_fqn}"):
+            update_gradients(fsdp_param_group)
 
 
 def set_custom_all_gather(fsdp_model: FSDPModule, comm: AllGather) -> None:
@@ -814,6 +986,23 @@ def set_custom_reduce_scatter(fsdp_model: FSDPModule, comm: ReduceScatter) -> No
         fsdp_param_group._reduce_scatter_comm = comm
 
 
+def init_all_gather_outputs(
+    self,
+    all_gather_input_numels: list[int],
+    all_gather_input_dtypes: list[torch.dtype],
+    world_size: int,
+    device: torch.device,
+    force_recreate: bool = False,
+):
+    if not force_recreate and len(self.all_gather_outputs) > 0:
+        return  # already initialized
+    with torch.cuda.nvtx.range("init_all_gather_outputs:all_gather_outputs_allocate"):
+        self.all_gather_outputs = [
+            torch.empty(torch.Size([numel * world_size]), dtype=dtype, device=device)
+            for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
+        ]
+
+
 def patch_fsdp2(fsdp_model: FSDPModule) -> None:
     from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
 
@@ -821,8 +1010,13 @@ def patch_fsdp2(fsdp_model: FSDPModule) -> None:
     _fsdp_param_group.foreach_all_gather = custom_foreach_all_gather
     _fsdp_collectives.foreach_reduce = custom_foreach_reduce
     _fsdp_param_group.foreach_reduce = custom_foreach_reduce
+    FSDPParamGroup.post_backward = post_backward
     # FSDPParam._init_sharded_param = _init_sharded_param
     # FSDPParam.reset_sharded_param = reset_sharded_param
+    # FSDPParam.init_all_gather_outputs = init_all_gather_outputs
+    _fsdp_param_group.record_function = nvtx_record_function
+    torch.profiler.record_function = nvtx_record_function
+    torch.autograd.profiler.record_function = nvtx_record_function
 
     set_custom_all_gather(fsdp_model, ODCAllGather())
 

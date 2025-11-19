@@ -27,6 +27,7 @@ import functools
 import os
 import random
 import time
+from typing import Any
 
 import numpy as np
 import packing
@@ -288,7 +289,7 @@ class Timer:
         return self.end_time - self.start_time
 
 
-def train_step(model, batch, is_last_microbatch):
+def train_step(model, batch):
     """Single training step with gradient accumulation"""
     with torch.cuda.nvtx.range("data_transfer"):
         input_ids, position_ids, attention_mask, loss_scale, _num_seqs = (
@@ -306,6 +307,7 @@ def train_step(model, batch, is_last_microbatch):
         loss_scale = loss_scale.cuda(non_blocking=True)
 
     # Forward pass
+    model.set_reshard_after_forward(True, recurse=True)
     with torch.cuda.nvtx.range("forward_pass"):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logps = model(input_ids=input_ids, attention_mask=None, position_ids=position_ids)
@@ -314,11 +316,8 @@ def train_step(model, batch, is_last_microbatch):
 
     # Backward pass
     if not args.forward_only:
-        if enable_decouple and is_last_microbatch:
-            ctx = fsdp2.last_microbatch_context()
-        else:
-            ctx = contextlib.nullcontext()
-        with torch.cuda.nvtx.range("backward_pass"), ctx:
+        model.set_reshard_after_forward(False, recurse=True)
+        with torch.cuda.nvtx.range("backward_pass"):
             loss.backward()
 
     return loss.item()
@@ -375,7 +374,7 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 3  # More epochs to see loss decrease
+    num_epochs = 1  # More epochs to see loss decrease
     max_steps = 25  # Limit steps for demo purposes
 
     # Setup wandb configuration
@@ -436,8 +435,6 @@ def main():
                 minibatch_start_time = time.time()
                 for idx, micro_batch in enumerate(minibatch):
                     # Training step with profiling
-                    is_last_microbatch = idx == accumulation_steps - 1
-
                     # torch.cuda.synchronize()
                     # start_time = time.time()
 
@@ -445,7 +442,6 @@ def main():
                         loss = train_step(
                             model,
                             micro_batch,
-                            is_last_microbatch,
                         )
                         # TODO: the gradient scaling should be dynamic.
 
@@ -465,6 +461,7 @@ def main():
                 optimizer_step_start_time = time.time()
                 grad_norm = torch.tensor(0.0).to("cuda")
                 if not args.forward_only:
+                    fsdp2.pre_optimizer_step(model)
                     if enable_decouple:
                         timer = Timer("pre_optimizer_step")
                         timer.start()

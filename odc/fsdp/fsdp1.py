@@ -287,7 +287,8 @@ def patch_fsdp1(reduce_dtype=None):
 def pre_optimizer_step(fsdp_module):
 
     assert isinstance(fsdp_module, _FSDPState)
-    get_reduction_service().sync(fsdp_module.process_group)
+    with torch.cuda.nvtx.range("scatter_accumulate_sync"):
+        get_reduction_service().sync(fsdp_module.process_group)
 
     # time.sleep(1)
     for acc in get_reduction_service().accumulations:
