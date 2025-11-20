@@ -227,7 +227,7 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
     fsdp_model = fully_shard(model, **fsdp_kwargs)
 
     if enable_decouple:
-        fsdp2.patch_fsdp2(fsdp_model)
+        fsdp2.patch_fsdp2()
 
     return fsdp_model
 
@@ -426,8 +426,6 @@ def main():
                 minibatch_seq_length = 0
                 global_step += 1
                 print(f"rank {dist.get_rank()}: accumulation_steps: {accumulation_steps}")
-                # if epoch == 0 and global_step == 2:
-                # torch.cuda.cudart().cudaProfilerStart()
 
                 if enable_decouple:
                     fsdp2.pre_minibatch_start()
@@ -507,8 +505,6 @@ def main():
                 }
                 if dist.get_rank() == 0:
                     wandb.log(minibatch_log, step=global_step)
-                # if epoch == 0 and global_step == 2:
-                #     torch.cuda.cudart().cudaProfilerStop()
                 if global_step >= max_steps:
                     break
 

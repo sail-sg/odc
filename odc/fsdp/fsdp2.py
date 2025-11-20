@@ -9,12 +9,11 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import _get_device_handle
-from torch.distributed.fsdp import FSDPModule, fully_shard
-from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter, _ReduceOp
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     AllGatherResult,
     DefaultAllocMixin,
-    ProcessGroupAllocMixin,
     _div_if_needed,
     _get_all_gather_input_metadatas,
     _get_gradient_divide_factors,
@@ -53,15 +52,19 @@ class nvtx_record_function(record_function):
         torch.cuda.nvtx.range_pop()
 
 
+reduction_service = None
+gather_service = None
+
+
+def get_reduction_service():
+    return reduction_service
+
+
+def get_gather_service():
+    return gather_service
+
+
 class ODCAllGather(DefaultAllocMixin, AllGather):
-    _odc_gather_instance = None
-
-    @classmethod
-    def get_odc_gather(cls) -> GatherService:
-        if cls._odc_gather_instance is None:
-            cls._odc_gather_instance = GatherService()
-        return cls._odc_gather_instance
-
     def __call__(
         self,
         output_tensor: torch.Tensor,
@@ -69,44 +72,13 @@ class ODCAllGather(DefaultAllocMixin, AllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> Optional[dist.Work]:
-        gather = self.get_odc_gather()
+        gather = get_gather_service()
         gather.gather_into_tensor(output_tensor, input_tensor, group)
         if async_op:
             event = torch.cuda.Event()
             event.record()
             return event
         return None
-        # return dist.all_gather_into_tensor(
-        #     output_tensor,
-        #     input_tensor,
-        #     group=group,
-        #     async_op=async_op,
-        # )
-
-
-class ODCReduceScatter(ProcessGroupAllocMixin, ReduceScatter):
-    _odc_reduction_instance = None
-
-    @classmethod
-    def get_odc_reduction(cls) -> ReductionService:
-        if cls._odc_reduction_instance is None:
-            cls._odc_reduction_instance = ReductionService()
-        return cls._odc_reduction_instance
-
-    @classmethod
-    def get_fsdp_params_key(cls, fsdp_params: list[FSDPParam]) -> str:
-        ids = "_".join([str(id(param)) for param in fsdp_params])
-        return f"fsdp_params_reduce_{ids}"
-
-    def __call__(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        group: dist.ProcessGroup,
-        op: _ReduceOp,
-        async_op: bool = False,
-    ) -> dist.Work:
-        raise NotImplementedError("ODCReduceScatter is not implemented")
 
 
 def get_fsdp_params_key(fsdp_params: list[FSDPParam]) -> str:
@@ -134,11 +106,13 @@ def replace_sharded_param_with_symm_buffer(
     total_size = sum(
         fsdp_params._sharded_param_data.numel() for fsdp_params in fsdp_param_group.fsdp_params
     )
+    # This key needs to be the same as the one used in `custom_foreach_all_gather`
     key = get_fsdp_params_key(fsdp_param_group.fsdp_params)
     symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
         key, (total_size,), dtype, group_rank
     )
     offset = 0
+    # Refer to the codes in `FSDPParam._init_sharded_param`
     for fsdp_params in fsdp_param_group.fsdp_params:
         param_size = fsdp_params._sharded_param_data.numel()
         numel = reduce(operator.mul, fsdp_params.padded_sharded_param_size, 1)
@@ -154,17 +128,6 @@ def replace_sharded_param_with_symm_buffer(
         length = old_sharded_param.size(shard_dim) if old_sharded_param.numel() > 0 else 0
         sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
         fsdp_params.sharded_param._local_tensor = sharded_param
-
-    # self._sharded_param_data = padded_sharded_param.view(-1)
-    # length = sharded_param.size(shard_dim) if sharded_param.numel() > 0 else 0
-    # sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
-    # assert sharded_param.is_contiguous(), f"{self.fsdp_placement=}"
-    # self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))
-    # self.sharded_param.requires_grad_(param.requires_grad)
-    # # Let `param_data` be freed normally when its ref count reaches 0 when
-    # # the `fully_shard` call returns to allow provided parameters to alias
-    # self._setattr_on_modules(self.sharded_param)
-    # self.sharded_state = ShardedState.SHARDED
 
 
 @torch.no_grad()
@@ -210,6 +173,10 @@ def custom_get_param_all_gather_inputs(
         else:
             # TODO: support reshard_after_forward=int in all_gather_inputs
             param_all_gather_inputs[i] = fsdp_param.all_gather_inputs
+
+    # We have to use the original symmetric buffer for odc gather.
+    # Just return the slices of the original symmetric buffer.
+    # The original codes below are not needed for ODC.
 
     # # 2nd pass: use foreach copy to compute the remaining all-gather inputs
     # if foreach_copy_inputs:
@@ -292,7 +259,7 @@ def custom_foreach_all_gather(
 
 
 def pre_minibatch_start():
-    ODCReduceScatter.get_odc_reduction().clear_accumulations()
+    get_reduction_service().clear_accumulations()
 
     # Make sure optimizer updates are visible to all ranks
     dist.barrier()
@@ -537,7 +504,7 @@ def custom_foreach_reduce(
         #     # For single GPU, just copy the input to output (no actual reduce-scatter needed)
         #     reduce_output.copy_(reduce_scatter_input)
         key = id(fsdp_param_group)
-        scatter = ODCReduceScatter.get_odc_reduction()
+        scatter = get_reduction_service()
         scatter.scatter_accumulate(key, reduce_scatter_input, reduce_scatter_group)
 
         post_reduce_stream = reduce_scatter_stream
@@ -613,7 +580,7 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
     with device_handle.stream(reduce_scatter_stream):
         post_reduce_stream = all_reduce_stream
 
-        scatter = ODCReduceScatter.get_odc_reduction()
+        scatter = get_reduction_service()
         key = id(fsdp_param_group)
         reduce_output = scatter.get_accumulation(key)
         assert reduce_scatter_op in [
@@ -624,6 +591,11 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
             reduce_output /= world_size
 
         if all_reduce_group is not None:  # HSDP
+            # ODC: all_reduce_grads is set to False during gradient accumulation in HSDP
+            # to defer all-reduce until the last microbatch.
+            # But this has been implemented in scatter-accumulate
+            # so we can remove this part from the original implementation.
+            #
             # Accumulations must run in the reduce-scatter stream
             # if not all_reduce_grads:
             #     if partial_reduce_output is not None:
@@ -725,7 +697,7 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
 
 
 def pre_optimizer_step(fsdp_module):
-    scatter = ODCReduceScatter.get_odc_reduction()
+    scatter = get_reduction_service()
 
     root_state = fully_shard.state(fsdp_module)
     all_fsdp_states = root_state._state_ctx.all_states
@@ -742,59 +714,23 @@ def pre_optimizer_step(fsdp_module):
             update_gradients(fsdp_param_group)
 
 
-def set_custom_all_gather(fsdp_model: FSDPModule, comm: AllGather) -> None:
-    """
-    Overrides the default ``all_gather`` communication behavior,
-    to have better control over the communication and memory usage.
-    See `Comm` and `ReduceScatter` for details.
-
-    Args:
-        comm (AllGather): Custom all-gather communication.
-    """
-    # state = fsdp_model._get_fsdp_state()
-    # if (fsdp_param_group := state._fsdp_param_group) is not None:
-    #     fsdp_param_group._all_gather_comm = comm
-    # Get all FSDP states in the module tree (not just the root)
-    from torch.distributed.fsdp._traversal_utils import _get_fsdp_states
-
-    all_states = _get_fsdp_states(fsdp_model)
-
-    # Set _all_gather_comm for all FSDP states that have a param group
-    for state in all_states:
-        if (fsdp_param_group := state._fsdp_param_group) is not None:
-            fsdp_param_group._all_gather_comm = comm
-
-
-def set_custom_reduce_scatter(fsdp_model: FSDPModule, comm: ReduceScatter) -> None:
-    """
-    Overrides the default ``reduce_scatter`` communication behavior,
-    to have better control over the communication and memory usage.
-    See `Comm` and `ReduceScatter` for details.
-
-    Args:
-        comm (ReduceScatter): Custom reduce_scatter communication.
-    """
-    state = fsdp_model._get_fsdp_state()
-    if (fsdp_param_group := state._fsdp_param_group) is not None:
-        fsdp_param_group._reduce_scatter_comm = comm
-
-
-def patch_fsdp2(fsdp_model: FSDPModule) -> None:
+def patch_fsdp2() -> None:
     from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
 
     _fsdp_collectives.foreach_all_gather = custom_foreach_all_gather
     _fsdp_param_group.foreach_all_gather = custom_foreach_all_gather
-    _fsdp_collectives.foreach_reduce = custom_foreach_reduce
-    _fsdp_param_group.foreach_reduce = custom_foreach_reduce
     FSDPParamGroup.post_backward = post_backward
     FSDPParamGroup.post_forward = post_forward
     _fsdp_param_group.record_function = nvtx_record_function
     torch.profiler.record_function = nvtx_record_function
     torch.autograd.profiler.record_function = nvtx_record_function
 
-    set_custom_all_gather(fsdp_model, ODCAllGather())
+    global reduction_service
+    global gather_service
+    reduction_service = ReductionService()
+    gather_service = GatherService()
 
 
 def stop():
-    ODCReduceScatter.get_odc_reduction().stop()
+    get_reduction_service().stop()
     SymmBufferRegistry.get_instance().finalize()

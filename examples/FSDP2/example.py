@@ -89,7 +89,7 @@ def main(args):
     inspect_model(model)
 
     if enable_decouple:
-        fsdp2.patch_fsdp2(fsdp_model)
+        fsdp2.patch_fsdp2()
 
     if args.explicit_prefetching:
         set_modules_to_forward_prefetch(model, num_to_forward_prefetch=2)
@@ -134,14 +134,12 @@ def main(args):
                     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
                     with torch.cuda.nvtx.range(f"forward_{mb}"):
                         loss = model(x).sum()
-                    if enable_decouple and mb == num_microbatches - 1:
-                        ctx = fsdp2.last_microbatch_context()
-                    else:
-                        ctx = contextlib.nullcontext()
-                    with torch.cuda.nvtx.range(f"backward_{mb}"), ctx:
+                    with torch.cuda.nvtx.range(f"backward_{mb}"):
                         loss.backward()
                     if prof is not None:
                         prof.step()
+                if enable_decouple:
+                    fsdp2.pre_optimizer_step(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optim.step()
                 optim.zero_grad()

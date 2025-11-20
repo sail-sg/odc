@@ -39,8 +39,8 @@ else
 fi
 
 bash launch.sh ${script} \
-           --limit_dataset_token_len 20000 \
-           --minibatch_size 2 \
-           --micro_batch_size 1 \
+           --limit_dataset_token_len 40000 \
+           --minibatch_size 4 \
+           --micro_batch_size 2 \
            --run_name ${run_name} \
            --project_name ${group_name}

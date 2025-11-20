@@ -420,14 +420,15 @@ def main():
         for epoch in range(num_epochs):
             epoch_start_time = time.time()
 
+            if epoch == num_epochs - 1:
+                torch.cuda.cudart().cudaProfilerStart()
+
             for minibatch in dataset:
                 accumulation_steps = len(minibatch)
                 minibatch_loss = torch.tensor(0.0).to("cuda")
                 minibatch_seq_length = 0
                 global_step += 1
                 print(f"rank {dist.get_rank()}: accumulation_steps: {accumulation_steps}")
-                if epoch == 0 and global_step == 2:
-                    torch.cuda.cudart().cudaProfilerStart()
 
                 minibatch_start_time = time.time()
                 for idx, micro_batch in enumerate(minibatch):
@@ -503,10 +504,11 @@ def main():
                 }
                 if dist.get_rank() == 0:
                     wandb.log(minibatch_log, step=global_step)
-                if epoch == 0 and global_step == 2:
-                    torch.cuda.cudart().cudaProfilerStop()
                 if global_step >= max_steps:
                     break
+
+            if epoch == num_epochs - 1:
+                torch.cuda.cudart().cudaProfilerStop()
 
             if dist.get_rank() == 0:
                 epoch_end_time = time.time()
