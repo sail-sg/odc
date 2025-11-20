@@ -27,7 +27,6 @@ import functools
 import os
 import random
 import time
-from typing import Any
 
 import numpy as np
 import packing
@@ -209,7 +208,7 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
     if args.model_name.startswith("deepseek-ai/DeepSeek-R1-Distill-Qwen"):
-        layer_cls = Qwen2DecoderLayer
+        _layer_cls = Qwen2DecoderLayer
     else:
         raise NotImplementedError(f"Model {args.model_name} not supported")
 
@@ -307,7 +306,6 @@ def train_step(model, batch):
         loss_scale = loss_scale.cuda(non_blocking=True)
 
     # Forward pass
-    model.set_reshard_after_forward(True, recurse=True)
     with torch.cuda.nvtx.range("forward_pass"):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logps = model(input_ids=input_ids, attention_mask=None, position_ids=position_ids)
@@ -316,7 +314,6 @@ def train_step(model, batch):
 
     # Backward pass
     if not args.forward_only:
-        model.set_reshard_after_forward(False, recurse=True)
         with torch.cuda.nvtx.range("backward_pass"):
             loss.backward()
 
@@ -374,7 +371,7 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 1  # More epochs to see loss decrease
+    num_epochs = 2  # More epochs to see loss decrease
     max_steps = 25  # Limit steps for demo purposes
 
     # Setup wandb configuration
@@ -420,14 +417,17 @@ def main():
         for epoch in range(num_epochs):
             epoch_start_time = time.time()
 
+            if epoch == num_epochs - 1:
+                torch.cuda.cudart().cudaProfilerStart()
+
             for minibatch in dataset:
                 accumulation_steps = len(minibatch)
                 minibatch_loss = torch.tensor(0.0).to("cuda")
                 minibatch_seq_length = 0
                 global_step += 1
                 print(f"rank {dist.get_rank()}: accumulation_steps: {accumulation_steps}")
-                if epoch == 0 and global_step == 2:
-                    torch.cuda.cudart().cudaProfilerStart()
+                # if epoch == 0 and global_step == 2:
+                # torch.cuda.cudart().cudaProfilerStart()
 
                 if enable_decouple:
                     fsdp2.pre_minibatch_start()
@@ -461,7 +461,8 @@ def main():
                 optimizer_step_start_time = time.time()
                 grad_norm = torch.tensor(0.0).to("cuda")
                 if not args.forward_only:
-                    fsdp2.pre_optimizer_step(model)
+                    if enable_decouple:
+                        fsdp2.pre_optimizer_step(model)
                     if enable_decouple:
                         timer = Timer("pre_optimizer_step")
                         timer.start()
@@ -506,10 +507,13 @@ def main():
                 }
                 if dist.get_rank() == 0:
                     wandb.log(minibatch_log, step=global_step)
-                if epoch == 0 and global_step == 2:
-                    torch.cuda.cudart().cudaProfilerStop()
+                # if epoch == 0 and global_step == 2:
+                #     torch.cuda.cudart().cudaProfilerStop()
                 if global_step >= max_steps:
                     break
+
+            if epoch == num_epochs - 1:
+                torch.cuda.cudart().cudaProfilerStop()
 
             if dist.get_rank() == 0:
                 epoch_end_time = time.time()
