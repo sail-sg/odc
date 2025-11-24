@@ -26,7 +26,6 @@ from odc.primitives import (
     tid,
 )
 from odc.primitives.utils import (
-    PROCESS_GROUP_RANKS_TENSORS,
     BufferSplitter,
     SymmBufferRegistry,
     get_comm_stream,
@@ -49,10 +48,9 @@ def nvshmem_scatter_kernel(
     output_tensor_ptr,
     elem_per_rank,
     size_per_elem,
-    group_rank,
+    rank,
     num_ranks_per_node,
-    group_world_size: tl.constexpr,
-    pg_ranks_ptr,
+    world_size: tl.constexpr,
     chunk_size: tl.constexpr,
     signal_next_expected,
     signal_ptr,
@@ -62,15 +60,15 @@ def nvshmem_scatter_kernel(
     # np = tl.num_programs(axis=0)
     assert num_ranks_per_node == tl.num_programs(axis=0)
     np = num_ranks_per_node
-    assert group_world_size % np == 0
-    num_nodes = group_world_size // np
+    assert world_size % np == 0
+    num_nodes = world_size // np
     expected = signal_next_expected
     chunk_buffer_seg = chunk_buffer + pid * chunk_size
 
     # Use different kernel for the ranks in the same node.
     for i in range(1, num_nodes):
-        peer_node = (i + group_rank // np) % num_nodes
-        peer = (pid + peer_node * np) % group_world_size
+        peer_node = (i + rank // np) % num_nodes
+        peer = (pid + peer_node * np) % world_size
 
         num_chunks = tl.cdiv(elem_per_rank, chunk_size)
         for chunk in range(num_chunks):
@@ -84,12 +82,11 @@ def nvshmem_scatter_kernel(
             tl.store(chunk_buffer_seg + chunk_offsets, input_chunk_data, mask=mask)
             # As we initialize NVSHMEM on global process group,
             # we need to use the global rank to access the peer tensor.
-            global_peer = tl.load(pg_ranks_ptr + peer)
             putmem_nbi_block(
                 output_tensor_ptr + (chunk * chunk_size),
                 chunk_buffer_seg,
                 this_chunk_size * size_per_elem,
-                global_peer,
+                peer,
             )
 
             expected += np
@@ -119,10 +116,9 @@ def nvshmem_cross_node_scatter(
     chunk_buffer,
     trans_buffer,
     size_per_elem,
-    group_rank,
+    rank,
     num_ranks_per_node,
-    group_world_size: tl.constexpr,
-    pg_ranks_ptr,
+    world_size: tl.constexpr,
     output_size,
     local_buf_size,
     chunk_size: tl.constexpr,
@@ -146,10 +142,9 @@ def nvshmem_cross_node_scatter(
             output_tensor_ptr=trans_buffer,
             elem_per_rank=size,
             size_per_elem=size_per_elem,
-            group_rank=group_rank,
+            rank=rank,
             num_ranks_per_node=num_ranks_per_node,
-            group_world_size=group_world_size,
-            pg_ranks_ptr=pg_ranks_ptr,
+            world_size=world_size,
             chunk_size=chunk_size,
             signal_next_expected=signal_next_expected,
             signal_ptr=signal_ptr,
@@ -157,18 +152,18 @@ def nvshmem_cross_node_scatter(
 
         nvshmem_request_accumulation_remote_node_kernel(
             request_buffer_ptr=request_buffer_ptr,
-            group_rank=group_rank,
+            rank=rank,
             rank_start_same_node=rank_start_same_node,
             rank_end_same_node=rank_end_same_node,
-            group_world_size=group_world_size,
+            world_size=world_size,
             accumulation_command=accumulation_command,
         )
         nvshmem_wait_accumulation_remote_node_kernel(
             response_buffer_ptr=response_buffer_ptr,
-            group_rank=group_rank,
+            rank=rank,
             rank_start_same_node=rank_start_same_node,
             rank_end_same_node=rank_end_same_node,
-            group_world_size=group_world_size,
+            world_size=world_size,
             next_request_id=next_request_id,
         )
         next_request_id += 1
@@ -214,58 +209,58 @@ def nvshmem_wait_accumulation_same_node_kernel(
 
 @triton.jit(
     do_not_specialize=[
-        "group_rank",
+        "rank",
         "rank_start_same_node",
         "rank_end_same_node",
-        "group_world_size",
+        "world_size",
         "accumulation_command",
     ]
 )
 def nvshmem_request_accumulation_remote_node_kernel(
     request_buffer_ptr,
-    group_rank,
+    rank,
     rank_start_same_node,
     rank_end_same_node,
-    group_world_size,
+    world_size,
     accumulation_command,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     if pid == 0:
         if tidx == 0:
-            for peer in range(group_world_size):
+            for peer in range(world_size):
                 if peer < rank_start_same_node or peer >= rank_end_same_node:
-                    int_p(request_buffer_ptr + group_rank, accumulation_command, peer)
+                    int_p(request_buffer_ptr + rank, accumulation_command, peer)
         __syncthreads()
 
 
 @triton.jit(
     do_not_specialize=[
-        "group_rank",
+        "rank",
         "rank_start_same_node",
         "rank_end_same_node",
-        "group_world_size",
+        "world_size",
         "next_request_id",
     ]
 )
 def nvshmem_wait_accumulation_remote_node_kernel(
     response_buffer_ptr,
-    group_rank,
+    rank,
     rank_start_same_node,
     rank_end_same_node,
-    group_world_size,
+    world_size,
     next_request_id,
 ):
     pid = tl.program_id(axis=0)
     tidx = tid(axis=0)
     if pid == 0:
         if tidx == 0:
-            for peer in range(group_world_size):
+            for peer in range(world_size):
                 if peer < rank_start_same_node or peer >= rank_end_same_node:
                     r = next_request_id - 1
                     while r != next_request_id:
                         quiet()
-                        r = int_g(response_buffer_ptr + group_rank, peer)
+                        r = int_g(response_buffer_ptr + rank, peer)
         __syncthreads()
 
 
@@ -316,14 +311,13 @@ def server_loop(server_context, dispatch_func, exit_predicate, client_mask=None)
 
 
 class DistLock:
-    def __init__(self, pg: dist.ProcessGroup):
-        group_rank = torch.distributed.get_rank(group=pg)
-        self.world_size = torch.distributed.get_world_size(pg)
+    def __init__(self):
+        self.world_size = torch.distributed.get_world_size()
         self.request_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-            "request_buffer", (self.world_size,), torch.int32, group_rank
+            "request_buffer", (self.world_size,), torch.int32
         )
         self.response_buffer = SymmBufferRegistry.get_instance().allocate_symm_buffer(
-            "response_buffer", (self.world_size,), torch.int32, group_rank
+            "response_buffer", (self.world_size,), torch.int32
         )
         self.request_buffer.fill_(0)
         self.response_buffer.fill_(0)
@@ -339,15 +333,17 @@ class ReductionWatcher:
         request_buffer: torch.Tensor,
         response_buffer: torch.Tensor,
     ):
+        assert len(accumulations) == 0
+        assert len(buffers) == 0
         self.accumulations = accumulations
+        self.group_world_sizes = []
         self.buffers = buffers
         self.request_buffer = request_buffer
         self.response_buffer = response_buffer
-        self.world_size = world_size
         self.running = True
         self.task_count = 0
         self.server_context = ServerContext(
-            self.request_buffer, self.response_buffer, [1] * self.world_size, defaultdict(lambda: 0)
+            self.request_buffer, self.response_buffer, [1] * world_size, defaultdict(lambda: 0)
         )
 
     def stop(self):
@@ -361,8 +357,9 @@ class ReductionWatcher:
     def add_buffer(self, buffers):
         self.buffers.append([tensor_from_handle(*buffer) for buffer in buffers])
 
-    def add_accumulation(self, accumulations):
+    def add_accumulation(self, accumulations, group_world_size):
         self.accumulations.append([tensor_from_handle(*acc) for acc in accumulations])
+        self.group_world_sizes.append(group_world_size)
 
     def run(self):
         def dispatch_func(client_rank, command):
@@ -374,7 +371,9 @@ class ReductionWatcher:
                 accumulation_id = command & 0xFFFF
 
                 acc = self.accumulations[accumulation_id - 1][0]
-                buf = self.buffers[buffer_id][client_rank]
+                # Only support one unified group_world_size for scatter-accumulate calls for now.
+                client_group_rank = client_rank % self.group_world_sizes[accumulation_id - 1]
+                buf = self.buffers[buffer_id][client_group_rank]
                 start = self.server_context.accumulation_start[(buffer_id, client_rank)]
                 size = min(buf.numel(), acc.numel() - start)
                 with torch.cuda.nvtx.range(
@@ -506,7 +505,7 @@ class ReductionService:
         self, key, output_tensor_shape, grad_dtype, reduction_dtype, pg: dist.ProcessGroup
     ):
         if self.reduction_watcher is None:
-            self.lock = DistLock(pg)
+            self.lock = DistLock()
             request_buffer_handle = get_nvshmem_handle(self.lock.request_buffer)
             response_buffer_handle = get_nvshmem_handle(self.lock.response_buffer)
 
@@ -523,33 +522,32 @@ class ReductionService:
         registry = SymmBufferRegistry.get_instance()
         assert not registry.has_key(accumulation_key)
         # assert self.reduction_watcher is None, "Reduction watcher is already running"
-
-        group_rank = torch.distributed.get_rank(group=pg)
+        group_world_size = torch.distributed.get_world_size(pg)
 
         def create_and_register_accumulation(key, shape, dtype, add_func):
-            buffer = registry.allocate_symm_buffer(key, shape, dtype, group_rank)
-            call_watcher(self.reduction_watcher, add_func, [get_nvshmem_handle(buffer)])
+            buffer = registry.allocate_symm_buffer(key, shape, dtype)
+            call_watcher(
+                self.reduction_watcher, add_func, [get_nvshmem_handle(buffer)], group_world_size
+            )
             return buffer
 
         def create_and_register_buffer(key, shape, dtype, add_func):
             buffers = []
-            for rank in range(torch.distributed.get_world_size()):
-                buffer = registry.allocate_symm_buffer(
-                    f"{key}_rank_{rank}", shape, dtype, group_rank
-                )
+            for rank in range(group_world_size):
+                buffer = registry.allocate_symm_buffer(f"{key}_rank_{rank}", shape, dtype)
                 buffers.append(buffer)
             call_watcher(self.reduction_watcher, add_func, [get_nvshmem_handle(b) for b in buffers])
             return buffers
 
-        # acc = registry.allocate_symm_buffer(accumulation_key, output_tensor_shape, reduction_dtype)
         acc = create_and_register_accumulation(
             accumulation_key, output_tensor_shape, reduction_dtype, "add_accumulation"
         )
         self.accumulation_indices[key] = len(self.accumulations)
         self.accumulations.append(acc)
 
-        world_size = torch.distributed.get_world_size()
-        buffer_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+        buffer_size = self.buffer_splitter.get_local_buffer_size(
+            output_tensor_shape, group_world_size
+        )
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
         logger.info(
             f"buffer_size: {buffer_size} output_size: {output_size} num_split: {math.ceil(output_size / buffer_size)}"
@@ -592,14 +590,20 @@ class ReductionService:
         if key not in self.accumulation_indices:
             self.register(key, output_tensor_shape, input_tensor.dtype, accum_dtype, pg)
 
-        world_size = torch.distributed.get_world_size(pg)
-        local_buf_size = self.buffer_splitter.get_local_buffer_size(output_tensor_shape, world_size)
+        group_world_size = torch.distributed.get_world_size(pg)
+        assert group_world_size in (
+            torch.distributed.get_world_size(),
+            get_local_world_size(),
+        ), f"{group_world_size=} {torch.distributed.get_world_size()=} {get_local_world_size()=}"
+        local_buf_size = self.buffer_splitter.get_local_buffer_size(
+            output_tensor_shape, group_world_size
+        )
         output_size = reduce(lambda x, y: x * y, output_tensor_shape)
 
         chunk_size = self.get_chunk_size(input_tensor.dtype)
         grid_size = get_local_world_size()
         input_tensor_symm_shape = (chunk_size * grid_size,)
-        rank = torch.distributed.get_rank(pg)
+        rank = torch.distributed.get_rank()
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[
                 (input_tensor_symm_shape, input_tensor.dtype)
@@ -607,12 +611,12 @@ class ReductionService:
                 f"rs_buffer_{input_tensor_symm_shape}_{input_tensor.dtype}",
                 input_tensor_symm_shape,
                 input_tensor.dtype,
-                rank,
             )
         input_tensor_symm = self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)]
 
         buffer_id = self.buffer_indices[key]
-        buffer = self.buffers[buffer_id][rank]
+        group_rank = torch.distributed.get_rank(pg)
+        buffer = self.buffers[buffer_id][group_rank]
         accumulation_id = self.accumulation_indices[key] + 1
 
         accumulation_command = (buffer_id << 16) | accumulation_id
@@ -626,25 +630,26 @@ class ReductionService:
         for local_peer in range(rank_start_same_node, rank_end_same_node):
             self.rank_streams[local_peer].wait_stream(torch.cuda.current_stream())
 
-        pg_ranks_tensor = PROCESS_GROUP_RANKS_TENSORS.get_pg_ranks_tensor(pg)
-
         with torch.cuda.stream(get_comm_stream()):
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
         num_requests = math.ceil(output_size / local_buf_size)
-        assert world_size % 8 == 0 or world_size < 8
-        assert world_size % grid_size == 0
-        _, rank_input_size = input_tensor.view(-1).view(world_size, -1).shape
+        assert group_world_size % 8 == 0 or group_world_size < 8
+        assert group_world_size % grid_size == 0
+        _, rank_input_size = input_tensor.view(-1).view(group_world_size, -1).shape
 
         for start in range(0, output_size, local_buf_size):
             size = min(local_buf_size, output_size - start)
-            assert local_buf_size == buffer.numel()
+            assert local_buf_size == buffer.numel(), f"{local_buf_size=} {buffer.numel()=}"
             buf = buffer[:size]
             # Use mem-copy for the ranks in the same node.
             same_node_tensors = SymmBufferRegistry.get_instance().get_peer_tensors(buffer)
             for i in range(get_local_world_size()):
                 peer_idx = (rank % get_local_world_size() + i) % get_local_world_size()
                 local_peer = rank_start_same_node + peer_idx
-                rank_input_start = local_peer * rank_input_size + start
+                if group_world_size == get_local_world_size():
+                    rank_input_start = peer_idx * rank_input_size + start
+                else:
+                    rank_input_start = local_peer * rank_input_size + start
                 same_node_peer_buffer = same_node_tensors[peer_idx]
                 peer_buf = same_node_peer_buffer[:size]
                 stream = self.rank_streams[local_peer]
@@ -683,10 +688,9 @@ class ReductionService:
                 chunk_buffer=input_tensor_symm,
                 trans_buffer=buf,
                 size_per_elem=buf.element_size(),
-                group_rank=rank,
+                rank=rank,
                 num_ranks_per_node=grid_size,
-                group_world_size=world_size,
-                pg_ranks_ptr=pg_ranks_tensor,
+                world_size=group_world_size,
                 output_size=output_size,
                 local_buf_size=local_buf_size,
                 chunk_size=chunk_size,

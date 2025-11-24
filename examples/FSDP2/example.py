@@ -6,13 +6,14 @@ import sys
 import torch
 from checkpoint import Checkpointer
 from model import ModelArgs, Transformer
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.profiler import ProfilerActivity, profile
 from utils import inspect_mixed_precision, inspect_model
 
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
-from odc.primitives.utils import SymmBufferRegistry
+from odc.primitives.utils import SymmBufferRegistry, get_local_world_size
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
 enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
@@ -67,11 +68,11 @@ def main(args):
     batch_size = 32
     seq_len = 64
     model_args = ModelArgs(
-        n_layers=10,
+        n_layers=1,
         n_heads=4,
         vocab_size=vocab_size,
         max_seq_len=seq_len,
-        dim=1024 * 2,
+        dim=1024,
         dropout_p=0,
     )
     with torch.device("meta"):
@@ -82,14 +83,26 @@ def main(args):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
         )
+    if os.environ.get("HSDP", "0") == "1":
+        gpus_per_node = get_local_world_size()
+        world_size = torch.distributed.get_world_size()
+        num_nodes = world_size // gpus_per_node
+        print(f"enable HSDP with {num_nodes} nodes and {gpus_per_node} GPUs per node")
+        assert world_size % gpus_per_node == 0, f"{world_size=} {gpus_per_node=}"
+        fsdp_kwargs["mesh"] = init_device_mesh(
+            "cuda", (num_nodes, gpus_per_node), mesh_dim_names=("dp_replicate", "dp_shard")
+        )
+        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
+
+    fsdp2.patch_hsdp_fix()
+    if enable_decouple:
+        fsdp2.patch_fsdp2()
+
     for layer in model.layers:
         fully_shard(layer, **fsdp_kwargs)
     fsdp_model = fully_shard(model, **fsdp_kwargs)
 
     inspect_model(model)
-
-    if enable_decouple:
-        fsdp2.patch_fsdp2()
 
     if args.explicit_prefetching:
         set_modules_to_forward_prefetch(model, num_to_forward_prefetch=2)
@@ -102,13 +115,12 @@ def main(args):
     else:
         checkpointer.load_model(model)
 
-    group_rank = torch.distributed.get_rank()
     if enable_decouple:
         state = fsdp_model._get_fsdp_state()
         state._lazy_init()
         for layer in fsdp_model.layers:
-            fsdp2.replace_sharded_param_with_symm_buffer(layer, group_rank)
-        fsdp2.replace_sharded_param_with_symm_buffer(fsdp_model, group_rank)
+            fsdp2.replace_sharded_param_with_symm_buffer(layer)
+        fsdp2.replace_sharded_param_with_symm_buffer(fsdp_model)
 
     if args.mixed_precision:
         inspect_mixed_precision(model)
@@ -122,7 +134,7 @@ def main(args):
     cuda_prof = cuda_profiler_context() if enable_cuda_profiler else contextlib.nullcontext()
 
     with cuda_prof, profiler_context:
-        num_microbatches = 5
+        num_microbatches = 1
         for epoch in range(10):
             if enable_decouple:
                 fsdp2.pre_minibatch_start()

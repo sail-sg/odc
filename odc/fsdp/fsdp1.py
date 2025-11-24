@@ -212,7 +212,7 @@ def custom_get_shard(tensor, rank, world_size):
     sharded, padded = old_get_shard(tensor, rank, world_size)
     assert isinstance(tensor, FlatParameter)
     sharded_in_nvshmem = odc.SymmBufferRegistry.get_instance().update_symm_buffer(
-        id(tensor), sharded, rank
+        id(tensor), sharded
     )
     return sharded_in_nvshmem, padded
 

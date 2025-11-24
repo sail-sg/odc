@@ -1,6 +1,10 @@
-# export WANDB_MODE=disabled
+export WANDB_MODE=disabled
 export ODC=${ODC:-1}
-export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
+if [ "${HSDP:-0}" -eq '1' ]; then
+    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-20000000000}
+else
+    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
+fi
 
 if [ "${FSDP2:-0}" -eq '1' ]; then
     FSDP_NAME="FSDP2"
@@ -40,7 +44,7 @@ fi
 
 bash launch.sh ${script} \
            --limit_dataset_token_len 40000 \
-           --minibatch_size 4 \
-           --micro_batch_size 2 \
+           --minibatch_size 2 \
+           --micro_batch_size 1 \
            --run_name ${run_name} \
            --project_name ${group_name}

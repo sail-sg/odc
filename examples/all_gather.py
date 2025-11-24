@@ -81,35 +81,16 @@ if __name__ == "__main__":
         group_rank = torch.distributed.get_rank(group=group)
         for i in range(cnt):
             src_tensors[i].fill_(i + rank * 2)
-            src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i], group_rank)
+            src_tensors[i] = registry.update_symm_buffer(i, src_tensors[i])
 
         gather_service = GatherService()
 
         registry = SymmBufferRegistry.get_instance()
-        multi_input_map = {}
-        for i in range(cnt):
-            num_inputs = 4
-            split_tensors = torch.split(src_tensors[i], size // num_inputs, dim=0)
-            tensors = []
-            for j, t in enumerate(split_tensors):
-                symm_input_tensor = registry.allocate_symm_buffer(
-                    f"multi_ag_input_{i}_{j}", t.shape, t.dtype, group_rank
-                )
-                symm_input_tensor.copy_(t)
-                tensors.append(symm_input_tensor)
-            multi_input_map[id(src_tensors[i])] = tensors
-
-        def all_gather_multi_into_tensor(
-            output_tensor: Tensor, input_tensor: Tensor, pg: dist.ProcessGroup
-        ):
-            input_tensors = multi_input_map[id(input_tensor)]
-            return gather_service.gather_multi_into_tensor(output_tensor, input_tensors, pg)
 
         comp_stream = torch.cuda.Stream()
         for all_gather_func in [
             all_gather_into_tensor_nccl,
             gather_service.gather_into_tensor,
-            all_gather_multi_into_tensor,
         ]:
             with torch.cuda.nvtx.range(all_gather_func.__name__):
                 start_events = [torch.cuda.Event(enable_timing=True) for _ in range(cnt)]

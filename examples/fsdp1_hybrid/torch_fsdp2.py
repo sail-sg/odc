@@ -36,6 +36,7 @@ import wandb
 from args import get_args
 from datasets import load_from_disk
 from lm_head import FusedLinearForPPOFunction
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.optim import AdamW
 from torch.profiler import ProfilerActivity, profile
@@ -44,7 +45,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 from data import BatchedDataset
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
-from odc.primitives.utils import SymmBufferRegistry
+from odc.primitives.utils import SymmBufferRegistry, get_local_world_size
 
 enable_decouple = os.environ.get("ODC", "0") == "1"
 enable_profiler = os.environ.get("TORCH_PROFILED", "0") == "1"
@@ -213,12 +214,22 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
         raise NotImplementedError(f"Model {args.model_name} not supported")
 
     # FSDP2 configuration with MixedPrecisionPolicy
-    fsdp_kwargs = {}
-    fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-    )
-
+    fsdp_kwargs = {
+        "mp_policy": MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+        ),
+    }
+    if os.environ.get("HSDP", "0") == "1":
+        gpus_per_node = get_local_world_size()
+        world_size = dist.get_world_size()
+        num_nodes = world_size // gpus_per_node
+        print(f"enable HSDP with {num_nodes} nodes and {gpus_per_node} GPUs per node")
+        assert world_size % gpus_per_node == 0, f"{world_size=} {gpus_per_node=}"
+        fsdp_kwargs["mesh"] = init_device_mesh(
+            "cuda", (num_nodes, gpus_per_node), mesh_dim_names=("dp_replicate", "dp_shard")
+        )
+        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
     # Wrap each transformer layer with fully_shard
     for layer in model.model.layers:
         fully_shard(layer, **fsdp_kwargs)
@@ -345,12 +356,11 @@ def main():
 
     # Replace sharded parameters with symmetric buffers if decouple is enabled
     if enable_decouple:
-        group_rank = dist.get_rank()
         state = model._get_fsdp_state()
         state._lazy_init()
         for layer in model.model.layers:
-            fsdp2.replace_sharded_param_with_symm_buffer(layer, group_rank)
-        fsdp2.replace_sharded_param_with_symm_buffer(model, group_rank)
+            fsdp2.replace_sharded_param_with_symm_buffer(layer)
+        fsdp2.replace_sharded_param_with_symm_buffer(model)
 
     # Optimizer with higher learning rate for faster convergence
     optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
@@ -371,7 +381,7 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 2  # More epochs to see loss decrease
+    num_epochs = 1  # More epochs to see loss decrease
     max_steps = 25  # Limit steps for demo purposes
 
     # Setup wandb configuration

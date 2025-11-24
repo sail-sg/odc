@@ -3,11 +3,12 @@ import logging
 import operator
 from functools import reduce
 from itertools import chain
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch._logging import warning_once
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
@@ -20,19 +21,25 @@ from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     foreach_reduce_scatter_copy_in,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
+    FSDPMeshInfo,
+    HSDPMeshInfo,
     TrainingState,
     _get_dim0_padded_size,
     _raise_assert_with_print,
     _to_dtype_if_needed,
     compiled_autograd_enabled,
 )
-from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
+from torch.distributed.fsdp._fully_shard._fsdp_param import (
+    FSDPParam,
+    ShardedState,
+    set_requires_grad_if_needed,
+)
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
     AllReduceState,
     FSDPParamGroup,
     ReduceScatterState,
 )
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.profiler import record_function
 
 from odc.primitives.gather import GatherService
@@ -86,10 +93,13 @@ def get_fsdp_params_key(fsdp_params: list[FSDPParam]) -> str:
     return f"fsdp_params_gather_{ids}"
 
 
+def get_hsdp_params_key(fsdp_param_key: str) -> str:
+    return f"hsdp_{fsdp_param_key}"
+
+
 @torch.no_grad()
 def replace_sharded_param_with_symm_buffer(
     fsdp_model,
-    group_rank: int,
 ) -> torch.Tensor:
     state = fsdp_model._get_fsdp_state()
     fsdp_param_group = state._fsdp_param_group
@@ -97,41 +107,66 @@ def replace_sharded_param_with_symm_buffer(
         return
 
     dtype = fsdp_param_group.fsdp_params[0]._sharded_param_data.dtype
-    for fsdp_params in fsdp_param_group.fsdp_params:
-        if fsdp_params._sharded_param_data.dtype != dtype:
+    for fsdp_param in fsdp_param_group.fsdp_params:
+        if fsdp_param._sharded_param_data.dtype != dtype:
             raise ValueError(
-                f"All FSDP parameters must have the same dtype: {fsdp_params._sharded_param_data.dtype=} {dtype=}"
+                f"All FSDP parameters must have the same dtype: {fsdp_param._sharded_param_data.dtype=} {dtype=}"
             )
 
     total_size = sum(
-        fsdp_params._sharded_param_data.numel() for fsdp_params in fsdp_param_group.fsdp_params
+        fsdp_param._sharded_param_data.numel() for fsdp_param in fsdp_param_group.fsdp_params
     )
-    # This key needs to be the same as the one used in `custom_foreach_all_gather`
+    # This key needs to be the same as the one used in `foreach_all_gather`
     key = get_fsdp_params_key(fsdp_param_group.fsdp_params)
     symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
-        key, (total_size,), dtype, group_rank
+        key, (total_size,), dtype
     )
+
+    # Pre-allocate the symmetric buffer for HSDP.
+    hsdp_sharded_param_total_size = 0
+    num_fsdp_groups = 1
+    hsdp_symm_buffer = None
+    post_forward_mesh_info = fsdp_param_group.post_forward_mesh_info
+    if fsdp_param_group._is_hsdp:
+        shard_world_size = post_forward_mesh_info.shard_mesh_size
+        world_size = fsdp_param_group._all_gather_process_group.size()
+        assert world_size % shard_world_size == 0, f"{world_size=} {shard_world_size=}"
+        num_fsdp_groups = world_size // shard_world_size
+        hsdp_sharded_param_total_size = total_size * num_fsdp_groups
+        hsdp_key = get_hsdp_params_key(key)
+        hsdp_symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
+            hsdp_key, (hsdp_sharded_param_total_size,), dtype
+        )
+
     offset = 0
+    hsdp_offset = 0
     # Refer to the codes in `FSDPParam._init_sharded_param`
-    for fsdp_params in fsdp_param_group.fsdp_params:
-        param_size = fsdp_params._sharded_param_data.numel()
-        numel = reduce(operator.mul, fsdp_params.padded_sharded_param_size, 1)
-        assert numel == param_size, f"{fsdp_params.padded_sharded_param_size=} {param_size=}"
-        symm_buffer[offset : offset + param_size].copy_(fsdp_params._sharded_param_data)
+    for fsdp_param in fsdp_param_group.fsdp_params:
+        param_size = fsdp_param._sharded_param_data.numel()
+        numel = reduce(operator.mul, fsdp_param.padded_sharded_param_size, 1)
+        assert numel == param_size, f"{fsdp_param.padded_sharded_param_size=} {param_size=}"
+        symm_buffer[offset : offset + param_size].copy_(fsdp_param._sharded_param_data)
         padded_sharded_param = symm_buffer[offset : offset + param_size]
-        padded_sharded_param = padded_sharded_param.view(fsdp_params.padded_sharded_param_size)
+        padded_sharded_param = padded_sharded_param.view(fsdp_param.padded_sharded_param_size)
         offset += param_size
 
-        fsdp_params._sharded_param_data = padded_sharded_param.view(-1)
-        shard_dim = fsdp_params.fsdp_placement.dim
-        old_sharded_param = fsdp_params.sharded_param._local_tensor
+        fsdp_param._sharded_param_data = padded_sharded_param.view(-1)
+        shard_dim = fsdp_param.fsdp_placement.dim
+        old_sharded_param = fsdp_param.sharded_param._local_tensor
         length = old_sharded_param.size(shard_dim) if old_sharded_param.numel() > 0 else 0
         sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
-        fsdp_params.sharded_param._local_tensor = sharded_param
+        fsdp_param.sharded_param._local_tensor = sharded_param
+
+        if fsdp_param_group._is_hsdp:
+            hsdp_param_size = param_size * num_fsdp_groups
+            fsdp_param._sharded_post_forward_param_data = hsdp_symm_buffer[
+                hsdp_offset : hsdp_offset + hsdp_param_size
+            ]
+            hsdp_offset += hsdp_param_size
 
 
 @torch.no_grad()
-def custom_get_param_all_gather_inputs(
+def _get_param_all_gather_inputs(
     fsdp_params: list[FSDPParam],
 ) -> list[list[torch.Tensor]]:
     if compiled_autograd_enabled():
@@ -155,13 +190,11 @@ def custom_get_param_all_gather_inputs(
     # 1st pass: for foreach-copy parameters, get inputs and metadata for the
     # foreach copy, and for the others, actually get their all-gather inputs
     for i, fsdp_param in enumerate(fsdp_params):
-        # assert use_foreach_copy(fsdp_param), f"{fsdp_param.param_dtype=} {fsdp_param.offload_to_cpu=} {hasattr(fsdp_param._sharded_local_tensor, 'fsdp_pre_all_gather')=}"
-        assert not hasattr(fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather")
-        assert fsdp_param.sharded_state == ShardedState.SHARDED, f"{fsdp_param.sharded_state=}"
+        assert not hasattr(
+            fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather"
+        ), "fsdp_pre_all_gather not supported in ODC"
         if use_foreach_copy(fsdp_param):
             foreach_copy_indices.append(i)
-            # reshard_after_forward=int not supported for now
-            # TODO: support reshard_after_forward=int
             all_gather_input = (
                 fsdp_param._sharded_param_data
                 if fsdp_param.sharded_state == ShardedState.SHARDED
@@ -171,7 +204,18 @@ def custom_get_param_all_gather_inputs(
             # foreach_copy_input_numels.append(all_gather_input.numel())
             param_all_gather_inputs[i] = [all_gather_input]
         else:
-            # TODO: support reshard_after_forward=int in all_gather_inputs
+            if (
+                hasattr(fsdp_param, "_sharded_post_forward_param_data")
+                and fsdp_param.param_dtype is not None
+            ):
+                # avoid converting symmetric buffer to a new tensor with param dtype for HSDP
+                assert (
+                    fsdp_param._sharded_post_forward_param_data.dtype == fsdp_param.param_dtype
+                ), f"{fsdp_param._sharded_post_forward_param_data.dtype=} != {fsdp_param.param_dtype=}"
+            assert fsdp_param.sharded_state in (
+                ShardedState.SHARDED,
+                ShardedState.SHARDED_POST_FORWARD,
+            ), f"Unexpected sharded state: {fsdp_param.sharded_state=}"
             param_all_gather_inputs[i] = fsdp_param.all_gather_inputs
 
     # We have to use the original symmetric buffer for odc gather.
@@ -194,7 +238,7 @@ def custom_get_param_all_gather_inputs(
 
 
 @torch.no_grad()
-def custom_foreach_all_gather(
+def foreach_all_gather(
     fsdp_params: list[FSDPParam],
     group: dist.ProcessGroup,
     async_op: bool,
@@ -209,6 +253,10 @@ def custom_foreach_all_gather(
     all_gather_comm = ODCAllGather()
     with device_handle.stream(all_gather_copy_in_stream):
         key = get_fsdp_params_key(fsdp_params)
+        # if isinstance(fsdp_params[0].post_forward_mesh_info, HSDPMeshInfo):
+        print(f"foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}")
+        if fsdp_params[0].sharded_state == ShardedState.SHARDED_POST_FORWARD:
+            key = get_hsdp_params_key(key)
         assert SymmBufferRegistry.get_instance().has_key(
             key
         ), f"{key=} not found. The fsdp param group has not been replaced with symm buffer yet."
@@ -216,7 +264,7 @@ def custom_foreach_all_gather(
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input.numel() * world_size,), dtype=all_gather_input.dtype, device=device
         )
-        param_all_gather_inputs = custom_get_param_all_gather_inputs(fsdp_params)
+        param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
         (
             param_all_gather_input_dtypes,
             param_all_gather_input_numels,
@@ -241,6 +289,7 @@ def custom_foreach_all_gather(
         # del param_all_gather_inputs
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
+        print(f"gather group: {group.size()} {group}")
         all_gather_work = all_gather_comm(
             output_tensor=all_gather_output,
             input_tensor=all_gather_input,
@@ -280,6 +329,13 @@ def post_forward(self, _module: nn.Module, _input: Any, output: Any):
             # it shouldn't change post_forward_order
             # print(f"post_forward {is_bw()=} {self._training_state=} {self._reshard_after_forward=}")
             if not is_bw():
+                print(
+                    f"post_forward: _training_state={self._training_state}, "
+                    f"_reshard_after_forward={self._reshard_after_forward}, "
+                    f"_use_post_forward_mesh={self._use_post_forward_mesh}, "
+                    f"mesh_info={type(self.mesh_info).__name__}, "
+                    f"post_forward_mesh_info={type(self.post_forward_mesh_info).__name__ if self.post_forward_mesh_info else None}"
+                )
                 self.reshard()
                 self._record_post_forward()
         else:
@@ -353,7 +409,7 @@ def post_backward(self, *_unused: Any):
             all_reduce_input,
             all_reduce_event,
             self._partial_reduce_output,
-        ) = custom_foreach_reduce(
+        ) = foreach_reduce(
             self,
             fsdp_params_with_grad,
             unsharded_grads,
@@ -403,7 +459,7 @@ class ReduceScatterContext:
 
 
 @torch.no_grad()
-def custom_foreach_reduce(
+def foreach_reduce(
     fsdp_param_group: FSDPParamGroup,
     fsdp_params: list[FSDPParam],
     unsharded_grads: list[torch.Tensor],
@@ -505,6 +561,9 @@ def custom_foreach_reduce(
         #     reduce_output.copy_(reduce_scatter_input)
         key = id(fsdp_param_group)
         scatter = get_reduction_service()
+        print(
+            f"scatter_accumulate: key={key}, reduce_scatter_input.sum()={reduce_scatter_input.sum().item():.6f}, reduce_scatter_input.shape={reduce_scatter_input.shape} {reduce_scatter_group.size()=}"
+        )
         scatter.scatter_accumulate(key, reduce_scatter_input, reduce_scatter_group)
 
         post_reduce_stream = reduce_scatter_stream
@@ -577,18 +636,27 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
     device_handle = _get_device_handle(device.type)
     current_stream = device_handle.current_stream()
 
+    print(f"reduce-scatter {reduce_scatter_op=} all-reduce {all_reduce_op=}")
+
     with device_handle.stream(reduce_scatter_stream):
         post_reduce_stream = all_reduce_stream
 
         scatter = get_reduction_service()
         key = id(fsdp_param_group)
         reduce_output = scatter.get_accumulation(key)
+        print(
+            f"get_accumulation: key={key}, reduce_output.sum()={reduce_output.sum().item():.6f}, reduce_output.shape={reduce_output.shape}"
+        )
         assert reduce_scatter_op in [
             torch.distributed.ReduceOp.SUM,
             torch.distributed.ReduceOp.AVG,
         ], f"reduce_scatter_op {reduce_scatter_op} is not supported"
+        print(
+            f"Before division: reduce_output.sum()={reduce_output.sum().item():.6f}, world_size={world_size}"
+        )
         if reduce_scatter_op == torch.distributed.ReduceOp.AVG:
             reduce_output /= world_size
+            print(f"After division: reduce_output.sum()={reduce_output.sum().item():.6f}")
 
         if all_reduce_group is not None:  # HSDP
             # ODC: all_reduce_grads is set to False during gradient accumulation in HSDP
@@ -618,12 +686,17 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
                 all_reduce_stream.wait_stream(reduce_scatter_stream)
             else:
                 all_reduce_stream.wait_stream(current_stream)
+            print(f"{all_reduce_group.size()=}")
             with device_handle.stream(all_reduce_stream):
+                print(
+                    f"Before all-reduce: reduce_output.sum()={reduce_output.sum().item():.6f}, all_reduce_group.size()={all_reduce_group.size()}"
+                )
                 dist.all_reduce(
                     reduce_output,
                     group=all_reduce_group,
                     op=all_reduce_op,
                 )
+                print(f"After all-reduce: reduce_output.sum()={reduce_output.sum().item():.6f}")
                 # all_reduce_input = reduce_output
                 # all_reduce_event = all_reduce_stream.record_event()
     # -- END: ops in reduce_scatter stream
@@ -639,6 +712,7 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
     # -- END: ops post reduce_scatter
 
     with device_handle.stream(post_reduce_stream):
+        print(f"{postdivide_factor=}")
         _div_if_needed(reduce_output, postdivide_factor)
         reduce_output = _to_dtype_if_needed(reduce_output, orig_dtype)
         # View out and accumulate sharded gradients
@@ -681,7 +755,7 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
                     hook(fsdp_param.sharded_param)
             padded_sharded_numel = padded_unsharded_size.numel() // world_size
             flat_grad_offset += padded_sharded_numel
-        # post_reduce_event = post_reduce_stream.record_event()
+        post_reduce_event = post_reduce_stream.record_event()
     # The RS output is allocated in the RS stream and used in the default
     # stream (for optimizer). To ensure its memory is not reused for later
     # RSs, we do not need extra synchronization since the sharded parameters
@@ -695,6 +769,118 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
     #     None,
     # )
 
+    # Synchronize the default stream with post_reduce_stream to ensure
+    # gradient writes are visible before optimizer step
+    current_stream = device_handle.current_stream()
+    current_stream.wait_event(post_reduce_event)
+
+
+# def hsdp_sharded_param_key()
+
+
+# FSDPParam
+def to_sharded_post_forward(self) -> None:
+    if self.is_dtensor:
+        raise NotImplementedError("Resharding to smaller mesh with TP is not supported yet")
+    self._assert_in_states(ShardedState.UNSHARDED)
+    assert self.post_forward_mesh_info is not None  # mypy
+    assert len(self.all_gather_outputs) == 1
+    shard_world_size = self.post_forward_mesh_info.shard_mesh_size
+    if (numel := self.all_gather_outputs[0].numel()) % shard_world_size != 0:
+        _raise_assert_with_print(
+            f"All-gather output size ({numel}) must be divisible by the shard "
+            f"world size ({shard_world_size})"
+        )
+    shard_rank = self.post_forward_mesh_info.shard_mesh_rank
+    # pyrefly: ignore  # unbound-name
+    sharded_numel = numel // shard_world_size
+    # self._sharded_post_forward_param_data = (
+    #     self.all_gather_outputs[0].narrow(
+    #         0, sharded_numel * shard_rank, sharded_numel
+    #     )
+    # ).clone()  # clone to be able to free all-gather output
+    self._sharded_post_forward_param_data.copy_(
+        self.all_gather_outputs[0].narrow(0, sharded_numel * shard_rank, sharded_numel)
+    )
+    sharded_post_forward_tensor = torch.as_strided(
+        self._sharded_post_forward_param_data,
+        size=self.sharded_post_forward_size,
+        stride=self.contiguous_sharded_post_forward_stride,
+        storage_offset=0,
+    )
+    self._sharded_post_forward_param = nn.Parameter(
+        self.to_sharded_post_forward_dtensor(sharded_post_forward_tensor)
+    )
+    self._setattr_on_modules(self._sharded_post_forward_param)
+    self.free_unsharded_param()
+    self.sharded_state = ShardedState.SHARDED_POST_FORWARD
+
+
+# FSDPParam
+def to_unsharded(self) -> None:
+    # Assume that the data has been allocated and all-gathered
+    set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
+    self._setattr_on_modules(self._unsharded_param)
+    if self.sharded_state == ShardedState.SHARDED_POST_FORWARD:
+        # The data is allocated in the default stream via the post-forward
+        # reshard and must be kept alive for the next all-gather copy-in.
+        # Since we call this method after the copy-out, the data's lifetime
+        # is ensured without further synchronization.
+        self._sharded_post_forward_param = None
+        # Do not free the symmetric buffer for HSDP.
+        # self._sharded_post_forward_param_data = None  # free
+    self.sharded_state = ShardedState.UNSHARDED
+
+
+def _get_post_forward_mesh_info(
+    reshard_after_forward: Union[bool, int], mesh_info: FSDPMeshInfo
+) -> Optional[FSDPMeshInfo]:
+    shard_mesh_size = mesh_info.shard_mesh_size
+    is_hsdp = isinstance(mesh_info, HSDPMeshInfo)
+
+    if not isinstance(reshard_after_forward, (bool, int)):
+        raise ValueError(
+            "reshard_after_forward should be a bool or an int representing the "
+            f"group size to reshard to, not {reshard_after_forward}"
+        )
+
+    # NOTE: `isinstance(False, int)` returns `True`.
+    if not isinstance(reshard_after_forward, bool) and isinstance(reshard_after_forward, int):
+        if (
+            reshard_after_forward < 1
+            or reshard_after_forward > shard_mesh_size
+            or shard_mesh_size % reshard_after_forward != 0
+        ):
+            raise ValueError(
+                "If passing reshard_after_forward as an int, it should be a "
+                f"factor of {shard_mesh_size}, not {reshard_after_forward}"
+            )
+        if reshard_after_forward == 1:
+            msg = (
+                "reshard_after_forward=1 (int) means resharding parameters to world size 1, "
+                "instead of reshard_after_forward=True (bool)"
+            )
+            warning_once(logger, msg, stacklevel=2)
+            reshard_after_forward = False
+        # Seems like a bug in FSDP2: reshard_after_forward == shard_mesh_size is not handled correctly for HSDP
+        elif reshard_after_forward == shard_mesh_size and not is_hsdp:
+            reshard_after_forward = True
+
+    print(f"{reshard_after_forward=} {is_hsdp=}")
+
+    post_forward_mesh_info = None
+    if reshard_after_forward is True:
+        post_forward_mesh_info = mesh_info
+    elif reshard_after_forward is not False:  # int case
+        print(f"enable HSDP {reshard_after_forward=}")
+        # For HSDP, we can flatten the two replicate dims into the 0th dim
+        post_forward_mesh_tensor = mesh_info.mesh.mesh.view(-1, reshard_after_forward)
+        post_forward_mesh = DeviceMesh(mesh_info.mesh.device_type, post_forward_mesh_tensor)
+        post_forward_mesh_info = HSDPMeshInfo(
+            post_forward_mesh, shard_mesh_dim=1, replicate_mesh_dim=0
+        )
+    return post_forward_mesh_info
+
 
 def pre_optimizer_step(fsdp_module):
     scatter = get_reduction_service()
@@ -706,7 +892,16 @@ def pre_optimizer_step(fsdp_module):
     ]
     for i, fsdp_param_group in enumerate(all_fsdp_param_groups):
         if i == 0:
-            reduce_scatter_group = fsdp_param_group.mesh_info.shard_process_group
+            mesh_info = (
+                cast(FSDPMeshInfo, fsdp_param_group.post_forward_mesh_info)
+                if fsdp_param_group.is_sharded_post_forward
+                else fsdp_param_group.mesh_info
+            )
+            assert isinstance(mesh_info, FSDPMeshInfo)
+            if fsdp_param_group._is_hsdp:
+                reduce_scatter_group = fsdp_param_group.post_forward_mesh_info.shard_process_group
+            else:
+                reduce_scatter_group = fsdp_param_group.mesh_info.shard_process_group
             with torch.cuda.nvtx.range("scatter_accumulate_sync"):
                 scatter.sync(reduce_scatter_group)
 
@@ -714,16 +909,27 @@ def pre_optimizer_step(fsdp_module):
             update_gradients(fsdp_param_group)
 
 
+def patch_hsdp_fix():
+    from torch.distributed.fsdp._fully_shard import _fsdp_init, _fully_shard
+
+    _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info
+    _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info
+
+
 def patch_fsdp2() -> None:
     from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
 
-    _fsdp_collectives.foreach_all_gather = custom_foreach_all_gather
-    _fsdp_param_group.foreach_all_gather = custom_foreach_all_gather
+    _fsdp_collectives.foreach_all_gather = foreach_all_gather
+    _fsdp_param_group.foreach_all_gather = foreach_all_gather
     FSDPParamGroup.post_backward = post_backward
     FSDPParamGroup.post_forward = post_forward
+    FSDPParam.to_sharded_post_forward = to_sharded_post_forward
+    FSDPParam.to_unsharded = to_unsharded
     _fsdp_param_group.record_function = nvtx_record_function
     torch.profiler.record_function = nvtx_record_function
     torch.autograd.profiler.record_function = nvtx_record_function
+
+    patch_hsdp_fix()
 
     global reduction_service
     global gather_service

@@ -103,10 +103,10 @@ class SymmBufferRegistry:
     def flush(self):
         self.updated.clear()
 
-    def update_symm_buffer(self, buffer_key, values, group_rank: int):
+    def update_symm_buffer(self, buffer_key, values):
         values = values.contiguous()
         if buffer_key not in self.local_tensor:
-            self.allocate_symm_buffer(buffer_key, values.shape, values.dtype, group_rank)
+            self.allocate_symm_buffer(buffer_key, values.shape, values.dtype)
 
         if buffer_key not in self.updated:
             self.updated.add(buffer_key)
@@ -123,12 +123,13 @@ class SymmBufferRegistry:
     def is_nvshmem_tensor(cls, tensor):
         return hasattr(tensor, "_odc_is_nvshmem") and tensor._odc_is_nvshmem
 
-    def allocate_symm_buffer(self, key, shape, dtype, group_rank: int):
+    def allocate_symm_buffer(self, key, shape, dtype):
         assert key not in self.local_tensor
         local_world_size = get_local_world_size()
         tensor = nvshmem_create_tensor(shape, dtype)
         self.set_nvshmem_flag(tensor)
-        peer_tensors = get_same_node_tensors(tensor, group_rank, local_world_size)
+        rank = torch.distributed.get_rank()
+        peer_tensors = get_same_node_tensors(tensor, rank, local_world_size)
         self.allocations.append(tensor)
         assert len(peer_tensors) == local_world_size
         # ranks inside the same node must be contiguous.
@@ -139,15 +140,15 @@ class SymmBufferRegistry:
         logger.info(
             f"Rank {torch.distributed.get_rank()} create tensor {key} with shape {shape} and dtype {dtype} and ptr {self.local_tensor[key].data_ptr()}"
         )
-        return self.local_tensor[key]
+        return tensor
 
     def has_key(self, key):
         return key in self.local_tensor
 
-    def get_or_create_symm_buffer(self, key, shape, dtype, group_rank: int):
+    def get_or_create_symm_buffer(self, key, shape, dtype):
         if self.has_key(key):
             return self.local_tensor[key]
-        return self.allocate_symm_buffer(key, shape, dtype, group_rank)
+        return self.allocate_symm_buffer(key, shape, dtype)
 
     def get_symm_buffer(self, key):
         if self.has_key(key):
@@ -253,18 +254,3 @@ def sync_cta(signal_ptr, expected):
     while r < expected:
         signals = tl.load(signal_ptr + offsets, mask=mask, volatile=True)
         r = tl.max(signals)
-
-
-class ProcessGroupRanksTensors:
-    def __init__(self):
-        self.pg_ranks_cache = {}
-
-    def get_pg_ranks_tensor(self, pg: torch.distributed.ProcessGroup):
-        if pg not in self.pg_ranks_cache:
-            pg_ranks = torch.distributed.get_process_group_ranks(group=pg)
-            pg_ranks_tensor = torch.tensor(pg_ranks, dtype=torch.int32, device="cuda")
-            self.pg_ranks_cache[pg] = pg_ranks_tensor
-        return self.pg_ranks_cache[pg]
-
-
-PROCESS_GROUP_RANKS_TENSORS = ProcessGroupRanksTensors()
