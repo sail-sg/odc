@@ -83,8 +83,11 @@ def main(args):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
         )
-    if os.environ.get("HSDP", "0") == "1":
-        gpus_per_node = get_local_world_size()
+    gpus_per_node = get_local_world_size()
+    if os.environ.get("HPZ", "0") == "1":
+        print(f"enable Hierarchical Partitioning for ZeRO(HPZ) with {gpus_per_node} GPUs per node")
+        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
+    elif os.environ.get("HSDP", "0") == "1":
         world_size = torch.distributed.get_world_size()
         num_nodes = world_size // gpus_per_node
         print(f"enable HSDP with {num_nodes} nodes and {gpus_per_node} GPUs per node")
@@ -92,9 +95,7 @@ def main(args):
         fsdp_kwargs["mesh"] = init_device_mesh(
             "cuda", (num_nodes, gpus_per_node), mesh_dim_names=("dp_replicate", "dp_shard")
         )
-        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
 
-    fsdp2.patch_hsdp_fix()
     if enable_decouple:
         fsdp2.patch_fsdp2()
 
@@ -137,7 +138,7 @@ def main(args):
         num_microbatches = 1
         for epoch in range(10):
             if enable_decouple:
-                fsdp2.pre_minibatch_start()
+                fsdp2.pre_minibatch_start(fsdp_model)
             if args.explicit_prefetching:
                 model.unshard()
 

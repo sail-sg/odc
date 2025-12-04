@@ -130,6 +130,8 @@ class GatherService:
             local_buf_size = buf_size // group_world_size
             signal_ptr = torch.empty(1, dtype=torch.int32, device="cuda")
             for start in range(0, input_tensor.numel(), local_buf_size):
+                if local_world_size == group_world_size:
+                    continue
                 size = min(local_buf_size, input_tensor.numel() - start)
                 sub_input_tensor = input_tensor.view(-1)[start : start + size]
                 assert (sub_input_tensor.numel() * sub_input_tensor.element_size()) % (
@@ -138,8 +140,6 @@ class GatherService:
                 target_buf_size = size * group_world_size
                 assert target_buf_size <= buf_size
                 target_tensor_split = target_tensor[:target_buf_size].view(group_world_size, size)
-                if local_world_size == group_world_size:
-                    continue
 
                 signal_ptr.fill_(0)
                 assert group_world_size % 8 == 0 or group_world_size < 8
