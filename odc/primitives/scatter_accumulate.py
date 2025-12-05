@@ -680,31 +680,34 @@ class ReductionService:
             self.lock.client_context.local_next_request_id += 1
             if self.lock.client_context.local_next_request_id > MAX_REQUEST_COUNT:
                 self.lock.client_context.local_next_request_id = 1
-        with torch.cuda.stream(get_comm_stream()):
-            signal_ptr.fill_(0)
-            nvshmem_cross_node_scatter[(grid_size,)](
-                input_tensor_ptr=input_tensor,
-                rank_input_size=rank_input_size,
-                chunk_buffer=input_tensor_symm,
-                trans_buffer=buf,
-                size_per_elem=buf.element_size(),
-                rank=rank,
-                num_ranks_per_node=grid_size,
-                world_size=group_world_size,
-                output_size=output_size,
-                local_buf_size=local_buf_size,
-                chunk_size=chunk_size,
-                signal_ptr=signal_ptr,
-                # client request
-                request_buffer_ptr=self.lock.request_buffer,
-                response_buffer_ptr=self.lock.response_buffer,
-                rank_start_same_node=rank_start_same_node,
-                rank_end_same_node=rank_end_same_node,
-                accumulation_command=accumulation_command,
-                next_request_id=self.lock.client_context.next_request_id,
-                num_warps=32,
-                extern_libs=NVSHMEM_EXTERN_LIBS,
-            )
+
+        if group_world_size > get_local_world_size():
+            assert group_world_size % get_local_world_size() == 0
+            with torch.cuda.stream(get_comm_stream()):
+                signal_ptr.fill_(0)
+                nvshmem_cross_node_scatter[(grid_size,)](
+                    input_tensor_ptr=input_tensor,
+                    rank_input_size=rank_input_size,
+                    chunk_buffer=input_tensor_symm,
+                    trans_buffer=buf,
+                    size_per_elem=buf.element_size(),
+                    rank=rank,
+                    num_ranks_per_node=grid_size,
+                    world_size=group_world_size,
+                    output_size=output_size,
+                    local_buf_size=local_buf_size,
+                    chunk_size=chunk_size,
+                    signal_ptr=signal_ptr,
+                    # client request
+                    request_buffer_ptr=self.lock.request_buffer,
+                    response_buffer_ptr=self.lock.response_buffer,
+                    rank_start_same_node=rank_start_same_node,
+                    rank_end_same_node=rank_end_same_node,
+                    accumulation_command=accumulation_command,
+                    next_request_id=self.lock.client_context.next_request_id,
+                    num_warps=32,
+                    extern_libs=NVSHMEM_EXTERN_LIBS,
+                )
         self.lock.client_context.next_request_id += num_requests
         if self.lock.client_context.next_request_id > MAX_REQUEST_COUNT:
             self.lock.client_context.next_request_id = 1
