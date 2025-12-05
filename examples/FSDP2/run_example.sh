@@ -16,5 +16,5 @@ for netdev in $netdevs; do
 done
 
 echo "Launching ${1:-example.py} with ${2:-2} gpus"
-NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdevs} bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py}
+NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdevs} bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision
 # torchrun --nnodes=1 --nproc_per_node=${2:-2} ${1:-example.py}

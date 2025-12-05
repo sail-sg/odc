@@ -459,6 +459,7 @@ disable=raw-checker-failed,
         broad-exception-caught,
         consider-using-generator,
         consider-using-from-import,
+        too-many-lines,
         duplicate-code
 
 # Enable the message, report, category or checker with the given id(s). You can

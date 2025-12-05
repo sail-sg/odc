@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import operator
+import types
 from functools import reduce
 from itertools import chain
 from typing import Any, Callable, Optional, cast
@@ -98,6 +99,19 @@ def get_hpz_params_key(fsdp_param_key: str) -> str:
 
 
 @torch.no_grad()
+def patch_lazy_init(fsdp_model):
+    state = fsdp_model._get_fsdp_state()
+    group = state._fsdp_param_group
+    prev_lazy_init = group.lazy_init
+
+    def patched_lazy_init(_self):
+        prev_lazy_init()
+        replace_sharded_param_with_symm_buffer(fsdp_model)
+
+    group.lazy_init = types.MethodType(patched_lazy_init, group)
+
+
+@torch.no_grad()
 def replace_sharded_param_with_symm_buffer(
     fsdp_model,
 ) -> torch.Tensor:
@@ -132,7 +146,6 @@ def replace_sharded_param_with_symm_buffer(
         assert isinstance(post_forward_mesh_info, HSDPMeshInfo), f"{post_forward_mesh_info=}"
         shard_world_size = post_forward_mesh_info.shard_mesh_size
         world_size = fsdp_param_group._all_gather_process_group.size()
-        print(f"all-gather {world_size=} {shard_world_size=}")
         assert world_size % shard_world_size == 0, f"{world_size=} {shard_world_size=}"
         num_nodes = world_size // shard_world_size
         hpz_sharded_param_total_size = total_size * num_nodes
@@ -140,7 +153,6 @@ def replace_sharded_param_with_symm_buffer(
         hpz_symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
             hpz_key, (hpz_sharded_param_total_size,), dtype
         )
-        print(f"{hpz_key=} {hpz_symm_buffer.shape=} {hpz_symm_buffer.dtype=}")
 
     offset = 0
     hpz_offset = 0
@@ -290,8 +302,7 @@ def foreach_all_gather(
     all_gather_comm = get_all_gather_comm()
     with device_handle.stream(all_gather_copy_in_stream):
         key = get_fsdp_params_key(fsdp_params)
-        # if isinstance(fsdp_params[0].post_forward_mesh_info, HSDPMeshInfo):
-        print(f"foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}")
+        # print(f"foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}")
         if fsdp_params[0].sharded_state == ShardedState.SHARDED_POST_FORWARD:
             for fsdp_param in fsdp_params:
                 assert (
@@ -352,6 +363,117 @@ def foreach_all_gather(
         )
 
 
+@torch.no_grad()
+def foreach_all_gather_copy_out(
+    all_gather_result: AllGatherResult,
+    fsdp_params: list[FSDPParam],
+    group: dist.ProcessGroup,
+) -> None:
+    (
+        all_gather_output,
+        all_gather_event,
+        all_gather_work,
+        param_all_gather_input_dtypes,
+        param_all_gather_input_numels,
+        all_gather_input_split_sizes,
+    ) = all_gather_result
+    _dtype, device = all_gather_output.dtype, all_gather_output.device
+    device_handle = _get_device_handle(device.type)
+
+    if all_gather_event is not None:  # sync op
+        device_handle.current_stream().wait_event(all_gather_event)
+    if isinstance(all_gather_work, dist.distributed_c10d.Work):  # async op
+        all_gather_work.wait()
+    world_size, device = group.size(), all_gather_output.device
+
+    # In ODC, we use the original dtype for all-gather input and output.
+    # Then when the output needs to be used here, we cast it to the param_dtype.
+    param_dtype = fsdp_params[0].param_dtype
+    if param_dtype is not None:
+        all_gather_output = _to_dtype_if_needed(all_gather_output, param_dtype)
+        input_dtype = param_all_gather_input_dtypes[0][0]
+        for dtypes in param_all_gather_input_dtypes:
+            for dtype in dtypes:
+                if dtype != input_dtype:
+                    raise ValueError(f"Input dtypes are not the same: {dtype} != {input_dtype}")
+        param_all_gather_input_dtypes = [
+            [param_dtype] * len(dtypes) for dtypes in param_all_gather_input_dtypes
+        ]
+
+    split_with_sizes_out: list[torch.Tensor] = []
+    shard_i_copy_infos: list[tuple[FSDPParam, list[torch.Tensor]]] = []
+    for all_gather_input_numels, all_gather_input_dtypes, fsdp_param in zip(
+        param_all_gather_input_numels, param_all_gather_input_dtypes, fsdp_params
+    ):
+        # NOTE: Under compile, make sure we always recreate all_gather_outputs
+        # per AllGather. See [Note: Invariants for torch.compile Traceable FSDP2].
+        force_recreate = compiled_autograd_enabled()
+        fsdp_param.init_all_gather_outputs(
+            all_gather_input_numels,
+            all_gather_input_dtypes,
+            world_size,
+            device,
+            force_recreate=force_recreate,
+        )
+        if not force_recreate:
+            fsdp_param.alloc_all_gather_outputs()
+        param_all_gather_outputs = fsdp_param.all_gather_outputs
+        if fsdp_param.fsdp_placement.dim != 0:
+            # Copy to a temporary and then chunk-cat into the final all-gather
+            # output tensors
+            param_all_gather_outputs = [torch.empty_like(t) for t in param_all_gather_outputs]
+            shard_i_copy_infos.append((fsdp_param, param_all_gather_outputs))
+        split_with_sizes_out.extend(param_all_gather_outputs)
+
+    all_gather_output = all_gather_output.view(world_size, -1)
+    if all_gather_output.dtype == torch.uint8:
+        out = [t.view(world_size, -1).view(torch.uint8) for t in split_with_sizes_out]
+    else:
+        out = [t.view(world_size, -1) for t in split_with_sizes_out]
+
+    # only avoid VC bump if we are not in inference mode
+    if torch._dynamo.is_compiling():
+        # For torch.compile, we turn off inference_mode for fake tensor
+        # propagation, and therefore graph break on is_inference. For `compile`,
+        # we don't care about VCs, so just skip the optimization.
+        non_inference_outs = []
+    else:
+        non_inference_outs = [o for o in out if not o.is_inference()]
+
+    if len(non_inference_outs) > 0:
+        with torch.autograd._unsafe_preserve_version_counter(tuple(non_inference_outs)):
+            torch.ops.fsdp.split_with_sizes_copy(
+                all_gather_output, all_gather_input_split_sizes, dim=1, out=out
+            )
+    else:
+        torch.ops.fsdp.split_with_sizes_copy(
+            all_gather_output, all_gather_input_split_sizes, dim=1, out=out
+        )
+
+    for fsdp_param, param_all_gather_outputs in shard_i_copy_infos:
+        # Chunk-cat from the temporary to the final all-gather output tensors
+        shard_dim = fsdp_param.fsdp_placement.dim
+
+        with torch.autograd._unsafe_preserve_version_counter(tuple(fsdp_param.all_gather_outputs)):
+            for param_all_gather_output, target_all_gather_output in zip(
+                param_all_gather_outputs, fsdp_param.all_gather_outputs
+            ):
+                padded_sharded_size = (
+                    fsdp_param.padded_sharded_param_size
+                    if fsdp_param.sharded_state == ShardedState.SHARDED
+                    else cast(torch.Tensor, fsdp_param._sharded_post_forward_param_data).size()
+                )
+                pre_param_size = list(padded_sharded_size)
+                pre_param_size[0] *= world_size
+                chunks = torch.chunk(
+                    param_all_gather_output.view(pre_param_size), world_size, dim=0
+                )
+                post_param_size = list(padded_sharded_size)
+                post_param_size[shard_dim] *= world_size
+                cat_out = target_all_gather_output.view(post_param_size)
+                torch.cat(chunks, dim=shard_dim, out=cat_out)
+
+
 def pre_minibatch_start(fsdp_module):
     get_reduction_service().clear_accumulations()
 
@@ -375,15 +497,14 @@ def post_forward(self, _module: nn.Module, _input: Any, output: Any):
         if not compiled_autograd_enabled():
             # for AC(fully_shard(model)), AC runs fsdp's _pre_forward
             # it shouldn't change post_forward_order
-            # print(f"post_forward {is_bw()=} {self._training_state=} {self._reshard_after_forward=}")
             if not is_bw():
-                print(
-                    f"post_forward: _training_state={self._training_state}, "
-                    f"_reshard_after_forward={self._reshard_after_forward}, "
-                    f"_use_post_forward_mesh={self._use_post_forward_mesh}, "
-                    f"mesh_info={type(self.mesh_info).__name__}, "
-                    f"post_forward_mesh_info={type(self.post_forward_mesh_info).__name__ if self.post_forward_mesh_info else None}"
-                )
+                # print(
+                #     f"post_forward: _training_state={self._training_state}, "
+                #     f"_reshard_after_forward={self._reshard_after_forward}, "
+                #     f"_use_post_forward_mesh={self._use_post_forward_mesh}, "
+                #     f"mesh_info={type(self.mesh_info).__name__}, "
+                #     f"post_forward_mesh_info={type(self.post_forward_mesh_info).__name__ if self.post_forward_mesh_info else None}"
+                # )
                 self.reshard()
                 self._record_post_forward()
         else:
@@ -764,17 +885,12 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
                 all_reduce_stream.wait_stream(reduce_scatter_stream)
             else:
                 all_reduce_stream.wait_stream(current_stream)
-            print(f"{all_reduce_group.size()=}")
             with device_handle.stream(all_reduce_stream):
-                print(
-                    f"Before all-reduce: reduce_output.sum()={reduce_output.sum().item():.6f}, all_reduce_group.size()={all_reduce_group.size()}"
-                )
                 dist.all_reduce(
                     reduce_output,
                     group=all_reduce_group,
                     op=all_reduce_op,
                 )
-                print(f"After all-reduce: reduce_output.sum()={reduce_output.sum().item():.6f}")
                 # all_reduce_input = reduce_output
                 # all_reduce_event = all_reduce_stream.record_event()
     # -- END: ops in reduce_scatter stream
@@ -947,6 +1063,8 @@ def patch_fsdp2() -> None:
 
     _fsdp_collectives.foreach_all_gather = foreach_all_gather
     _fsdp_param_group.foreach_all_gather = foreach_all_gather
+    _fsdp_collectives.foreach_all_gather_copy_out = foreach_all_gather_copy_out
+    _fsdp_param_group.foreach_all_gather_copy_out = foreach_all_gather_copy_out
     FSDPParamGroup.post_backward = post_backward
     FSDPParamGroup.post_forward = post_forward
     FSDPParam.to_sharded_post_forward = to_sharded_post_forward
