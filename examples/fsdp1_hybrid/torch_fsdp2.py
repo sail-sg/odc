@@ -230,15 +230,16 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
             "cuda", (num_nodes, gpus_per_node), mesh_dim_names=("dp_replicate", "dp_shard")
         )
         fsdp_kwargs["reshard_after_forward"] = gpus_per_node
+
+    if enable_decouple:
+        fsdp2.patch_fsdp2()
+
     # Wrap each transformer layer with fully_shard
     for layer in model.model.layers:
         fully_shard(layer, **fsdp_kwargs)
 
     # Wrap the entire model with fully_shard
     fsdp_model = fully_shard(model, **fsdp_kwargs)
-
-    if enable_decouple:
-        fsdp2.patch_fsdp2()
 
     return fsdp_model
 
@@ -354,13 +355,11 @@ def main():
     model = create_fsdp_model(model, None, None)
     # print(model.dtype)
 
-    # Replace sharded parameters with symmetric buffers if decouple is enabled
+    # Patch lazy init if decouple is enabled
     if enable_decouple:
-        state = model._get_fsdp_state()
-        state._lazy_init()
         for layer in model.model.layers:
-            fsdp2.replace_sharded_param_with_symm_buffer(layer)
-        fsdp2.replace_sharded_param_with_symm_buffer(model)
+            fsdp2.patch_lazy_init(layer)
+        fsdp2.patch_lazy_init(model)
 
     # Optimizer with higher learning rate for faster convergence
     optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
@@ -438,7 +437,7 @@ def main():
                 print(f"rank {dist.get_rank()}: accumulation_steps: {accumulation_steps}")
 
                 if enable_decouple:
-                    fsdp2.pre_minibatch_start()
+                    fsdp2.pre_minibatch_start(model)
 
                 minibatch_start_time = time.time()
                 for idx, micro_batch in enumerate(minibatch):

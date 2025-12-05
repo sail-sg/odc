@@ -19,6 +19,7 @@ from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     _div_if_needed,
     _get_all_gather_input_metadatas,
     _get_gradient_divide_factors,
+    _get_param_all_gather_inputs,
     foreach_reduce_scatter_copy_in,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
@@ -181,82 +182,6 @@ def replace_sharded_param_with_symm_buffer(
             hpz_offset += hpz_param_size
 
 
-@torch.no_grad()
-def _get_param_all_gather_inputs(
-    fsdp_params: list[FSDPParam],
-) -> list[list[torch.Tensor]]:
-    if compiled_autograd_enabled():
-        return [fsdp_param.all_gather_inputs for fsdp_param in fsdp_params]
-
-    # Intentionally try to run a fast-path that bypasses abstractions for the
-    # common FSDP case of bf16/fp32 mixed precision in order to use foreach
-    # copy for lower CPU overhead and more efficient copying in eager
-    def use_foreach_copy(fsdp_param: FSDPParam) -> bool:
-        return (
-            fsdp_param.param_dtype is not None
-            and not fsdp_param.offload_to_cpu
-            and not hasattr(fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather")
-        )
-
-    param_all_gather_inputs: list[list[torch.Tensor]] = [[] for _ in fsdp_params]
-    foreach_copy_indices: list[int] = []
-    # foreach_copy_inputs: list[torch.Tensor] = []
-    # foreach_copy_input_numels: list[int] = []
-
-    # 1st pass: for foreach-copy parameters, get inputs and metadata for the
-    # foreach copy, and for the others, actually get their all-gather inputs
-    for i, fsdp_param in enumerate(fsdp_params):
-        assert not hasattr(
-            fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather"
-        ), "fsdp_pre_all_gather not supported in ODC"
-        if use_foreach_copy(fsdp_param):
-            foreach_copy_indices.append(i)
-            all_gather_input = (
-                fsdp_param._sharded_param_data
-                if fsdp_param.sharded_state == ShardedState.SHARDED
-                else cast(torch.Tensor, fsdp_param._sharded_post_forward_param_data)
-            )
-            # foreach_copy_inputs.append(all_gather_input)
-            # foreach_copy_input_numels.append(all_gather_input.numel())
-            param_all_gather_inputs[i] = [all_gather_input]
-        else:
-            if fsdp_param.param_dtype is not None:
-                assert (
-                    fsdp_param._sharded_param_data.dtype == fsdp_param.param_dtype
-                ), f"{fsdp_param._sharded_param_data.dtype=} != {fsdp_param.param_dtype=}"
-            if (
-                hasattr(fsdp_param, "_sharded_post_forward_param_data")
-                and fsdp_param.param_dtype is not None
-            ):
-                # avoid converting symmetric buffer to a new tensor with param dtype for HPZ
-                assert (
-                    fsdp_param._sharded_post_forward_param_data.dtype == fsdp_param.param_dtype
-                ), f"{fsdp_param._sharded_post_forward_param_data.dtype=} != {fsdp_param.param_dtype=}"
-            assert fsdp_param.sharded_state in (
-                ShardedState.SHARDED,
-                ShardedState.SHARDED_POST_FORWARD,
-            ), f"Unexpected sharded state: {fsdp_param.sharded_state=}"
-            param_all_gather_inputs[i] = fsdp_param.all_gather_inputs
-
-    # We have to use the original symmetric buffer for odc gather.
-    # Just return the slices of the original symmetric buffer.
-    # The original codes below are not needed for ODC.
-
-    # # 2nd pass: use foreach copy to compute the remaining all-gather inputs
-    # if foreach_copy_inputs:
-    #     fsdp_param_0 = fsdp_params[foreach_copy_indices[0]]
-    #     param_dtype, device = fsdp_param_0.param_dtype, fsdp_param_0.device
-    #     flat_foreach_copy_input = torch.empty(
-    #         (sum(foreach_copy_input_numels),), device=device, dtype=param_dtype
-    #     )
-    #     splits = torch.split(flat_foreach_copy_input, foreach_copy_input_numels)
-    #     torch._foreach_copy_(splits, foreach_copy_inputs)
-    #     for i, split in zip(foreach_copy_indices, splits):
-    #         param_all_gather_inputs[i] = [split]
-
-    return param_all_gather_inputs
-
-
 __odc_gather = None
 __all_gather = None
 
@@ -316,6 +241,8 @@ def foreach_all_gather(
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input.numel() * world_size,), dtype=all_gather_input.dtype, device=device
         )
+        # _get_param_all_gather_inputs allocates some tensors
+        # But we don't use them here. Just get the metadata.
         param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
         (
             param_all_gather_input_dtypes,
