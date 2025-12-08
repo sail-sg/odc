@@ -380,7 +380,7 @@ def main():
         random.seed(worker_seed)
 
     # Training parameters
-    num_epochs = 1  # More epochs to see loss decrease
+    num_epochs = 5  # More epochs to see loss decrease
     max_steps = 25  # Limit steps for demo purposes
 
     # Setup wandb configuration

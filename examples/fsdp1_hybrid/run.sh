@@ -1,8 +1,10 @@
 export WANDB_MODE=disabled
 export ODC=${ODC:-1}
 if [ "${HSDP:-0}" -eq '1' ]; then
-    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-20000000000}
+    HSDP_FLAG="_HSDP"
+    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
 else
+    HSDP_FLAG=""
     export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
 fi
 
@@ -18,8 +20,8 @@ else
     COMM_NAME="NCCL"
 fi
 
-run_name="${FSDP_NAME}_${COMM_NAME}"
-group_name="fsdp2_test"
+run_name="${FSDP_NAME}_${COMM_NAME}${HSDP_FLAG}"
+group_name="fsdp2_v1"
 
 if [ ! -d "data/longalign64" ]; then
     echo "data/longalign64 does not exist, running preprocessing..."
