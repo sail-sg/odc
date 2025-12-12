@@ -25,9 +25,9 @@ It **requires some time** to compile the CUDA extension `tensor_ipc`.
 
 ## Quick Start
 
-A complete example is provided in `examples/fsdp1_hybrid/`:
+A complete example is provided in `examples/llm_training/`:
 ```shell
-bash examples/fsdp1_hybrid/run.sh
+bash examples/llm_training/run.sh
 ```
 
 ### Basic Usage with FSDP1

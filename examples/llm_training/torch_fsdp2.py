@@ -159,50 +159,6 @@ def setup_distributed():
         init_nvshmem()
 
 
-def setup_hybrid_sharding():
-    """Setup hybrid sharding process groups for HYBRID_SHARD strategy"""
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-
-    assert world_size == 8, f"This example requires exactly 8 GPUs, got {world_size}"
-
-    # For HYBRID_SHARD, we need to set up process groups
-    # HYBRID_SHARD uses 2 replicas * 4 FSDP groups
-    # Replicas: [0,1,2,3] and [4,5,6,7]
-    # Each replica uses FSDP internally
-
-    replica_group_size = 4  # 4 GPUs per replica
-    num_replicas = world_size // replica_group_size  # 2 replicas
-
-    # Create sharding groups (FSDP groups within each replica)
-    sharding_groups = []
-    for i in range(num_replicas):
-        start_rank = i * replica_group_size
-        end_rank = start_rank + replica_group_size
-        group_ranks = list(range(start_rank, end_rank))
-        sharding_groups.append(dist.new_group(group_ranks))
-
-    # Create replication groups (data parallel across replicas)
-    replication_groups = []
-    for i in range(replica_group_size):
-        group_ranks = [i + j * replica_group_size for j in range(num_replicas)]
-        replication_groups.append(dist.new_group(group_ranks))
-
-    # Determine which groups this rank belongs to
-    replica_id = rank // replica_group_size
-    local_rank_in_replica = rank % replica_group_size
-
-    sharding_group = sharding_groups[replica_id]
-    replication_group = replication_groups[local_rank_in_replica]
-
-    print(f"Rank {rank}: Replica {replica_id}, Local rank {local_rank_in_replica}")
-    print(
-        f"Rank {rank}: Sharding group size {dist.get_world_size(sharding_group)}, "
-        f"Replication group size {dist.get_world_size(replication_group)}"
-    )
-
-    return sharding_group, replication_group
-
 
 def create_fsdp_model(model, _sharding_group, _replication_group):
     """Wrap model with FSDP2 using fully_shard"""
@@ -229,7 +185,6 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
         fsdp_kwargs["mesh"] = init_device_mesh(
             "cuda", (num_nodes, gpus_per_node), mesh_dim_names=("dp_replicate", "dp_shard")
         )
-        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
 
     if enable_decouple:
         fsdp2.patch_fsdp2()
@@ -343,9 +298,6 @@ def main():
     set_deterministic_training(seed=42)
 
     # Setup distributed training
-
-    # Setup hybrid sharding
-    # sharding_group, replication_group = setup_hybrid_sharding()
 
     # Create Qwen 2.5 0.5B model
     model, _tokenizer = create_qwen_model()

@@ -1,4 +1,4 @@
-export WANDB_MODE=disabled
+# export WANDB_MODE=disabled
 export ODC=${ODC:-1}
 if [ "${HSDP:-0}" -eq '1' ]; then
     HSDP_FLAG="_HSDP"
@@ -20,33 +20,33 @@ else
     COMM_NAME="NCCL"
 fi
 
-run_name="${FSDP_NAME}_${COMM_NAME}${HSDP_FLAG}"
-group_name="fsdp2_v1"
+export RUN_NAME="${FSDP_NAME}_${COMM_NAME}${HSDP_FLAG}"
+group_name="profile_group"
 
 if [ ! -d "data/longalign64" ]; then
     echo "data/longalign64 does not exist, running preprocessing..."
-    python examples/fsdp1_hybrid/preprocess_dataset.py --num_samples 1000 --output data/longalign64
+    python examples/llm_training/preprocess_dataset.py --num_samples 1000 --output data/longalign64
 else
     echo "data/longalign64 already exists, skipping preprocessing"
 fi
 
 netdevs=$(ls /sys/class/net | grep 'bond0\|eth0')
-for netdev in $netdevs; do
-    echo "Netdev: $netdev"
-done
-export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdevs}
+netdev=$(echo $netdevs | head -n1 | awk '{print $1}')
+echo "Netdev: $netdev"
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdev}
+export NCCL_SOCKET_IFNAME=${netdev}
 
 if [ "${FSDP2:-0}" -eq 1 ]; then
     echo "Running FSDP2: ODC: ${ODC}"
-    script="examples/fsdp1_hybrid/torch_fsdp2.py"
+    script="examples/llm_training/torch_fsdp2.py"
 else
     echo "Running FSDP1: ODC: ${ODC}"
-    script="examples/fsdp1_hybrid/torch_fsdp.py"
+    script="examples/llm_training/torch_fsdp.py"
 fi
 
 bash launch.sh ${script} \
-           --limit_dataset_token_len 40000 \
-           --minibatch_size 2 \
+           --minibatch_size 4 \
            --micro_batch_size 1 \
-           --run_name ${run_name} \
+           --run_name ${RUN_NAME} \
            --project_name ${group_name}
+        #    --limit_dataset_token_len 40000 \
