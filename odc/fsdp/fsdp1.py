@@ -2,12 +2,9 @@ import logging
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.distributed.fsdp._flat_param import FlatParamHandle, HandleShardingStrategy
-from torch.distributed.fsdp._runtime_utils import (
-    _div_if_needed,
-    _FSDPState,
-    _get_reduce_scatter_tensors,
-)
+from torch.distributed.fsdp._runtime_utils import _div_if_needed, _FSDPState
 
 import odc
 
@@ -23,6 +20,22 @@ def get_reduction_service():
 
 def get_gather_service():
     return gather_service
+
+
+def custom_get_reduce_scatter_tensors(
+    state: _FSDPState, unsharded_grad: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns the input and output tensors to reduce-scatter, respectively.
+    """
+    chunks = list(unsharded_grad.chunk(state.world_size))
+    numel_to_pad = state.world_size * chunks[0].numel() - unsharded_grad.numel()
+    padded_unsharded_grad = (
+        F.pad(unsharded_grad, [0, numel_to_pad]) if numel_to_pad > 0 else unsharded_grad
+    )
+    # new_sharded_grad = torch.empty_like(chunks[0])  # padded
+    # return padded_unsharded_grad, new_sharded_grad
+    return padded_unsharded_grad
 
 
 def _reduce_grad(state, handle) -> None:
@@ -44,8 +57,10 @@ def _reduce_grad(state, handle) -> None:
     unsharded_grad = flat_param.grad.data
     flat_param.grad = None
     # print(f"unsharded_grad shape: {unsharded_grad.shape} dtype {unsharded_grad.dtype}")
-    padded_unsharded_grad, new_sharded_grad = _get_reduce_scatter_tensors(state, unsharded_grad)
+    # padded_unsharded_grad, new_sharded_grad = _get_reduce_scatter_tensors(state, unsharded_grad)
+    padded_unsharded_grad = custom_get_reduce_scatter_tensors(state, unsharded_grad)
     # print(state._comm_hook)
+    assert state._comm_hook is None, "ODC does not support comm hook"
     if state._comm_hook is None:  # default path
         _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
         pg = handle._fake_process_group if handle._use_fake_reduce else state.process_group
@@ -80,7 +95,8 @@ def _reduce_grad(state, handle) -> None:
         #         return
         # _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
     else:
-        state._comm_hook(state._comm_hook_state, padded_unsharded_grad, new_sharded_grad)
+        pass
+        # state._comm_hook(state._comm_hook_state, padded_unsharded_grad, new_sharded_grad)
         # NOTE: HSDP variants do not support communication hook.
 
     # Already set below: handle.flat_param._saved_grad_shard = xxx
@@ -173,12 +189,23 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
         # padded_unsharded_flat_param output torch.bfloat16 sharded_flat_param input torch.float32
         assert padded_unsharded_flat_param.dtype == self._fwd_bwd_param_dtype
         assert sharded_flat_param.dtype == self._orig_param_dtype
-        padded_unsharded_flat_param_orig_dtype = padded_unsharded_flat_param
-        if padded_unsharded_flat_param.dtype != sharded_flat_param.dtype:
+        # Handle dtype conversion for mixed precision
+        # We need to convert to output to orig_dtype for all-gather
+        # as the sharded_flat_param is in orig_dtype for all ranks, then convert back
+        # This is because when using ODC, the peer may have not reached here and be able to
+        # convert input to _fwd_bwd_param_dtype.
+        from torch.distributed.utils import _free_storage
+
+        needs_dtype_conversion = padded_unsharded_flat_param.dtype != sharded_flat_param.dtype
+        if needs_dtype_conversion:
             assert self._uses_param_mixed_precision
+            # Convert output to orig_dtype for all-gather (creates new tensor)
             padded_unsharded_flat_param_orig_dtype = padded_unsharded_flat_param.to(
                 self._orig_param_dtype
             )
+        else:
+            padded_unsharded_flat_param_orig_dtype = padded_unsharded_flat_param
+
         ag_func = gather_service.gather_into_tensor
         ag_func(
             padded_unsharded_flat_param_orig_dtype,  # Could be fp32
@@ -186,11 +213,14 @@ def all_gather_flat_param(self, padded_unsharded_flat_param):
             sharded_flat_param,
             pg,
         )
-        # Convert back to fwd_bwd_param_dtype
-        if padded_unsharded_flat_param.dtype != sharded_flat_param.dtype:
-            padded_unsharded_flat_param = padded_unsharded_flat_param_orig_dtype.to(
-                self._fwd_bwd_param_dtype
-            )
+
+        # Convert back to fwd_bwd_param_dtype and free the temporary buffer
+        if needs_dtype_conversion:
+            # Convert the dtype conversion buffer back to fwd_bwd_param_dtype in-place
+            # copy_ will do the implicit conversion.
+            padded_unsharded_flat_param.copy_(padded_unsharded_flat_param_orig_dtype)
+            # Free the temporary buffer
+            _free_storage(padded_unsharded_flat_param_orig_dtype)
 
     if self._offload_params:
         # In case of offloading, `flat_param.data` (i.e. sharded param) is

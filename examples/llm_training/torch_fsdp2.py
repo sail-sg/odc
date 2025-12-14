@@ -159,7 +159,6 @@ def setup_distributed():
         init_nvshmem()
 
 
-
 def create_fsdp_model(model, _sharding_group, _replication_group):
     """Wrap model with FSDP2 using fully_shard"""
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
