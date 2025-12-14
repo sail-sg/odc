@@ -34,16 +34,15 @@ bash examples/llm_training/run.sh
 
 ```python
 import torch
-import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import odc
-from odc.fsdp import fsdp1 # import patch_fsdp1, pre_minibatch_start, pre_optimizer_step, stop
+from odc.fsdp import fsdp1
 
 
 fsdp1.patch_fsdp1()
 
-dist.init_process_group(backend="nccl")
+torch.distributed.init_process_group(backend="nccl", device_id=device)
 odc.init_nvshmem()
 
 
@@ -52,15 +51,50 @@ fsdp_model = FSDP(
     # ...
 )
 
-for minibatch in dataset:
-    fsdp1.pre_minibatch_start()
-    loss = train_step(model, ...)
-    fsdp1.pre_optimizer_step(model)
-    optimizer.step()
-    optimizer.zero_grad()
+for epoch in range(10):
+    fsdp1.pre_minibatch_start(fsdp_model)
+    for minibatch in dataset:
+        loss = loss_fn(model)
+        fsdp1.pre_optimizer_step(model)
+        optimizer.step()
+        optimizer.zero_grad()
 
 fsdp1.stop()
 ```
+
+### Basic Usage with FSDP2
+
+```python
+import torch
+import odc
+from odc.fsdp import fsdp2
+
+
+torch.distributed.init_process_group(backend="nccl", device_id=device)
+odc.init_nvshmem()
+
+fsdp2.patch_fsdp2()
+
+for layer in model.layers:
+    fully_shard(layer, **fsdp_kwargs)
+fsdp_model = fully_shard(model, **fsdp_kwargs)
+
+# Call patch_lazy_init just as how we call fully_shard above.
+for layer in fsdp_model.layers:
+    fsdp2.patch_lazy_init(layer)
+fsdp2.patch_lazy_init(fsdp_model)
+
+for epoch in range(10):
+    fsdp2.pre_minibatch_start(fsdp_model)
+    for minibatch in dataset:
+        loss = loss_fn(model)
+        fsdp2.pre_optimizer_step(model)
+        optimizer.step()
+        optimizer.zero_grad()
+
+fsdp2.stop()
+```
+
 
 ## Development
 

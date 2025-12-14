@@ -84,12 +84,8 @@ def main(args):
             reduce_dtype=torch.float32,
         )
     gpus_per_node = get_local_world_size()
-    hpz = os.environ.get("HPZ", "0") == "1"
     hsdp = os.environ.get("HSDP", "0") == "1"
-    if hpz:
-        print(f"enable Hierarchical Partitioning for ZeRO(HPZ) with {gpus_per_node} GPUs per node")
-        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
-    elif hsdp:
+    if hsdp:
         world_size = torch.distributed.get_world_size()
         num_nodes = world_size // gpus_per_node
         print(f"enable HSDP with {num_nodes} nodes and {gpus_per_node} GPUs per node")
