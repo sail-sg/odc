@@ -5,6 +5,11 @@ reduce-scatter with on-demand point-to-point communication.
 
 ![Original-FSDP](./docs/readme/FSDP-ODC.jpg)
 
+## Features
+- FSDP1
+- FSDP2
+  - HSDP (`reshard_after_forward=int` not supported)
+
 ## Usage
 
 ### Prerequisites
@@ -29,6 +34,12 @@ A complete example is provided in `examples/llm_training/`:
 ```shell
 bash examples/llm_training/run.sh
 ```
+
+## Memory
+> User may need to tune `NVSHMEM_SYMMETRIC_SIZE` for better memory usage.
+In ODC, NVSHMEM symmetric buffer are only allocated for sharded parameters.
+To achieve smallest memory footprint,
+`NVSHMEM_SYMMETRIC_SIZE` should be set to be slightly higher than the size of sharded parameters.
 
 ### Basic Usage with FSDP1
 

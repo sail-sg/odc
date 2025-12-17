@@ -1,11 +1,12 @@
-# export WANDB_MODE=disabled
+export WANDB_MODE=disabled
 export ODC=${ODC:-1}
 if [ "${HSDP:-0}" -eq '1' ]; then
     HSDP_FLAG="_HSDP"
+    # Need higher symmetric size for HSDP
     export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
 else
     HSDP_FLAG=""
-    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
+    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-3000000000}
 fi
 
 if [ "${FSDP2:-0}" -eq '1' ]; then
