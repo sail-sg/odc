@@ -20,7 +20,7 @@ reduce-scatter with on-demand point-to-point communication.
 
 We highly recommand using a pytorch container like
 - `nvcr.io/nvidia/pytorch:25.06-py3` [Full List](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags)
-- `2.9.0-cuda12.8-cudnn9-devel` [Full List](https://hub.docker.com/r/pytorch/pytorch/tags)
+- `pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel` [Full List](https://hub.docker.com/r/pytorch/pytorch/tags)
 
 ### Install ODC
 ```
@@ -32,6 +32,8 @@ It **requires some time** to compile the CUDA extension `tensor_ipc`.
 
 A complete example is provided in `examples/llm_training/`:
 ```shell
+pip install -r examples/llm_training/requirements.txt
+
 bash examples/llm_training/run.sh
 ```
 

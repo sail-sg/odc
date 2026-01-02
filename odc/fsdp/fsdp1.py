@@ -345,3 +345,4 @@ def pre_minibatch_start(_fsdp_module):
 def stop():
     get_reduction_service().stop()
     odc.SymmBufferRegistry.get_instance().finalize()
+    odc.finalize_distributed()

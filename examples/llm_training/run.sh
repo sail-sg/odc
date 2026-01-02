@@ -6,7 +6,7 @@ if [ "${HSDP:-0}" -eq '1' ]; then
     export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-10000000000}
 else
     HSDP_FLAG=""
-    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-3000000000}
+    export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-5000000000}
 fi
 
 if [ "${FSDP2:-0}" -eq '1' ]; then
@@ -43,6 +43,12 @@ if [ "${FSDP2:-0}" -eq 1 ]; then
 else
     echo "Running FSDP1: ODC: ${ODC}"
     script="examples/llm_training/torch_fsdp.py"
+fi
+
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -ra _cuda_visible <<< "${CUDA_VISIBLE_DEVICES}"
+    export GPUS_PER_NODE=${#_cuda_visible[@]}
+    echo "Setting GPUS_PER_NODE=${GPUS_PER_NODE} from CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 fi
 
 bash launch.sh ${script} \

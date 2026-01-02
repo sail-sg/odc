@@ -10,6 +10,12 @@
 SCRIPT_DIR=$(dirname $BASH_SOURCE)
 # echo "SCRIPT_DIR: ${SCRIPT_DIR}"
 
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -ra _cuda_visible <<< "${CUDA_VISIBLE_DEVICES}"
+    export GPUS_PER_NODE=${#_cuda_visible[@]}
+    echo "Setting GPUS_PER_NODE=${GPUS_PER_NODE} from CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+fi
+
 netdevs=$(ls /sys/class/net | grep 'bond0\|eth0')
 for netdev in $netdevs; do
     echo "Netdev: $netdev"

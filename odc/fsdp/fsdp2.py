@@ -40,7 +40,7 @@ from torch.profiler import record_function
 
 from odc.primitives.gather import GatherService
 from odc.primitives.scatter_accumulate import ReductionService
-from odc.primitives.utils import SymmBufferRegistry
+from odc.primitives.utils import SymmBufferRegistry, finalize_distributed
 
 logger = logging.getLogger(__name__)
 
@@ -836,3 +836,4 @@ def patch_fsdp2() -> None:
 def stop():
     get_reduction_service().stop()
     SymmBufferRegistry.get_instance().finalize()
+    finalize_distributed()
