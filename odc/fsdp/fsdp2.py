@@ -814,13 +814,65 @@ def pre_optimizer_step(fsdp_module):
             update_gradients(fsdp_param_group)
 
 
+def _get_post_forward_mesh_info_no_convert(reshard_after_forward, mesh_info):
+    """Variant of FSDP's helper that preserves int semantics even on 1 node."""
+    from torch._logging import warning_once
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+    from torch.distributed.tensor import DeviceMesh
+
+    shard_mesh_size = mesh_info.shard_mesh_size
+    if not isinstance(reshard_after_forward, (bool, int)):
+        raise ValueError(
+            "reshard_after_forward should be a bool or an int representing the "
+            f"group size to reshard to, not {reshard_after_forward}"
+        )
+    # NOTE: `isinstance(False, int)` returns `True`.
+    if not isinstance(reshard_after_forward, bool) and isinstance(reshard_after_forward, int):
+        if (
+            reshard_after_forward < 1
+            or reshard_after_forward > shard_mesh_size
+            or shard_mesh_size % reshard_after_forward != 0
+        ):
+            raise ValueError(
+                "If passing reshard_after_forward as an int, it should be a "
+                f"factor of {shard_mesh_size}, not {reshard_after_forward}"
+            )
+        elif reshard_after_forward == 1:
+            msg = (
+                "reshard_after_forward=1 (int) means resharding parameters to world size 1, "
+                "instead of reshard_after_forward=True (bool)"
+            )
+            warning_once(logger, msg, stacklevel=2)
+            reshard_after_forward = False
+
+    post_forward_mesh_info = None
+    if reshard_after_forward is True:
+        post_forward_mesh_info = mesh_info
+    elif reshard_after_forward is not False:  # int case
+        post_forward_mesh_tensor = mesh_info.mesh.mesh.view(-1, reshard_after_forward)
+        post_forward_mesh = DeviceMesh(mesh_info.mesh.device_type, post_forward_mesh_tensor)
+        post_forward_mesh_info = HSDPMeshInfo(
+            post_forward_mesh, shard_mesh_dim=1, replicate_mesh_dim=0
+        )
+    return post_forward_mesh_info
+
+
 def patch_fsdp2() -> None:
-    from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
+    from torch.distributed._composable import replicate_with_fsdp
+    from torch.distributed.fsdp._fully_shard import (
+        _fsdp_collectives,
+        _fsdp_init,
+        _fsdp_param_group,
+        _fully_shard,
+    )
 
     _fsdp_collectives.foreach_all_gather = foreach_all_gather
     _fsdp_param_group.foreach_all_gather = foreach_all_gather
     _fsdp_collectives.foreach_all_gather_copy_out = foreach_all_gather_copy_out
     _fsdp_param_group.foreach_all_gather_copy_out = foreach_all_gather_copy_out
+    _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+    _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+    replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     FSDPParamGroup.post_backward = post_backward
     FSDPParamGroup.post_forward = post_forward
     _fsdp_param_group.record_function = nvtx_record_function
@@ -831,6 +883,78 @@ def patch_fsdp2() -> None:
     global gather_service
     reduction_service = ReductionService()
     gather_service = GatherService()
+
+
+def patch_debug():
+    from torch.distributed._composable import replicate_with_fsdp
+    from torch.distributed.fsdp._fully_shard import (
+        _fsdp_collectives,
+        _fsdp_init,
+        _fsdp_param_group,
+        _fully_shard,
+    )
+
+    _fsdp_collectives.foreach_all_gather = debug_foreach_all_gather
+    _fsdp_param_group.foreach_all_gather = debug_foreach_all_gather
+    _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+    _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+    replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+
+
+@torch.no_grad()
+def debug_foreach_all_gather(
+    fsdp_params: list[FSDPParam],
+    group: dist.ProcessGroup,
+    async_op: bool,
+    all_gather_copy_in_stream: torch.Stream,
+    all_gather_stream: torch.Stream,
+    device: torch.device,
+    all_gather_comm: AllGather,
+) -> Optional[AllGatherResult]:
+    world_size, rank = group.size(), group.rank()
+    device_handle = _get_device_handle(device.type)
+    print(f"foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}")
+    with device_handle.stream(all_gather_copy_in_stream):
+        param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
+        (
+            param_all_gather_input_dtypes,
+            param_all_gather_input_numels,
+            dtype,
+        ) = _get_all_gather_input_metadatas(param_all_gather_inputs)
+        if dtype == torch.uint8:
+            all_gather_inputs = [t.view(torch.uint8) for ts in param_all_gather_inputs for t in ts]
+        else:
+            all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
+        inp_split_sizes = [t.numel() for t in all_gather_inputs]
+        all_gather_input_numel = sum(inp_split_sizes)
+        all_gather_output = all_gather_comm.allocate(
+            (all_gather_input_numel * world_size,), dtype=dtype, device=device
+        )
+        all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
+            all_gather_inputs,
+            all_gather_output,
+            inp_split_sizes,
+            all_gather_input_numel,
+            rank,
+        )
+        del param_all_gather_inputs
+    all_gather_stream.wait_stream(all_gather_copy_in_stream)
+    with device_handle.stream(all_gather_stream):
+        all_gather_work = all_gather_comm(
+            output_tensor=all_gather_output,
+            input_tensor=all_gather_input,
+            group=group,
+            async_op=async_op,
+        )
+        all_gather_event = all_gather_stream.record_event()
+        return AllGatherResult(
+            all_gather_output,
+            all_gather_event,
+            all_gather_work,
+            param_all_gather_input_dtypes,
+            param_all_gather_input_numels,
+            inp_split_sizes,
+        )
 
 
 def stop():
