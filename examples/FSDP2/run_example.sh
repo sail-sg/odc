@@ -17,10 +17,9 @@ if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
 fi
 
 netdevs=$(ls /sys/class/net | grep 'bond0\|eth0')
-for netdev in $netdevs; do
-    echo "Netdev: $netdev"
-done
+netdev=$(echo $netdevs | head -n1 | awk '{print $1}')
+echo "Netdev: $netdev"
 
 echo "Launching ${1:-example.py} with ${2:-2} gpus"
-NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdevs} bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision
+NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdev} bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision
 # torchrun --nnodes=1 --nproc_per_node=${2:-2} ${1:-example.py}
