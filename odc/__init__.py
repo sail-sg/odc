@@ -2,7 +2,7 @@ import logging
 
 from odc.primitives.gather import GatherService
 from odc.primitives.scatter_accumulate import ReductionService
-from odc.primitives.utils import SymmBufferRegistry, init_nvshmem, finalize_distributed
+from odc.primitives.utils import SymmBufferRegistry, finalize_distributed, init_nvshmem
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())

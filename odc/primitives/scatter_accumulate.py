@@ -438,15 +438,24 @@ def reduction_watcher_function(
 
 
 def start_reduction_watcher(accumulations, buffers, request_buffer, response_buffer):
-    original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if original_visible_devices is not None:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+    rank = torch.distributed.get_rank()
+    current_device = torch.cuda.current_device()
+    local_world_size = get_local_world_size()
+
+    logger.debug(
+        f"Rank {rank} start_reduction_watcher: "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT_SET')}, "
+        f"current_device={current_device}, "
+        f"local_world_size={local_world_size}"
+    )
 
     ctx = torch.multiprocessing.get_context("spawn")
     cmd_queue = ctx.Queue()
     response_queue = ctx.Queue()
     device_id = torch.distributed.get_rank() % get_local_world_size()
     world_size = torch.distributed.get_world_size()
+
+    logger.debug(f"Rank {rank} spawning reduction_watcher with device_id={device_id}")
     process = ctx.Process(
         target=reduction_watcher_function,
         args=(
@@ -461,10 +470,6 @@ def start_reduction_watcher(accumulations, buffers, request_buffer, response_buf
         ),
     )
     process.start()
-    if original_visible_devices is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
-    elif "CUDA_VISIBLE_DEVICES" in os.environ:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
     return cmd_queue, response_queue
 
 

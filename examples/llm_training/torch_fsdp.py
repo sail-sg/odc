@@ -33,6 +33,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from args import get_args
+from data import BatchedDataset
 from datasets import load_from_disk
 from lm_head import FusedLinearForPPOFunction
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -43,7 +44,6 @@ from torch.profiler import ProfilerActivity, profile
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 
 import odc
-from data import BatchedDataset
 from odc.fsdp import fsdp1
 from odc.primitives.utils import SymmBufferRegistry
 
