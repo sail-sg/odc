@@ -69,6 +69,8 @@ class GatherService:
         self.shaped_buffer = {}
         self.buffer_splitter = BufferSplitter()
         self.chunk_size_bytes = 2**20
+        self._shaped_buffer_memory_bytes = 0
+        self._shaped_buffer_count = 0
 
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
@@ -82,6 +84,7 @@ class GatherService:
         assert output_size >= buf_size, f"output_size: {output_size} < buf_size: {buf_size}"
 
         rank = torch.distributed.get_rank()
+        new_shaped_buffer = False
         if (buffer_shape, output_tensor.dtype) not in self.shaped_buffer:
             logger.info(
                 f"Rank {rank} create buffer: output_size: {output_size} num_sub_buffers: {math.ceil(output_size / buf_size)} buf_size: {buf_size}"
@@ -93,7 +96,21 @@ class GatherService:
                 buffer_shape,
                 output_tensor.dtype,
             )
+            new_shaped_buffer = True
         target_tensor = self.shaped_buffer[(buffer_shape, output_tensor.dtype)]
+        if new_shaped_buffer:
+            shaped_bytes = target_tensor.numel() * target_tensor.element_size()
+            self._shaped_buffer_memory_bytes += shaped_bytes
+            self._shaped_buffer_count += 1
+            logger.info(
+                f"[ODC] Gather shaped buffer allocated: shape={buffer_shape}, dtype={output_tensor.dtype}, "
+                f"size={shaped_bytes / 1e6:.2f}MB"
+            )
+            logger.info(
+                f"[ODC] Gather shaped buffer totals: count={self._shaped_buffer_count}, "
+                f"bytes={self._shaped_buffer_memory_bytes} "
+                f"({self._shaped_buffer_memory_bytes / 1e6:.2f}MB)"
+            )
 
         assert (input_tensor.numel() * input_tensor.element_size()) % (
             2**6

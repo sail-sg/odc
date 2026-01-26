@@ -505,6 +505,21 @@ class ReductionService:
         # Track accumulation buffer memory for logging
         self._accumulation_memory_bytes = 0
         self._accumulation_count = 0
+        # Track shared and input buffer memory for logging
+        self._shared_buffer_memory_bytes = 0
+        self._shared_buffer_count = 0
+        self._input_buffer_memory_bytes = 0
+        self._input_buffer_count = 0
+
+    def _log_buffer_totals(self, context):
+        logger.info(
+            f"[ODC] {context} buffer totals: shared_buffers={self._shared_buffer_count}, "
+            f"shared_bytes={self._shared_buffer_memory_bytes} "
+            f"({self._shared_buffer_memory_bytes / 1e6:.2f}MB), "
+            f"input_buffers={self._input_buffer_count}, "
+            f"input_bytes={self._input_buffer_memory_bytes} "
+            f"({self._input_buffer_memory_bytes / 1e6:.2f}MB)"
+        )
 
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
@@ -585,6 +600,16 @@ class ReductionService:
             self.shared_buffer[shared_buffer_key] = (cnt, buffers)
 
             self.buffers.append(buffers)
+            shared_buffer_bytes = sum(
+                buffer.numel() * buffer.element_size() for buffer in buffers
+            )
+            self._shared_buffer_memory_bytes += shared_buffer_bytes
+            self._shared_buffer_count += len(buffers)
+            logger.info(
+                f"[ODC] Shared buffers allocated: shape={buffer_shape}, dtype={grad_dtype}, "
+                f"count={len(buffers)}, size={shared_buffer_bytes / 1e6:.2f}MB"
+            )
+            self._log_buffer_totals("ReductionService")
         self.buffer_indices[key] = self.shared_buffer[shared_buffer_key][0]
 
         # Make sure changes are visible to all reduction watchers
@@ -622,6 +647,7 @@ class ReductionService:
         grid_size = get_local_world_size()
         input_tensor_symm_shape = (chunk_size * grid_size,)
         rank = torch.distributed.get_rank()
+        new_input_buffer = False
         if (input_tensor_symm_shape, input_tensor.dtype) not in self.input_buffer:
             self.input_buffer[
                 (input_tensor_symm_shape, input_tensor.dtype)
@@ -630,7 +656,17 @@ class ReductionService:
                 input_tensor_symm_shape,
                 input_tensor.dtype,
             )
+            new_input_buffer = True
         input_tensor_symm = self.input_buffer[(input_tensor_symm_shape, input_tensor.dtype)]
+        if new_input_buffer:
+            input_bytes = input_tensor_symm.numel() * input_tensor_symm.element_size()
+            self._input_buffer_memory_bytes += input_bytes
+            self._input_buffer_count += 1
+            logger.info(
+                f"[ODC] Input buffer allocated: shape={input_tensor_symm_shape}, dtype={input_tensor.dtype}, "
+                f"size={input_bytes / 1e6:.2f}MB"
+            )
+            self._log_buffer_totals("ReductionService")
 
         buffer_id = self.buffer_indices[key]
         group_rank = torch.distributed.get_rank(pg)
