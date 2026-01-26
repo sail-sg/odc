@@ -58,6 +58,8 @@ class nvtx_record_function(record_function):
 
 reduction_service = None
 gather_service = None
+_orig_foreach_all_gather = None
+_orig_foreach_all_gather_copy_out = None
 
 
 def get_reduction_service():
@@ -91,7 +93,7 @@ def get_fsdp_params_key(fsdp_params: list[FSDPParam]) -> str:
 
 
 @torch.no_grad()
-def patch_lazy_init(fsdp_model):
+def patch_lazy_init(fsdp_model, *, use_symm_buffer: bool = True):
     state = fsdp_model._get_fsdp_state()
     group = state._fsdp_param_group
     prev_lazy_init = group.lazy_init
@@ -104,11 +106,11 @@ def patch_lazy_init(fsdp_model):
         
         prev_lazy_init()
         
-        # Debug: Check dtype AFTER original lazy_init, BEFORE replace_sharded_param_with_symm_buffer
-        if rank == 0 and len(_self.fsdp_params) > 0:
-            print(f"[DEBUG ODC=1 Rank {rank}] AFTER lazy_init, BEFORE replace: _sharded_param_data.dtype = {_self.fsdp_params[0]._sharded_param_data.dtype}")
-        
-        replace_sharded_param_with_symm_buffer(fsdp_model)
+        if use_symm_buffer:
+            # Debug: Check dtype AFTER original lazy_init, BEFORE replace_sharded_param_with_symm_buffer
+            if rank == 0 and len(_self.fsdp_params) > 0:
+                print(f"[DEBUG ODC=1 Rank {rank}] AFTER lazy_init, BEFORE replace: _sharded_param_data.dtype = {_self.fsdp_params[0]._sharded_param_data.dtype}")
+            replace_sharded_param_with_symm_buffer(fsdp_model)
 
     group.lazy_init = types.MethodType(patched_lazy_init, group)
 
@@ -185,6 +187,7 @@ def foreach_all_gather(
 ) -> Optional[AllGatherResult]:
     world_size, _rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
+    orig_all_gather_comm = all_gather_comm
     # Override the all-gather comm with ODCAllGather
     all_gather_comm = ODCAllGather()
     with device_handle.stream(all_gather_copy_in_stream):
@@ -192,9 +195,18 @@ def foreach_all_gather(
         # print(f"foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}")
         for fsdp_param in fsdp_params:
             assert fsdp_param.sharded_state != ShardedState.SHARDED_POST_FORWARD
-        assert SymmBufferRegistry.get_instance().has_key(
-            key
-        ), f"{key=} not found. The fsdp param group has not been replaced with symm buffer yet."
+        if not SymmBufferRegistry.get_instance().has_key(key):
+            if _orig_foreach_all_gather is None:
+                raise RuntimeError("ODC foreach_all_gather fallback requested but original is not set")
+            return _orig_foreach_all_gather(
+                fsdp_params,
+                group,
+                async_op,
+                all_gather_copy_in_stream,
+                all_gather_stream,
+                device,
+                orig_all_gather_comm,
+            )
         all_gather_input = SymmBufferRegistry.get_instance().get_symm_buffer(key)
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input.numel() * world_size,), dtype=all_gather_input.dtype, device=device
@@ -254,6 +266,11 @@ def foreach_all_gather_copy_out(
     fsdp_params: list[FSDPParam],
     group: dist.ProcessGroup,
 ) -> None:
+    key = get_fsdp_params_key(fsdp_params)
+    if not SymmBufferRegistry.get_instance().has_key(key):
+        if _orig_foreach_all_gather_copy_out is None:
+            raise RuntimeError("ODC foreach_all_gather_copy_out fallback requested but original is not set")
+        return _orig_foreach_all_gather_copy_out(all_gather_result, fsdp_params, group)
     (
         all_gather_output,
         all_gather_event,
@@ -828,11 +845,11 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
             if to_accumulate_grad:
                 assert isinstance(fsdp_param.sharded_param.grad, DTensor)
                 fsdp_param.sharded_param.grad._local_tensor += new_sharded_grad
-                print(f"{orig_dtype=} {fsdp_param.sharded_param.grad._local_tensor.dtype=}")
+                # print(f"{orig_dtype=} {fsdp_param.sharded_param.grad._local_tensor.dtype=}")
             else:
                 new_sharded_dtensor_grad = fsdp_param.to_sharded_dtensor(new_sharded_grad)
                 fsdp_param.sharded_param.grad = new_sharded_dtensor_grad
-                print(f"{orig_dtype=} {fsdp_param.sharded_param.grad.dtype=} {new_sharded_grad.dtype=}")
+                # print(f"{orig_dtype=} {fsdp_param.sharded_param.grad.dtype=} {new_sharded_grad.dtype=}")
             if not compiled_autograd_enabled():
                 for hook in (
                     getattr(fsdp_param.sharded_param, "_post_accumulate_grad_hooks", {}) or {}
@@ -895,6 +912,13 @@ def pre_optimizer_step(fsdp_module):
 
 def patch_fsdp2() -> None:
     from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
+
+    global _orig_foreach_all_gather
+    global _orig_foreach_all_gather_copy_out
+    if _orig_foreach_all_gather is None:
+        _orig_foreach_all_gather = _fsdp_collectives.foreach_all_gather
+    if _orig_foreach_all_gather_copy_out is None:
+        _orig_foreach_all_gather_copy_out = _fsdp_collectives.foreach_all_gather_copy_out
 
     _fsdp_collectives.foreach_all_gather = foreach_all_gather
     _fsdp_param_group.foreach_all_gather = foreach_all_gather
