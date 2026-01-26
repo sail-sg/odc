@@ -81,6 +81,46 @@ def nvshmem_free_tensor_sync(tensor):
     torch.cuda.synchronize()
 
 
+def get_total_gpu_memory():
+    """Get total GPU memory including both PyTorch CUDA and NVSHMEM allocations."""
+    cuda_allocated = torch.cuda.memory_allocated()
+    cuda_reserved = torch.cuda.memory_reserved()
+    cuda_max_allocated = torch.cuda.max_memory_allocated()
+    symm_allocated = SymmBufferRegistry.get_instance().memory_allocated()
+    return {
+        "cuda_allocated": cuda_allocated,
+        "cuda_reserved": cuda_reserved,
+        "cuda_max_allocated": cuda_max_allocated,
+        "symm_allocated": symm_allocated,
+        "total_allocated": cuda_allocated + symm_allocated,
+        "total_reserved": cuda_reserved + symm_allocated,
+        "total_peak": cuda_max_allocated + symm_allocated,
+    }
+
+
+def reset_peak_memory_stats():
+    """Reset peak memory stats to track per-phase peaks."""
+    torch.cuda.reset_peak_memory_stats()
+
+
+def log_total_gpu_memory(prefix=""):
+    """Log total GPU memory for debugging."""
+    mem = get_total_gpu_memory()
+    # Get NVSHMEM_SYMMETRIC_SIZE from env (this is the pre-allocated heap size)
+    nvshmem_heap_size = int(os.environ.get("NVSHMEM_SYMMETRIC_SIZE", 0))
+    # Get peak memory (max allocated since last reset)
+    cuda_max_allocated = torch.cuda.max_memory_allocated()
+    if torch.distributed.get_rank() == 0:
+        logger.info(
+            f"[ODC Memory] {prefix}: "
+            f"cuda_alloc={mem['cuda_allocated'] / 1e9:.2f}GB, "
+            f"cuda_peak={cuda_max_allocated / 1e9:.2f}GB, "
+            f"symm_alloc={mem['symm_allocated'] / 1e9:.2f}GB (heap={nvshmem_heap_size / 1e9:.2f}GB), "
+            f"TOTAL={mem['total_allocated'] / 1e9:.2f}GB, "
+            f"TOTAL_PEAK={(cuda_max_allocated + mem['symm_allocated']) / 1e9:.2f}GB"
+        )
+
+
 def finalize_distributed():
     nvshmem.core.finalize()
 
@@ -170,6 +210,44 @@ class SymmBufferRegistry:
 
     def memory_allocated(self):
         return sum(t.nbytes for t in self.allocations)
+
+    def memory_breakdown(self):
+        """Returns a breakdown of memory by allocation type."""
+        breakdown = {
+            "fsdp_params": 0,
+            "accumulation": 0,
+            "shared_buffer": 0,
+            "ag_buffer": 0,
+            "other": 0,
+        }
+        for key, tensor in self.local_tensor.items():
+            nbytes = tensor.nbytes
+            if key.startswith("fsdp_params_gather_"):
+                breakdown["fsdp_params"] += nbytes
+            elif key.startswith("rs_accumulation_"):
+                breakdown["accumulation"] += nbytes
+            elif key.startswith("shared_buffer_"):
+                breakdown["shared_buffer"] += nbytes
+            elif key.startswith("ag_buffer_"):
+                breakdown["ag_buffer"] += nbytes
+            else:
+                breakdown["other"] += nbytes
+        return breakdown
+
+    def log_memory_breakdown(self):
+        """Log memory breakdown for debugging."""
+        breakdown = self.memory_breakdown()
+        total = sum(breakdown.values())
+        logger.info(
+            f"[ODC] SymmBuffer Memory Breakdown: "
+            f"fsdp_params={breakdown['fsdp_params'] / 1e9:.2f}GB, "
+            f"accumulation={breakdown['accumulation'] / 1e9:.2f}GB, "
+            f"shared_buffer={breakdown['shared_buffer'] / 1e6:.2f}MB, "
+            f"ag_buffer={breakdown['ag_buffer'] / 1e6:.2f}MB, "
+            f"other={breakdown['other'] / 1e6:.2f}MB, "
+            f"total={total / 1e9:.2f}GB"
+        )
+        return breakdown
 
 
 local_world_pg = None

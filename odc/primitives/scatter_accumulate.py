@@ -502,6 +502,9 @@ class ReductionService:
         self.buffer_splitter = BufferSplitter()
         self.rank_streams = defaultdict(torch.cuda.Stream)
         self.chunk_size_bytes = 2**20
+        # Track accumulation buffer memory for logging
+        self._accumulation_memory_bytes = 0
+        self._accumulation_count = 0
 
     def get_chunk_size(self, buffer_dtype):
         return self.chunk_size_bytes // buffer_dtype.itemsize
@@ -549,6 +552,16 @@ class ReductionService:
         )
         self.accumulation_indices[key] = len(self.accumulations)
         self.accumulations.append(acc)
+        
+        # Track and log accumulation buffer allocation
+        acc_size_bytes = acc.numel() * acc.element_size()
+        self._accumulation_memory_bytes += acc_size_bytes
+        self._accumulation_count += 1
+        logger.info(
+            f"[ODC] Accumulation buffer allocated: shape={output_tensor_shape}, dtype={reduction_dtype}, "
+            f"size={acc_size_bytes / 1e6:.2f}MB, total_accumulation={self._accumulation_memory_bytes / 1e9:.2f}GB, "
+            f"count={self._accumulation_count}"
+        )
 
         buffer_size = self.buffer_splitter.get_local_buffer_size(
             output_tensor_shape, group_world_size
@@ -738,7 +751,48 @@ class ReductionService:
         call_watcher(self.reduction_watcher, "wait_and_reset_task_count", target)
         self.dispatched_tasks = 0
 
+    def get_accumulation_memory_summary(self):
+        """Get summary of accumulation buffer memory usage."""
+        # Calculate from actual tensors to ensure accuracy
+        total_bytes = sum(acc.numel() * acc.element_size() for acc in self.accumulations)
+        return {
+            "total_bytes": total_bytes,
+            "total_mb": total_bytes / 1e6,
+            "total_gb": total_bytes / 1e9,
+            "count": len(self.accumulations),
+            "details": [
+                {
+                    "key": key,
+                    "shape": self.accumulations[idx].shape,
+                    "dtype": self.accumulations[idx].dtype,
+                    "bytes": self.accumulations[idx].numel() * self.accumulations[idx].element_size(),
+                }
+                for key, idx in self.accumulation_indices.items()
+            ],
+        }
+
+    def log_accumulation_memory_summary(self):
+        """Log summary of accumulation buffer memory usage."""
+        summary = self.get_accumulation_memory_summary()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            logger.info(
+                f"[ODC] === Accumulation Buffer Memory Summary ===\n"
+                f"  Total accumulation buffers: {summary['count']}\n"
+                f"  Total memory: {summary['total_gb']:.4f} GB ({summary['total_mb']:.2f} MB)\n"
+                f"  Breakdown by buffer:"
+            )
+            for detail in summary["details"]:
+                logger.info(
+                    f"    - {detail['key']}: shape={detail['shape']}, dtype={detail['dtype']}, "
+                    f"size={detail['bytes'] / 1e6:.2f} MB"
+                )
+        return summary
+
     def stop(self):
+        # Log accumulation memory summary before stopping
+        self.log_accumulation_memory_summary()
+        
         if self.reduction_watcher is not None:
             call_watcher(self.reduction_watcher, "stop")
             torch.distributed.barrier()

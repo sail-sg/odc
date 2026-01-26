@@ -1,4 +1,5 @@
 import dataclasses
+import gc
 import logging
 import operator
 import types
@@ -40,7 +41,7 @@ from torch.profiler import record_function
 
 from odc.primitives.gather import GatherService
 from odc.primitives.scatter_accumulate import ReductionService
-from odc.primitives.utils import SymmBufferRegistry, finalize_distributed
+from odc.primitives.utils import SymmBufferRegistry, finalize_distributed, log_total_gpu_memory, reset_peak_memory_stats
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,17 @@ def patch_lazy_init(fsdp_model):
     prev_lazy_init = group.lazy_init
 
     def patched_lazy_init(_self):
+        # Debug: Check dtype BEFORE original lazy_init
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0 and len(_self.fsdp_params) > 0:
+            print(f"[DEBUG ODC=1 Rank {rank}] BEFORE lazy_init: _sharded_param_data.dtype = {_self.fsdp_params[0]._sharded_param_data.dtype}")
+        
         prev_lazy_init()
+        
+        # Debug: Check dtype AFTER original lazy_init, BEFORE replace_sharded_param_with_symm_buffer
+        if rank == 0 and len(_self.fsdp_params) > 0:
+            print(f"[DEBUG ODC=1 Rank {rank}] AFTER lazy_init, BEFORE replace: _sharded_param_data.dtype = {_self.fsdp_params[0]._sharded_param_data.dtype}")
+        
         replace_sharded_param_with_symm_buffer(fsdp_model)
 
     group.lazy_init = types.MethodType(patched_lazy_init, group)
@@ -117,6 +128,7 @@ def replace_sharded_param_with_symm_buffer(
             raise ValueError(
                 f"All FSDP parameters must have the same dtype: {fsdp_param._sharded_param_data.dtype=} {dtype=}"
             )
+    print(f"### param dtype: {dtype}")
 
     total_size = sum(
         fsdp_param._sharded_param_data.numel() for fsdp_param in fsdp_param_group.fsdp_params
@@ -126,6 +138,7 @@ def replace_sharded_param_with_symm_buffer(
     symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
         key, (total_size,), dtype
     )
+    print(f"[DEBUG ODC=1] symm_buffer total_size {total_size} dtype: {symm_buffer.dtype} memory {total_size * symm_buffer.element_size() / 1e9:.2f} GB")
 
     offset = 0
     # Refer to the codes in `FSDPParam._init_sharded_param`
@@ -138,12 +151,26 @@ def replace_sharded_param_with_symm_buffer(
         padded_sharded_param = padded_sharded_param.view(fsdp_param.padded_sharded_param_size)
         offset += param_size
 
+        # Store reference to old tensor to ensure we can track/free it
+        old_sharded_param_data = fsdp_param._sharded_param_data
+        
         fsdp_param._sharded_param_data = padded_sharded_param.view(-1)
         shard_dim = fsdp_param.fsdp_placement.dim
         old_sharded_param = fsdp_param.sharded_param._local_tensor
         length = old_sharded_param.size(shard_dim) if old_sharded_param.numel() > 0 else 0
         sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
         fsdp_param.sharded_param._local_tensor = sharded_param
+        
+        # Explicitly delete references to old tensors to help GC
+        del old_sharded_param_data
+        del old_sharded_param
+
+    # Force garbage collection and clear CUDA cache to free original param memory
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Log memory after replacement for debugging
+    log_total_gpu_memory(f"After replace_sharded_param ({key[:50]}...)")
 
 
 @torch.no_grad()
@@ -332,13 +359,54 @@ def foreach_all_gather_copy_out(
                 torch.cat(chunks, dim=shard_dim, out=cat_out)
 
 
+_minibatch_count = 0
+
 def pre_minibatch_start(fsdp_module):
+    global _minibatch_count
+    _minibatch_count += 1
+    
+    # Log memory at start of first minibatch and reset peak stats
+    if _minibatch_count == 1:
+        log_total_gpu_memory("Before first minibatch")
+        reset_peak_memory_stats()  # Reset so we can track peak during training
+    
     get_reduction_service().clear_accumulations()
 
     # Make sure optimizer updates are visible to all ranks
     dist.barrier()
 
     check_fsdp_module(fsdp_module)
+
+
+_microbatch_count = 0
+_forward_count = 0
+_epoch_count = 0
+
+def log_after_forward(microbatch_id: int):
+    """Call this after model forward pass (captures peak activation memory)"""
+    global _forward_count
+    _forward_count += 1
+    log_total_gpu_memory(f"After forward {microbatch_id}")
+
+
+def log_after_microbatch(microbatch_id: int):
+    """Call this after each microbatch (after loss.backward())"""
+    global _microbatch_count
+    _microbatch_count += 1
+    log_total_gpu_memory(f"After backward {microbatch_id}")
+
+
+def log_after_optimizer_step():
+    """Call this after optimizer.step()"""
+    global _epoch_count
+    _epoch_count += 1
+    log_total_gpu_memory(f"After optimizer step {_epoch_count}")
+
+
+def log_after_optimizer_zero_grad():
+    """Call this after optimizer.zero_grad()"""
+    global _epoch_count
+    log_total_gpu_memory(f"After zero_grad {_epoch_count}")
 
 
 def is_bw() -> bool:
@@ -760,9 +828,11 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
             if to_accumulate_grad:
                 assert isinstance(fsdp_param.sharded_param.grad, DTensor)
                 fsdp_param.sharded_param.grad._local_tensor += new_sharded_grad
+                print(f"{orig_dtype=} {fsdp_param.sharded_param.grad._local_tensor.dtype=}")
             else:
                 new_sharded_dtensor_grad = fsdp_param.to_sharded_dtensor(new_sharded_grad)
                 fsdp_param.sharded_param.grad = new_sharded_dtensor_grad
+                print(f"{orig_dtype=} {fsdp_param.sharded_param.grad.dtype=} {new_sharded_grad.dtype=}")
             if not compiled_autograd_enabled():
                 for hook in (
                     getattr(fsdp_param.sharded_param, "_post_accumulate_grad_hooks", {}) or {}
@@ -790,7 +860,10 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
     current_stream.wait_event(post_reduce_event)
 
 
+_logged_memory_breakdown = False
+
 def pre_optimizer_step(fsdp_module):
+    global _logged_memory_breakdown
     scatter = get_reduction_service()
 
     root_state = fully_shard.state(fsdp_module)
@@ -813,6 +886,12 @@ def pre_optimizer_step(fsdp_module):
         with torch.cuda.nvtx.range(f"update_gradients:{fsdp_param_group._module_fqn}"):
             update_gradients(fsdp_param_group)
 
+    # Log memory breakdown once after first backward pass
+    if not _logged_memory_breakdown and dist.get_rank() == 0:
+        _logged_memory_breakdown = True
+        SymmBufferRegistry.get_instance().log_memory_breakdown()
+        log_total_gpu_memory("After first backward")
+
 
 def patch_fsdp2() -> None:
     from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
@@ -834,6 +913,110 @@ def patch_fsdp2() -> None:
 
 
 def stop():
-    get_reduction_service().stop()
+    """Stop ODC services and log final memory summary."""
+    reduction_svc = get_reduction_service()
+    if reduction_svc is not None:
+        # Log final accumulation memory summary
+        reduction_svc.stop()
+        
+        # Also log the overall symm buffer memory breakdown
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            logger.info("[ODC] === Final Memory Summary at Training End ===")
+        SymmBufferRegistry.get_instance().log_memory_breakdown()
+    
     SymmBufferRegistry.get_instance().finalize()
     finalize_distributed()
+
+
+# ============== Debugging utilities for dtype checking ==============
+_debug_dtype_printed = False
+
+
+def patch_fsdp2_debug_dtype() -> None:
+    """
+    Patch FSDP2 to print dtype information during forward pass.
+    This can be used with ODC=0 to debug what dtype _sharded_param_data has.
+    
+    Usage: Call this function before the first forward pass.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torch.distributed.fsdp._fully_shard._fsdp_collectives import foreach_all_gather as orig_foreach_all_gather
+    from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
+    
+    # Store original lazy_init
+    orig_lazy_init = FSDPParamGroup.lazy_init
+    
+    def debug_lazy_init(self):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0 and len(self.fsdp_params) > 0:
+            print(f"[DEBUG ODC=0 Rank {rank}] BEFORE lazy_init: _sharded_param_data.dtype = {self.fsdp_params[0]._sharded_param_data.dtype}")
+        
+        result = orig_lazy_init(self)
+        
+        if rank == 0 and len(self.fsdp_params) > 0:
+            print(f"[DEBUG ODC=0 Rank {rank}] AFTER lazy_init: _sharded_param_data.dtype = {self.fsdp_params[0]._sharded_param_data.dtype}")
+            print(f"[DEBUG ODC=0 Rank {rank}] AFTER lazy_init: orig_dtype = {self.fsdp_params[0].orig_dtype}")
+            print(f"[DEBUG ODC=0 Rank {rank}] AFTER lazy_init: param_dtype = {self.fsdp_params[0].param_dtype}")
+        
+        return result
+    
+    FSDPParamGroup.lazy_init = debug_lazy_init
+    
+    # Store original all_gather_inputs property
+    orig_all_gather_inputs = FSDPParam.all_gather_inputs.fget
+    
+    @property
+    def debug_all_gather_inputs(self) -> list[torch.Tensor]:
+        global _debug_dtype_printed
+        if not _debug_dtype_printed:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[DEBUG ODC=0 Rank {rank}] all_gather_inputs: _sharded_param_data.dtype = {self._sharded_param_data.dtype}")
+            print(f"[DEBUG ODC=0 Rank {rank}] all_gather_inputs: orig_dtype = {self.orig_dtype}")
+            print(f"[DEBUG ODC=0 Rank {rank}] all_gather_inputs: param_dtype = {self.param_dtype}")
+            print(f"[DEBUG ODC=0 Rank {rank}] all_gather_inputs: reduce_dtype = {self.reduce_dtype}")
+            _debug_dtype_printed = True
+        
+        # Call original implementation
+        return orig_all_gather_inputs(self)
+    
+    # Patch the property
+    FSDPParam.all_gather_inputs = debug_all_gather_inputs
+    
+    # Also patch foreach_all_gather to print input dtypes
+    def debug_foreach_all_gather(
+        fsdp_params,
+        group,
+        async_op,
+        all_gather_copy_in_stream,
+        all_gather_stream,
+        device,
+        all_gather_comm,
+    ):
+        global _debug_dtype_printed
+        if not _debug_dtype_printed:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            for i, fsdp_param in enumerate(fsdp_params):
+                print(f"[DEBUG ODC=0 Rank {rank}] foreach_all_gather fsdp_param[{i}]._sharded_param_data.dtype = {fsdp_param._sharded_param_data.dtype}")
+                print(f"[DEBUG ODC=0 Rank {rank}] foreach_all_gather fsdp_param[{i}].orig_dtype = {fsdp_param.orig_dtype}")
+                print(f"[DEBUG ODC=0 Rank {rank}] foreach_all_gather fsdp_param[{i}].param_dtype = {fsdp_param.param_dtype}")
+                if i >= 2:  # Only print first 3 params
+                    print(f"[DEBUG ODC=0 Rank {rank}] ... (truncated, total {len(fsdp_params)} params)")
+                    break
+            _debug_dtype_printed = True
+        
+        return orig_foreach_all_gather(
+            fsdp_params,
+            group,
+            async_op,
+            all_gather_copy_in_stream,
+            all_gather_stream,
+            device,
+            all_gather_comm,
+        )
+    
+    _fsdp_collectives.foreach_all_gather = debug_foreach_all_gather
+    _fsdp_param_group.foreach_all_gather = debug_foreach_all_gather
+    
+    logger.info("FSDP2 debug dtype patch applied. Will print dtype info during lazy_init and first forward pass.")
