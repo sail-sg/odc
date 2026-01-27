@@ -1,6 +1,6 @@
 # On-demand Communication (ODC)
 
-ODC is a high-performance communication library that adapts Parameter Server (PS) into Fully Sharded Data Parallel (FSDP) by replacing collective all-gather and
+ODC is a patch to FSDP that adapts Parameter Server (PS) into Fully Sharded Data Parallel (FSDP) by replacing collective all-gather and
 reduce-scatter with on-demand point-to-point communication.
 
 ![Original-FSDP](./docs/readme/FSDP-ODC.jpg)
@@ -51,9 +51,9 @@ bash examples/llm_training/run.sh
 
 ## Memory
 > User may need to tune `NVSHMEM_SYMMETRIC_SIZE` for better memory usage.
-In ODC, NVSHMEM symmetric buffer are only allocated for sharded parameters.
+When using ODC in FSDP, NVSHMEM symmetric buffer are allocated for sharded parameters, sharded gradient accumulation buffer, miscellaneous buffers for `gather` and `scatter-accumulate`.
 To achieve smallest memory footprint,
-`NVSHMEM_SYMMETRIC_SIZE` should be set to be slightly higher than the size of sharded parameters.
+`NVSHMEM_SYMMETRIC_SIZE` should be set to be slightly higher than the size of sharded parameters and gradient: params.element_size() * params.numel() + grad_reduce_buf.element_size() * grad_reduce_buf.numel().
 
 ### Basic Usage with FSDP1
 
@@ -77,9 +77,10 @@ fsdp_model = FSDP(
 )
 
 for epoch in range(10):
-    fsdp1.pre_minibatch_start(fsdp_model)
     for minibatch in dataset:
+        fsdp1.pre_minibatch_start(fsdp_model)
         loss = loss_fn(model)
+        loss.backward()
         fsdp1.pre_optimizer_step(model)
         optimizer.step()
         optimizer.zero_grad()
@@ -110,9 +111,10 @@ for layer in fsdp_model.layers:
 fsdp2.patch_lazy_init(fsdp_model)
 
 for epoch in range(10):
-    fsdp2.pre_minibatch_start(fsdp_model)
     for minibatch in dataset:
+        fsdp2.pre_minibatch_start(fsdp_model)
         loss = loss_fn(model)
+        loss.backward()
         fsdp2.pre_optimizer_step(model)
         optimizer.step()
         optimizer.zero_grad()

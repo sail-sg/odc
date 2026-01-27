@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import logging
 import os
 import sys
 
@@ -44,6 +45,7 @@ def set_modules_to_backward_prefetch(model, num_to_backward_prefetch):
 
 
 def main(args):
+    logging.basicConfig(level=logging.INFO, force=True)
     _min_gpu_count = 2
     if not verify_min_gpu_count(min_gpus=_min_gpu_count):
         print(f"Unable to locate sufficient {_min_gpu_count} gpus to run this example. Exiting.")
@@ -61,6 +63,7 @@ def main(args):
     backend = torch.distributed.get_default_backend_for_device(device)  # pylint: disable=no-member
     torch.distributed.init_process_group(backend=backend, device_id=device)
     if enable_decouple:
+        print("ODC is enabled. Initializing NVSHMEM")
         init_nvshmem()
 
     torch.manual_seed(0)
