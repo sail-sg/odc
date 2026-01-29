@@ -139,15 +139,15 @@ def main(args):
     cuda_prof = cuda_profiler_context() if enable_cuda_profiler else contextlib.nullcontext()
 
     with cuda_prof, profiler_context:
-        num_microbatches = 1
-        for epoch in range(1):
+        num_microbatches = 2
+        for epoch in range(2):
             if enable_decouple:
                 fsdp2.pre_minibatch_start(fsdp_model)
             if args.explicit_prefetching:
                 model.unshard()
 
             with torch.cuda.nvtx.range(f"epoch_{epoch}"):
-                for mb in range(num_microbatches):
+                for mb_idx, mb in enumerate(range(num_microbatches)):
                     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
                     with torch.cuda.nvtx.range(f"forward_{mb}"):
                         loss = model(x).sum()
@@ -155,8 +155,12 @@ def main(args):
                         loss.backward()
                     if prof is not None:
                         prof.step()
+                    torch.cuda.synchronize()
+                    print(f"microbatch {mb_idx}")
                 if enable_decouple:
                     fsdp2.pre_optimizer_step(model)
+                else:
+                    fsdp2.original_impl_pre_optimizer_step(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optim.step()
                 optim.zero_grad()

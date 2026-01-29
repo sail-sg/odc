@@ -539,21 +539,37 @@ def reshard(self):
     when reshard_after_forward is int (HPZ mode).
     """
     if self._training_state == TrainingState.FORWARD:
+        assert self._reshard_after_forward  # TODO: remove
         if not self._reshard_after_forward:
             return
+        assert self._use_post_forward_mesh  # TODO: remove
         if self._use_post_forward_mesh:
+            print(f"reshard to post-forward in forward state")
             self._to_sharded_post_forward()
             self._reshard_after_forward_event = self.device_handle.Event()
             if self._reshard_after_forward_event is not None:
                 self._reshard_after_forward_event.record()
             return
-    if self._use_post_forward_mesh:
-        self._to_sharded_post_forward()
-        self._reshard_after_forward_event = self.device_handle.Event()
-        if self._reshard_after_forward_event is not None:
-            self._reshard_after_forward_event.record()
-    else:
-        self._to_sharded()
+    # Supports gather parameters from local GPUs at the same node
+    # even between forward for different microbatches.
+    # So even in backward, we still does not shard it back to fully-sharded.
+    # We just shard it within each node.
+    # After all the backward is done, we will shard it back to fully-sharded.
+    # Only reshard to post-forward if we currently have unsharded params.
+    if self._training_state == TrainingState.POST_BACKWARD:
+        assert self._reshard_after_forward  # TODO: remove
+        if not self._reshard_after_forward:
+            return
+        assert self._use_post_forward_mesh  # TODO: remove
+        if self._use_post_forward_mesh:
+            assert self.is_unsharded, "Unsharded params are required for resharding to post-forward"
+            print(f"reshard to post-backward state in post-backward state")
+            self._to_sharded_post_forward()
+            self._reshard_after_forward_event = self.device_handle.Event()
+            if self._reshard_after_forward_event is not None:
+                self._reshard_after_forward_event.record()
+            return
+    self._to_sharded()
 
 
 @dataclasses.dataclass
@@ -1021,6 +1037,23 @@ def pre_optimizer_step(fsdp_module):
 
         with torch.cuda.nvtx.range(f"update_gradients:{fsdp_param_group._module_fqn}"):
             update_gradients(fsdp_param_group)
+        if fsdp_param_group._use_post_forward_mesh and fsdp_param_group.is_sharded_post_forward:
+            # After gradient sync, return to fully-sharded params so the next
+            # minibatch performs cross-node all-gather again.
+            fsdp_param_group._to_sharded()
+
+
+def original_impl_pre_optimizer_step(fsdp_module):
+    root_state = fully_shard.state(fsdp_module)
+    all_fsdp_states = root_state._state_ctx.all_states
+    all_fsdp_param_groups = [
+        state._fsdp_param_group for state in all_fsdp_states if state._fsdp_param_group is not None
+    ]
+    for fsdp_param_group in all_fsdp_param_groups:
+        if fsdp_param_group._use_post_forward_mesh and fsdp_param_group.is_sharded_post_forward:
+            # After gradient sync, return to fully-sharded params so the next
+            # minibatch performs cross-node all-gather again.
+            fsdp_param_group._to_sharded()
 
 
 def _get_post_forward_mesh_info_no_convert(reshard_after_forward, mesh_info):
@@ -1084,7 +1117,7 @@ def patch_fsdp2() -> None:
     replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     FSDPParamGroup.post_backward = post_backward
     FSDPParamGroup.post_forward = post_forward
-    # FSDPParamGroup.reshard = reshard
+    FSDPParamGroup.reshard = reshard
     FSDPParam.to_sharded_post_forward = to_sharded_post_forward
     FSDPParam.to_unsharded = to_unsharded
     _fsdp_param_group.record_function = nvtx_record_function
@@ -1111,7 +1144,7 @@ def patch_debug():
     _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
-    # FSDPParamGroup.reshard = reshard
+    FSDPParamGroup.reshard = reshard
 
 
 @torch.no_grad()
@@ -1128,7 +1161,7 @@ def debug_foreach_all_gather(
     device_handle = _get_device_handle(device.type)
     rank = dist.get_rank()
     print(
-        f"[{rank}] foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}"
+        f"[{rank}] foreach_all_gather: {id(fsdp_params[0])} fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}"
     )
     # traceback.print_stack()
     with device_handle.stream(all_gather_copy_in_stream):
