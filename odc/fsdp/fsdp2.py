@@ -631,6 +631,8 @@ def check_fsdp_module(fsdp_module):
 
 @torch.no_grad()
 def update_gradients(fsdp_param_group: FSDPParamGroup):
+    if not hasattr(fsdp_param_group, "__odc_reduce_scatter_context"):
+        return
     reduce_scatter_context = fsdp_param_group.__odc_reduce_scatter_context
     del fsdp_param_group.__odc_reduce_scatter_context
     fsdp_params = reduce_scatter_context.fsdp_params
