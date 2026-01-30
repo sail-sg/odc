@@ -99,7 +99,7 @@ def main(args):
         )
 
     if enable_decouple:
-        fsdp2.patch_fsdp2()
+        fsdp2.patch_fsdp2(hpz)
         print("enable ODC")
     else:
         fsdp2.patch_debug()
@@ -140,7 +140,7 @@ def main(args):
 
     with cuda_prof, profiler_context:
         num_microbatches = 2
-        for epoch in range(2):
+        for epoch in range(10):
             if enable_decouple:
                 fsdp2.pre_minibatch_start(fsdp_model)
             if args.explicit_prefetching:
@@ -156,11 +156,11 @@ def main(args):
                     if prof is not None:
                         prof.step()
                     torch.cuda.synchronize()
-                    print(f"microbatch {mb_idx}")
+                    # print(f"microbatch {mb_idx}")
                 if enable_decouple:
                     fsdp2.pre_optimizer_step(model)
-                else:
-                    fsdp2.original_impl_pre_optimizer_step(model)
+                # else:
+                #     fsdp2.original_impl_pre_optimizer_step(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optim.step()
                 optim.zero_grad()

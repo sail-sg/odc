@@ -12,6 +12,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp._fully_shard import _fsdp_collectives
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     AllGatherResult,
@@ -132,19 +133,23 @@ def replace_sharded_param_with_symm_buffer(
     total_size = sum(
         fsdp_param._sharded_param_data.numel() for fsdp_param in fsdp_param_group.fsdp_params
     )
-    # This key needs to be the same as the one used in `foreach_all_gather`
-    key = get_fsdp_params_key(fsdp_param_group.fsdp_params)
-    symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
-        key, (total_size,), dtype
-    )
 
-    # Pre-allocate the symmetric buffer for HPZ (Hierarchical Partitioning for ZeRO in ZeRO++).
     hpz_sharded_param_total_size = 0
     num_nodes = 1
     hpz_symm_buffer = None
     post_forward_mesh_info = fsdp_param_group.post_forward_mesh_info
     is_hpz = fsdp_param_group._use_post_forward_mesh
-    if is_hpz:
+
+    # This key needs to be the same as the one used in `foreach_all_gather`
+    key = get_fsdp_params_key(fsdp_param_group.fsdp_params)
+    if not is_hpz:
+        symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
+            key, (total_size,), dtype
+        )
+    else:
+        # When HPZ is enabled, we keep the original parameters(mostly fp32)
+        # in the torch tensor just like the original FSDP2.
+        # Pre-allocate the symmetric buffer for HPZ (Hierarchical Partitioning for ZeRO in ZeRO++).
         assert isinstance(post_forward_mesh_info, HSDPMeshInfo), f"{post_forward_mesh_info=}"
         shard_world_size = post_forward_mesh_info.shard_mesh_size
         world_size = fsdp_param_group._all_gather_process_group.size()
@@ -161,21 +166,21 @@ def replace_sharded_param_with_symm_buffer(
     # Refer to the codes in `FSDPParam._init_sharded_param`
     for fsdp_param in fsdp_param_group.fsdp_params:
         param_size = fsdp_param._sharded_param_data.numel()
-        numel = reduce(operator.mul, fsdp_param.padded_sharded_param_size, 1)
-        assert numel == param_size, f"{fsdp_param.padded_sharded_param_size=} {param_size=}"
-        symm_buffer[offset : offset + param_size].copy_(fsdp_param._sharded_param_data)
-        padded_sharded_param = symm_buffer[offset : offset + param_size]
-        padded_sharded_param = padded_sharded_param.view(fsdp_param.padded_sharded_param_size)
-        offset += param_size
+        if not is_hpz:
+            numel = reduce(operator.mul, fsdp_param.padded_sharded_param_size, 1)
+            assert numel == param_size, f"{fsdp_param.padded_sharded_param_size=} {param_size=}"
+            symm_buffer[offset : offset + param_size].copy_(fsdp_param._sharded_param_data)
+            padded_sharded_param = symm_buffer[offset : offset + param_size]
+            padded_sharded_param = padded_sharded_param.view(fsdp_param.padded_sharded_param_size)
+            offset += param_size
 
-        fsdp_param._sharded_param_data = padded_sharded_param.view(-1)
-        shard_dim = fsdp_param.fsdp_placement.dim
-        old_sharded_param = fsdp_param.sharded_param._local_tensor
-        length = old_sharded_param.size(shard_dim) if old_sharded_param.numel() > 0 else 0
-        sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
-        fsdp_param.sharded_param._local_tensor = sharded_param
-
-        if is_hpz:
+            fsdp_param._sharded_param_data = padded_sharded_param.view(-1)
+            shard_dim = fsdp_param.fsdp_placement.dim
+            old_sharded_param = fsdp_param.sharded_param._local_tensor
+            length = old_sharded_param.size(shard_dim) if old_sharded_param.numel() > 0 else 0
+            sharded_param = padded_sharded_param.narrow(dim=shard_dim, start=0, length=length)
+            fsdp_param.sharded_param._local_tensor = sharded_param
+        else:
             hpz_param_size = param_size * num_nodes
             fsdp_param._sharded_post_forward_param_data = hpz_symm_buffer[
                 hpz_offset : hpz_offset + hpz_param_size
@@ -184,14 +189,6 @@ def replace_sharded_param_with_symm_buffer(
 
 
 __odc_gather = None
-__all_gather = None
-
-
-def get_all_gather_comm():
-    global __all_gather
-    if __all_gather is None:
-        __all_gather = get_odc_gather_comm()
-    return __all_gather
 
 
 def get_odc_gather_comm():
@@ -201,14 +198,7 @@ def get_odc_gather_comm():
     return __odc_gather
 
 
-def set_odc_all_gather_comm():
-    global __all_gather
-    __all_gather = get_odc_gather_comm()
-
-
-def set_default_all_gather_comm():
-    global __all_gather
-    __all_gather = DefaultAllGather()
+original_foreach_all_gather = _fsdp_collectives.foreach_all_gather
 
 
 @torch.no_grad()
@@ -221,18 +211,44 @@ def foreach_all_gather(
     device: torch.device,
     all_gather_comm: AllGather,
 ) -> Optional[AllGatherResult]:
+    original_all_gather_comm = all_gather_comm
+    is_hpz_list = [
+        param.post_forward_mesh_info is not None and param.mesh_info != param.post_forward_mesh_info
+        for param in fsdp_params
+    ]
+    assert len(set(is_hpz_list)) == 1, f"{is_hpz_list=}"
+    is_hpz = is_hpz_list[0]
+
+    if is_hpz and fsdp_params[0].sharded_state == ShardedState.SHARDED:
+        assert (
+            original_foreach_all_gather != foreach_all_gather
+        ), "original_foreach_all_gather and foreach_all_gather are the same"
+        # rank = dist.get_rank()
+        # print(
+        #     f"[{rank}] foreach_all_gather original: {id(fsdp_params[0])} fsdp_params[0].sharded_state={fsdp_params[0].sharded_state} "
+        #     f"{type(all_gather_comm)=}"
+        # )
+        return original_foreach_all_gather(
+            fsdp_params,
+            group,
+            async_op,
+            all_gather_copy_in_stream,
+            all_gather_stream,
+            device,
+            all_gather_comm,
+        )
+
     world_size, _rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
     # Override the all-gather comm with ODCAllGather
     # all_gather_comm = ODCAllGather()
-    all_gather_comm = get_all_gather_comm()
+    all_gather_comm = get_odc_gather_comm()
     with device_handle.stream(all_gather_copy_in_stream):
         key = get_fsdp_params_key(fsdp_params)
-        print(
-            f"foreach_all_gather: fsdp_params[0].sharded_state={fsdp_params[0].sharded_state} "
-            f"{type(all_gather_comm)=}"
-        )
-        # traceback.print_stack()
+        # print(
+        #     f"[{rank}] foreach_all_gather: {id(fsdp_params[0])} fsdp_params[0].sharded_state={fsdp_params[0].sharded_state} "
+        #     f"{type(all_gather_comm)=}"
+        # )
         if fsdp_params[0].sharded_state == ShardedState.SHARDED_POST_FORWARD:
             for fsdp_param in fsdp_params:
                 assert (
@@ -265,11 +281,35 @@ def foreach_all_gather(
         assert (
             input_size_sum == all_gather_input.numel()
         ), f"{input_size_sum=} != {all_gather_input.numel()}"
+        check_hpz_symm = False
+        if check_hpz_symm:
+            original_all_gather_output = torch.empty(
+                (input_size_sum * world_size,),
+                dtype=dtype,
+                device=device,
+            )
+            original_all_gather_input, _ = torch.ops.fsdp.all_gather_copy_in(
+                all_gather_inputs,
+                original_all_gather_output,
+                inp_split_sizes,
+                input_size_sum,
+                _rank,
+            )
+            if original_all_gather_input.numel() != all_gather_input.numel():
+                if _rank == 0:
+                    print(
+                        f"[hpz-symm-check] packed numel {original_all_gather_input.numel()} "
+                        f"!= symm numel {all_gather_input.numel()}"
+                    )
+            else:
+                diff = (all_gather_input - original_all_gather_input).abs().max().item()
+                if _rank == 0:
+                    print(f"[hpz-symm-check] packed_vs_symm max_abs_diff={diff}")
         # all_gather_input_numel = sum(inp_split_sizes)
         # all_gather_output = all_gather_comm.allocate(
         #     (all_gather_input_numel * world_size,), dtype=dtype, device=device
         # )
-        # all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
+        # original_all_gather_input, original_all_gather_output = torch.ops.fsdp.all_gather_copy_in(
         #     all_gather_inputs,
         #     all_gather_output,
         #     inp_split_sizes,
@@ -286,6 +326,15 @@ def foreach_all_gather(
             async_op=async_op,
         )
         all_gather_event = all_gather_stream.record_event()
+        # original_all_gather_comm(
+        #     output_tensor=original_all_gather_output,
+        #     input_tensor=original_all_gather_input,
+        #     group=group,
+        #     async_op=async_op,
+        # )
+        # diff = (all_gather_output - original_all_gather_output).abs().max().item()
+        # if _rank == 0:
+        #     print(f"[hpz-symm-check] all_gather_output_vs_original_all_gather_output max_abs_diff={diff}")
         # torch.cuda.default_stream().wait_event(all_gather_event)
         return AllGatherResult(
             all_gather_output,
@@ -533,43 +582,40 @@ def post_backward(self, *_unused: Any):
             self._all_reduce_state = AllReduceState(all_reduce_input, all_reduce_event)
 
 
-def reshard(self):
+def reshard(self, refresh_post_forward_data: bool = False):
     """
     Keep params sharded on the post-forward mesh (within-node) outside forward
     when reshard_after_forward is int (HPZ mode).
     """
-    if self._training_state == TrainingState.FORWARD:
-        assert self._reshard_after_forward  # TODO: remove
-        if not self._reshard_after_forward:
-            return
-        assert self._use_post_forward_mesh  # TODO: remove
-        if self._use_post_forward_mesh:
-            print(f"reshard to post-forward in forward state")
-            self._to_sharded_post_forward()
-            self._reshard_after_forward_event = self.device_handle.Event()
-            if self._reshard_after_forward_event is not None:
-                self._reshard_after_forward_event.record()
-            return
     # Supports gather parameters from local GPUs at the same node
     # even between forward for different microbatches.
     # So even in backward, we still does not shard it back to fully-sharded.
     # We just shard it within each node.
     # After all the backward is done, we will shard it back to fully-sharded.
     # Only reshard to post-forward if we currently have unsharded params.
-    if self._training_state == TrainingState.POST_BACKWARD:
-        assert self._reshard_after_forward  # TODO: remove
+    if (
+        self._training_state == TrainingState.FORWARD
+        or self._training_state == TrainingState.POST_BACKWARD
+    ):
         if not self._reshard_after_forward:
             return
-        assert self._use_post_forward_mesh  # TODO: remove
         if self._use_post_forward_mesh:
-            assert self.is_unsharded, "Unsharded params are required for resharding to post-forward"
-            print(f"reshard to post-backward state in post-backward state")
-            self._to_sharded_post_forward()
+            # rank = dist.get_rank()
+            # print(f"[{rank}] reshard to post-forward in {self._training_state} state")
+            self._to_sharded_post_forward(refresh_post_forward_data=refresh_post_forward_data)
             self._reshard_after_forward_event = self.device_handle.Event()
             if self._reshard_after_forward_event is not None:
                 self._reshard_after_forward_event.record()
             return
     self._to_sharded()
+
+
+def _to_sharded_post_forward(self, refresh_post_forward_data: bool = False):
+    """This patch is used to supports refresh_post_forward_data argument"""
+    if not self.is_sharded_post_forward:
+        for fsdp_param in self.fsdp_params:
+            fsdp_param.to_sharded_post_forward(refresh_post_forward_data=refresh_post_forward_data)
+        self._sharded_state = ShardedState.SHARDED_POST_FORWARD
 
 
 @dataclasses.dataclass
@@ -760,31 +806,42 @@ def ensure_resharded_within_node(fsdp_module):
 
     hpz = any(fsdp_param_group._use_post_forward_mesh for fsdp_param_group in all_fsdp_param_groups)
     if not hpz:
-        set_odc_all_gather_comm()
         return
 
-    set_default_all_gather_comm()
+    # rank = dist.get_rank()
+    # print(f"[{rank}] ====== nccl all-gather: unshard and reshard start ======")
 
+    per_node_pg = None
     for fsdp_param_group in all_fsdp_param_groups:
         # Only do this if reshard_after_forward is an int (HPZ mode)
         if not fsdp_param_group._use_post_forward_mesh:
             continue
+        if per_node_pg is None:
+            assert isinstance(
+                fsdp_param_group.post_forward_mesh_info, HSDPMeshInfo
+            ), f"{fsdp_param_group.post_forward_mesh_info=}"
+            per_node_pg = fsdp_param_group.post_forward_mesh_info.shard_process_group
 
         # Set training state to FORWARD so reshard() will do post-forward resharding
         old_state = fsdp_param_group._training_state
         fsdp_param_group._training_state = TrainingState.FORWARD
 
         # Unshard (all-gather on all GPUs) - what pre_forward does
-        fsdp_param_group.unshard(async_op=False)
-        fsdp_param_group.wait_for_unshard()
+        with torch.cuda.nvtx.range("unshard"):
+            fsdp_param_group.unshard(async_op=False)
+        with torch.cuda.nvtx.range("wait_for_unshard"):
+            fsdp_param_group.wait_for_unshard()
 
         # Reshard (shard within each node) - what post_forward does
-        fsdp_param_group.reshard()
+        with torch.cuda.nvtx.range("reshard"):
+            fsdp_param_group.reshard(refresh_post_forward_data=True)
 
         # Restore training state
         fsdp_param_group._training_state = old_state
 
-    set_odc_all_gather_comm()
+    assert per_node_pg is not None, "HPZ enabled but per-node process group not found"
+    torch.distributed.barrier(group=per_node_pg)
+    # print(f"[{rank}] ====== nccl all-gather: unshard and reshard end ======")
 
 
 @torch.no_grad()
@@ -949,7 +1006,7 @@ def update_gradients(fsdp_param_group: FSDPParamGroup):
 
 
 # FSDPParam
-def to_sharded_post_forward(self) -> None:
+def to_sharded_post_forward(self, refresh_post_forward_data: bool = False) -> None:
     if self.is_dtensor:
         raise NotImplementedError("Resharding to smaller mesh with TP is not supported yet")
     self._assert_in_states(ShardedState.UNSHARDED)
@@ -971,9 +1028,13 @@ def to_sharded_post_forward(self) -> None:
     # ).clone()  # clone to be able to free all-gather output
     # Don't replace the symmetric buffer _sharded_post_forward_param_data here.
 
-    # In ODC, we shard the full parameters within node
-    # at the beginning of epoch, not after forward.
-    if not isinstance(__all_gather, ODCAllGather):
+    # If hpz is enabled, self._sharded_post_forward_param_data
+    # only needs to be updated (copy)
+    # on the first unshard in ensure_resharded_within_node.
+    # Later unshard in forward and backward doing gather
+    # from the _sharded_post_forward_param_data won't change
+    # _sharded_post_forward_param_data itself.
+    if refresh_post_forward_data:
         self._sharded_post_forward_param_data.copy_(
             self.all_gather_outputs[0].narrow(0, sharded_numel * shard_rank, sharded_numel)
         )
@@ -1099,7 +1160,7 @@ def _get_post_forward_mesh_info_no_convert(reshard_after_forward, mesh_info):
     return post_forward_mesh_info
 
 
-def patch_fsdp2() -> None:
+def patch_fsdp2(enable_hpz: bool = False) -> None:
     from torch.distributed._composable import replicate_with_fsdp
     from torch.distributed.fsdp._fully_shard import (
         _fsdp_collectives,
@@ -1112,14 +1173,16 @@ def patch_fsdp2() -> None:
     _fsdp_param_group.foreach_all_gather = foreach_all_gather
     _fsdp_collectives.foreach_all_gather_copy_out = foreach_all_gather_copy_out
     _fsdp_param_group.foreach_all_gather_copy_out = foreach_all_gather_copy_out
-    _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
-    _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
-    replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     FSDPParamGroup.post_backward = post_backward
     FSDPParamGroup.post_forward = post_forward
-    FSDPParamGroup.reshard = reshard
-    FSDPParam.to_sharded_post_forward = to_sharded_post_forward
-    FSDPParam.to_unsharded = to_unsharded
+    if enable_hpz:
+        _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+        _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+        replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
+        FSDPParamGroup.reshard = reshard
+        FSDPParamGroup._to_sharded_post_forward = _to_sharded_post_forward
+        FSDPParam.to_sharded_post_forward = to_sharded_post_forward
+        FSDPParam.to_unsharded = to_unsharded
     _fsdp_param_group.record_function = nvtx_record_function
     torch.profiler.record_function = nvtx_record_function
     torch.autograd.profiler.record_function = nvtx_record_function
@@ -1144,7 +1207,6 @@ def patch_debug():
     _fsdp_init._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     _fully_shard._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
     replicate_with_fsdp._get_post_forward_mesh_info = _get_post_forward_mesh_info_no_convert
-    FSDPParamGroup.reshard = reshard
 
 
 @torch.no_grad()
@@ -1160,10 +1222,9 @@ def debug_foreach_all_gather(
     world_size, rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
     rank = dist.get_rank()
-    print(
-        f"[{rank}] foreach_all_gather: {id(fsdp_params[0])} fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}"
-    )
-    # traceback.print_stack()
+    # print(
+    #     f"[{rank}] foreach_all_gather: {id(fsdp_params[0])} fsdp_params[0].sharded_state={fsdp_params[0].sharded_state}"
+    # )
     with device_handle.stream(all_gather_copy_in_stream):
         param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
         (
