@@ -175,7 +175,13 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
             reduce_dtype=reduce_dtype,
         ),
     }
-    if os.environ.get("HSDP", "0") == "1":
+
+    hpz = os.environ.get("HPZ", "0") == "1"
+    if hpz:
+        gpus_per_node = get_local_world_size()
+        print(f"enable Hierarchical Partitioning for ZeRO(HPZ) with {gpus_per_node} GPUs per node")
+        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
+    elif os.environ.get("HSDP", "0") == "1":
         gpus_per_node = get_local_world_size()
         world_size = dist.get_world_size()
         num_nodes = world_size // gpus_per_node
@@ -186,7 +192,7 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
         )
 
     if enable_decouple:
-        fsdp2.patch_fsdp2()
+        fsdp2.patch_fsdp2(enable_hpz=hpz)
 
     # Wrap each transformer layer with fully_shard
     for layer in model.model.layers:
