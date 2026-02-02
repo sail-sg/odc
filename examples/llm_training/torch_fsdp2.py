@@ -193,8 +193,6 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
 
     if enable_decouple:
         fsdp2.patch_fsdp2(enable_hpz=hpz)
-    else:
-        fsdp2.patch_debug()
 
     # Wrap each transformer layer with fully_shard
     for layer in model.model.layers:

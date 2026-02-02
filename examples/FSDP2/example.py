@@ -102,7 +102,6 @@ def main(args):
         fsdp2.patch_fsdp2(hpz)
         print("enable ODC")
     else:
-        fsdp2.patch_debug()
         print("disable odc and enable debug mode")
 
     for layer in model.layers:
@@ -147,7 +146,7 @@ def main(args):
                 model.unshard()
 
             with torch.cuda.nvtx.range(f"epoch_{epoch}"):
-                for mb_idx, mb in enumerate(range(num_microbatches)):
+                for mb in range(num_microbatches):
                     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
                     with torch.cuda.nvtx.range(f"forward_{mb}"):
                         loss = model(x).sum()
@@ -155,12 +154,8 @@ def main(args):
                         loss.backward()
                     if prof is not None:
                         prof.step()
-                    torch.cuda.synchronize()
-                    # print(f"microbatch {mb_idx}")
                 if enable_decouple:
                     fsdp2.pre_optimizer_step(model)
-                # else:
-                #     fsdp2.original_impl_pre_optimizer_step(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optim.step()
                 optim.zero_grad()

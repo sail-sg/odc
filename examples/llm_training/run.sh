@@ -56,5 +56,3 @@ bash launch.sh ${script} \
            --micro_batch_size 1 \
            --run_name ${RUN_NAME} \
            --project_name ${group_name}
-
-#    --limit_dataset_token_len 40000 \
