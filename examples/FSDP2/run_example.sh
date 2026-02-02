@@ -7,6 +7,8 @@
 # example.py
 # export ODC=1
 
+export ODC=${ODC:-1}
+
 SCRIPT_DIR=$(dirname $BASH_SOURCE)
 # echo "SCRIPT_DIR: ${SCRIPT_DIR}"
 
@@ -17,10 +19,14 @@ if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
 fi
 
 netdevs=$(ls /sys/class/net | grep 'bond0\|eth0')
-for netdev in $netdevs; do
-    echo "Netdev: $netdev"
-done
+netdev=$(echo $netdevs | head -n1 | awk '{print $1}')
+echo "Netdev: $netdev"
+
+command -v ip >/dev/null 2>&1 || { echo "ip command not found. Please install iproute2." >&2; exit 1; }
+
+export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-5000000000}
 
 echo "Launching ${1:-example.py} with ${2:-2} gpus"
-NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdevs} bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision
-# torchrun --nnodes=1 --nproc_per_node=${2:-2} ${1:-example.py}
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdev}
+export NCCL_SOCKET_IFNAME=${netdev}
+bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+command -v ip >/dev/null 2>&1 || { echo "ip command not found. Please install iproute2." >&2; exit 1; }
+
 user_nproc_per_node=""
 final_args=()
 
