@@ -20,7 +20,8 @@ TO support transparent on-demand communications, we implement RDMA based primiti
 ## Support for FSDP
 - FSDP1
 - FSDP2
-  - HSDP (`reshard_after_forward=int` not supported)
+  - HSDP
+  - `reshard_after_forward=int`
 
 ## Usage
 
