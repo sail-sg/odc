@@ -121,12 +121,25 @@ def replace_sharded_param_with_symm_buffer(
     if fsdp_param_group is None:
         return
 
+    is_hpz = fsdp_param_group._use_post_forward_mesh
+    if _enable_hpz is None:
+        raise ValueError("Need to run patch_fsdp2() first")
+    assert _enable_hpz == is_hpz, "If HPZ is enabled, reshard_after_forward must be set to int"
+
     dtype = fsdp_param_group.fsdp_params[0]._sharded_param_data.dtype
+    hpz_dtype = fsdp_param_group.fsdp_params[0].param_dtype
     for fsdp_param in fsdp_param_group.fsdp_params:
         if fsdp_param._sharded_param_data.dtype != dtype:
             raise ValueError(
                 f"All FSDP parameters must have the same dtype: {fsdp_param._sharded_param_data.dtype=} {dtype=}"
             )
+        if fsdp_param.param_dtype != hpz_dtype:
+            raise ValueError(
+                f"All FSDP parameters must have the same param dtype: {fsdp_param.param_dtype=} {hpz_dtype=}"
+            )
+    if is_hpz and hpz_dtype is None:
+        logger.warning(f"mixed precision param_dtype is not set but HPZ is enabled, using the same as the original dtype {dtype}")
+        hpz_dtype = dtype
 
     total_size = sum(
         fsdp_param._sharded_param_data.numel() for fsdp_param in fsdp_param_group.fsdp_params
@@ -136,12 +149,6 @@ def replace_sharded_param_with_symm_buffer(
     num_nodes = 1
     hpz_symm_buffer = None
     post_forward_mesh_info = fsdp_param_group.post_forward_mesh_info
-    is_hpz = fsdp_param_group._use_post_forward_mesh
-
-    if _enable_hpz is None:
-        raise ValueError("Need to run patch_fsdp2() first")
-    assert _enable_hpz == is_hpz, "If HPZ is enabled, reshard_after_forward must be set to int"
-
     # This key needs to be the same as the one used in `foreach_all_gather`
     key = get_fsdp_params_key(fsdp_param_group.fsdp_params)
     if not is_hpz:
@@ -160,8 +167,9 @@ def replace_sharded_param_with_symm_buffer(
         hpz_sharded_param_total_size = total_size * num_nodes
         hpz_key = get_hpz_params_key(key)
         hpz_symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
-            hpz_key, (hpz_sharded_param_total_size,), dtype
+            hpz_key, (hpz_sharded_param_total_size,), hpz_dtype
         )
+        logger.info(f"Replacing HPZ params with symmetric buffer of shape {hpz_symm_buffer.shape} and dtype: {hpz_dtype}")
 
     offset = 0
     hpz_offset = 0
