@@ -34,7 +34,6 @@ import torch
 import torch.distributed as dist
 import wandb
 from args import get_args
-from data import BatchedDataset
 from datasets import load_from_disk
 from lm_head import FusedLinearForPPOFunction
 from torch.distributed.device_mesh import init_device_mesh
@@ -43,6 +42,7 @@ from torch.optim import AdamW
 from torch.profiler import ProfilerActivity, profile
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 
+from data import BatchedDataset
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
 from odc.primitives.utils import SymmBufferRegistry, get_local_world_size

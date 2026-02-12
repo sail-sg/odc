@@ -138,7 +138,9 @@ def replace_sharded_param_with_symm_buffer(
                 f"All FSDP parameters must have the same param dtype: {fsdp_param.param_dtype=} {hpz_dtype=}"
             )
     if is_hpz and hpz_dtype is None:
-        logger.warning(f"mixed precision param_dtype is not set but HPZ is enabled, using the same as the original dtype {dtype}")
+        logger.warning(
+            f"mixed precision param_dtype is not set but HPZ is enabled, using the same as the original dtype {dtype}"
+        )
         hpz_dtype = dtype
 
     total_size = sum(
@@ -169,7 +171,9 @@ def replace_sharded_param_with_symm_buffer(
         hpz_symm_buffer = SymmBufferRegistry.get_instance().get_or_create_symm_buffer(
             hpz_key, (hpz_sharded_param_total_size,), hpz_dtype
         )
-        logger.info(f"Replacing HPZ params with symmetric buffer of shape {hpz_symm_buffer.shape} and dtype: {hpz_dtype}")
+        logger.info(
+            f"Replacing HPZ params with symmetric buffer of shape {hpz_symm_buffer.shape} and dtype: {hpz_dtype}"
+        )
 
     offset = 0
     hpz_offset = 0
@@ -1138,3 +1142,31 @@ def stop():
     get_reduction_service().stop()
     SymmBufferRegistry.get_instance().finalize()
     finalize_distributed()
+
+
+def get_symm_buffer_memory_breakdown() -> dict[str, float]:
+    """Return ODC symmetric-buffer memory breakdown in GB."""
+    breakdown = {
+        "fsdp_params": 0,
+        "accumulation": 0,
+        "shared_buffer": 0,
+        "ag_buffer": 0,
+        "hpz_buffer": 0,
+        "other": 0,
+    }
+    registry = SymmBufferRegistry.get_instance()
+    for key, tensor in registry.local_tensor.items():
+        nbytes = tensor.nbytes
+        if key.startswith("fsdp_params_gather_"):
+            breakdown["fsdp_params"] += nbytes
+        elif key.startswith("rs_accumulation_"):
+            breakdown["accumulation"] += nbytes
+        elif key.startswith("shared_buffer_"):
+            breakdown["shared_buffer"] += nbytes
+        elif key.startswith("ag_buffer_"):
+            breakdown["ag_buffer"] += nbytes
+        elif key.startswith("hpz_"):
+            breakdown["hpz_buffer"] += nbytes
+        else:
+            breakdown["other"] += nbytes
+    return {k: round(v / (1024**3), 2) for k, v in breakdown.items()}
