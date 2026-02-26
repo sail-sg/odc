@@ -358,7 +358,11 @@ class ReductionWatcher:
         self.buffers.append([tensor_from_handle(*buffer) for buffer in buffers])
 
     def add_accumulation(self, accumulations, group_world_size):
-        self.accumulations.append([tensor_from_handle(*acc) for acc in accumulations])
+        tensors = [tensor_from_handle(*acc) for acc in accumulations]
+        # Ensure the watcher-side view starts from zeros (epoch 0 safety).
+        for tensor in tensors:
+            tensor.zero_()
+        self.accumulations.append(tensors)
         self.group_world_sizes.append(group_world_size)
 
     def run(self):

@@ -10,7 +10,7 @@ from model import ModelArgs, Transformer
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.profiler import ProfilerActivity, profile
-from utils import inspect_mixed_precision, inspect_model
+from utils import hash_optimizer_grads, inspect_mixed_precision, inspect_model
 
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
@@ -87,8 +87,13 @@ def main(args):
             reduce_dtype=torch.float32,
         )
     gpus_per_node = get_local_world_size()
+    hpz = os.environ.get("HPZ", "0") == "1"
     hsdp = os.environ.get("HSDP", "0") == "1"
-    if hsdp:
+    if hpz:
+        print(f"enable Hierarchical Partitioning for ZeRO(HPZ) with {gpus_per_node} GPUs per node")
+        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
+        assert not hsdp, "HPZ and HSDP cannot be enabled together"
+    elif hsdp:
         world_size = torch.distributed.get_world_size()
         num_nodes = world_size // gpus_per_node
         print(f"enable HSDP with {num_nodes} nodes and {gpus_per_node} GPUs per node")
@@ -96,9 +101,13 @@ def main(args):
         fsdp_kwargs["mesh"] = init_device_mesh(
             "cuda", (num_nodes, gpus_per_node), mesh_dim_names=("dp_replicate", "dp_shard")
         )
+        assert not hpz, "HPZ and HSDP cannot be enabled together"
 
     if enable_decouple:
-        fsdp2.patch_fsdp2()
+        fsdp2.patch_fsdp2(hpz)
+        print("enable ODC")
+    else:
+        print("disable ODC")
 
     for layer in model.layers:
         fully_shard(layer, **fsdp_kwargs)
@@ -134,7 +143,7 @@ def main(args):
     cuda_prof = cuda_profiler_context() if enable_cuda_profiler else contextlib.nullcontext()
 
     with cuda_prof, profiler_context:
-        num_microbatches = 1
+        num_microbatches = 2
         for epoch in range(10):
             if enable_decouple:
                 fsdp2.pre_minibatch_start(fsdp_model)
@@ -152,10 +161,30 @@ def main(args):
                         prof.step()
                 if enable_decouple:
                     fsdp2.pre_optimizer_step(model)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                debug_numeric_correctness = (
+                    os.environ.get("ODC_DEBUG_NUMERIC_CORRECTNESS", "0") == "1"
+                )
+                if debug_numeric_correctness:
+                    # This should only works when num of GPUs is 2
+                    # or the scatter accumulation order and result cannot be guaranteed.
+                    world_size = torch.distributed.get_world_size()
+                    gathered_grad_norms = [None] * world_size
+                    torch.distributed.all_gather_object(gathered_grad_norms, grad_norm.item())
+                    grad_hash = hash_optimizer_grads(optim)
+                    gathered_hashes = [None] * world_size
+                    torch.distributed.all_gather_object(gathered_hashes, grad_hash)
+                    global_rank = torch.distributed.get_rank()
+                    if global_rank == 0:
+                        print(
+                            f"epoch {epoch} loss: {loss.detach().item()} "
+                            f"grad_norms_per_rank: {gathered_grad_norms} "
+                            f"grad_hashes_per_rank: {gathered_hashes}"
+                        )
+                else:
+                    print(f"epoch {epoch} loss: {loss.detach().item()}")
                 optim.step()
                 optim.zero_grad()
-                print(f"epoch {epoch} loss: {loss.detach().item()}")
 
     torch_memory_allocated = torch.cuda.max_memory_allocated()
     symm_buffer_memory_allocated = SymmBufferRegistry.get_instance().memory_allocated()

@@ -8,8 +8,10 @@
 # export ODC=1
 
 export ODC=${ODC:-1}
+
 SCRIPT_DIR=$(dirname $BASH_SOURCE)
-# echo "SCRIPT_DIR: ${SCRIPT_DIR}"
+
+export NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-2}
 
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     IFS=',' read -ra _cuda_visible <<< "${CUDA_VISIBLE_DEVICES}"
@@ -21,5 +23,11 @@ netdevs=$(ls /sys/class/net | grep 'bond0\|eth0')
 netdev=$(echo $netdevs | head -n1 | awk '{print $1}')
 echo "Netdev: $netdev"
 
-echo "Launching ${1:-example.py} with ${2:-2} gpus"
-NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdev} bash launch.sh --nproc_per_node=${2:-2} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision
+command -v ip >/dev/null 2>&1 || { echo "ip command not found. Please install iproute2." >&2; exit 1; }
+
+export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-5000000000}
+
+echo "Launching ${1:-example.py} with ${NUM_GPUS_PER_NODE} gpus"
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=${netdev}
+export NCCL_SOCKET_IFNAME=${netdev}
+bash launch.sh --nproc_per_node=${NUM_GPUS_PER_NODE} ${1:-${SCRIPT_DIR}/example.py} --mixed-precision

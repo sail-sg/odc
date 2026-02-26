@@ -34,7 +34,6 @@ import torch
 import torch.distributed as dist
 import wandb
 from args import get_args
-from data import BatchedDataset
 from datasets import load_from_disk
 from lm_head import FusedLinearForPPOFunction
 from torch.distributed.device_mesh import init_device_mesh
@@ -43,6 +42,7 @@ from torch.optim import AdamW
 from torch.profiler import ProfilerActivity, profile
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config
 
+from data import BatchedDataset
 from odc import init_nvshmem
 from odc.fsdp import fsdp2
 from odc.primitives.utils import SymmBufferRegistry, get_local_world_size
@@ -175,7 +175,13 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
             reduce_dtype=reduce_dtype,
         ),
     }
-    if os.environ.get("HSDP", "0") == "1":
+
+    hpz = os.environ.get("HPZ", "0") == "1"
+    if hpz:
+        gpus_per_node = get_local_world_size()
+        print(f"enable Hierarchical Partitioning for ZeRO(HPZ) with {gpus_per_node} GPUs per node")
+        fsdp_kwargs["reshard_after_forward"] = gpus_per_node
+    elif os.environ.get("HSDP", "0") == "1":
         gpus_per_node = get_local_world_size()
         world_size = dist.get_world_size()
         num_nodes = world_size // gpus_per_node
@@ -186,7 +192,7 @@ def create_fsdp_model(model, _sharding_group, _replication_group):
         )
 
     if enable_decouple:
-        fsdp2.patch_fsdp2()
+        fsdp2.patch_fsdp2(enable_hpz=hpz)
 
     # Wrap each transformer layer with fully_shard
     for layer in model.model.layers:
